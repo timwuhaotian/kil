@@ -62,6 +62,35 @@ impl Settings {
     }
 }
 
+/// `text` with `key = value`: the line assigning `key` replaced, else one appended. The
+/// file is flat (no tables), so any line assigning `key` is the one. Other lines, comments
+/// included, are kept as they were.
+pub fn set_key(text: &str, key: &str, value: &toml::Value) -> String {
+    let assignment = format!("{key} = {value}");
+    let mut found = false;
+    let mut out = String::with_capacity(text.len() + assignment.len() + 1);
+    for line in text.lines() {
+        if !found && assigns(line, key) {
+            found = true;
+            out.push_str(&assignment);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !found {
+        out.push_str(&assignment);
+        out.push('\n');
+    }
+    out
+}
+
+fn assigns(line: &str, key: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
 /// `$XDG_CONFIG_HOME/kil`, else `~/.config/kil`.
 pub fn config_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -96,5 +125,30 @@ mod tests {
     #[test]
     fn parse_should_reject_absurd_font_size() {
         assert!(Settings::parse("font_size = 400.0").is_err());
+    }
+
+    #[test]
+    fn set_key_should_replace_the_line_and_keep_comments() {
+        let text = "# mine\nfont_size = 13.0 # big\ncursor_blink = false\n";
+        assert_eq!(
+            set_key(text, "font_size", &toml::Value::Float(15.)),
+            "# mine\nfont_size = 15.0\ncursor_blink = false\n"
+        );
+    }
+
+    #[test]
+    fn set_key_should_append_a_missing_key() {
+        assert_eq!(
+            set_key("font_size = 13.0", "font_family", &"SF Mono".into()),
+            "font_size = 13.0\nfont_family = \"SF Mono\"\n"
+        );
+    }
+
+    #[test]
+    fn set_key_should_not_match_a_longer_key() {
+        assert_eq!(
+            set_key("cursor_blinking = 1\n", "cursor_blink", &true.into()),
+            "cursor_blinking = 1\ncursor_blink = true\n"
+        );
     }
 }

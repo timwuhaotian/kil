@@ -28,6 +28,9 @@ pub enum Command {
     FontBigger,
     FontSmaller,
     FontReset,
+    OpenSettings,
+    Hide,
+    HideOthers,
     Quit,
     Unbind,
 }
@@ -50,6 +53,9 @@ const NAMED: &[(&str, Command)] = &[
     ("font_bigger", Command::FontBigger),
     ("font_smaller", Command::FontSmaller),
     ("font_reset", Command::FontReset),
+    ("open_settings", Command::OpenSettings),
+    ("hide", Command::Hide),
+    ("hide_others", Command::HideOthers),
     ("quit", Command::Quit),
     ("unbind", Command::Unbind),
 ];
@@ -83,6 +89,9 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("cmd-=", "font_bigger"),
     ("cmd--", "font_smaller"),
     ("cmd-0", "font_reset"),
+    ("cmd-,", "open_settings"),
+    ("cmd-h", "hide"),
+    ("cmd-alt-h", "hide_others"),
     ("cmd-q", "quit"),
 ];
 
@@ -103,7 +112,7 @@ impl Command {
 
     fn binding(self, keys: &str) -> Option<KeyBinding> {
         use workspace as w;
-        let cx = Some(self.context());
+        let cx = self.context();
         Some(match self {
             Self::NewTab => KeyBinding::new(keys, w::NewTab, cx),
             Self::CloseTab => KeyBinding::new(keys, w::CloseTab, cx),
@@ -131,15 +140,20 @@ impl Command {
             Self::FontBigger => KeyBinding::new(keys, w::FontBigger, cx),
             Self::FontSmaller => KeyBinding::new(keys, w::FontSmaller, cx),
             Self::FontReset => KeyBinding::new(keys, w::FontReset, cx),
+            Self::OpenSettings => KeyBinding::new(keys, crate::OpenSettings, cx),
+            Self::Hide => KeyBinding::new(keys, crate::Hide, cx),
+            Self::HideOthers => KeyBinding::new(keys, crate::HideOthers, cx),
             Self::Quit => KeyBinding::new(keys, w::Quit, cx),
             Self::Unbind => return None,
         })
     }
 
-    fn context(self) -> &'static str {
+    /// App-level commands bind in every window, Settings included.
+    fn context(self) -> Option<&'static str> {
         match self {
-            Self::Copy | Self::Paste | Self::ClearScrollback => "Terminal",
-            _ => "Workspace",
+            Self::Copy | Self::Paste | Self::ClearScrollback => Some("Terminal"),
+            Self::OpenSettings | Self::Hide | Self::HideOthers | Self::Quit => None,
+            _ => Some("Workspace"),
         }
     }
 }

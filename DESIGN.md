@@ -12,6 +12,7 @@ integration tests.
 Build status:
 - **M1 is done.** All §4.8 tests pass, and the churn test runs 500 cycles.
 - **M2–M5 are implemented and lint/test-clean** (66 tests). They still need hands-on UI verification: the A9 checklist, IME, and animation smoothness.
+- **A14–A16** (row menu and rename, Settings window, double-click for a new tab) are implemented. Headless GPUI tests drive the clicks, input and keys. They still need a hands-on pass with a real IME.
 - A dev bundle is built with `scripts/bundle.sh`. The two-tone icon source is `packaging/icon.svg`.
 - Release signing and notarization (the rest of M6) is not done yet.
 
@@ -28,7 +29,7 @@ Build status:
 | A3 | `cmd-d` splits right and `cmd-shift-d` splits down. The new pane inherits cwd, and the split animates. Each pane gets **one** `SIGWINCH` per layout change, not one per frame. | `trap 'echo WINCH' WINCH` counter. |
 | A4 | `cmd-w` or shell `exit 0` closes the pane with an animation. The last pane closes its tab. The last tab closes the window, which quits the app. | Manual. |
 | A5 | A non-zero exit or a signal death keeps the pane open with a banner showing `exited 1` or `killed: SIGKILL`. Any key closes it. | `exit 3`. |
-| A6 | Focus moves between panes with `cmd-alt-arrows`. Dividers can be dragged to resize. | Manual. |
+| A6 | Focus moves between panes with `cmd-alt-arrows` or a click. The focused pane is the bright one, and the others are dimmed to about half. Dividers can be dragged to resize. | Manual + `workspace` GPUI test (click focuses). |
 | A7 | Switch tabs by clicking, `cmd-1…9`, or `cmd-shift-[ / ]`. | Manual. |
 | A8 | `~/.config/kil/keymap.toml` overrides any default, including the split keys. Invalid entries appear in a banner with the key and the reason, and valid entries still apply. The file is reloaded when the window regains focus. | Rebind the split keys. |
 | A9 | Terminal correctness: vim, htop, less, tmux, 256-color and truecolor, CJK wide characters aligned to the grid, **Chinese IME preedit at the cursor**, selection, copy, bracketed paste, trackpad scrollback. | Manual checklist. |
@@ -36,6 +37,9 @@ Build status:
 | A11 | **Memory.** Per-pane overhead without scrollback is ≤ 2 MB. Scrollback cost matches the formula in §5 within ±10%. A churn of 500 open/close cycles returns threads, fds, child count and live `TerminalPane` count to baseline. | Churn test plus `footprint`. |
 | A12 | **Performance.** Idle CPU is 0.0% with blink off and < 1% with blink on. Animations run at 120 fps with 4 panes streaming output (Metal HUD). Throughput is at least Terminal.app's on the same file. Keypress-to-photon is ≤ 1 frame after the PTY echo. | §6.4 |
 | A13 | Release build is signed with **Developer ID Application (team 43VLF3KTFZ)**, notarized and stapled, and `spctl -a -vv` accepts it. | §11 |
+| A14 | Right-clicking a sidebar row opens a menu with **Rename Tab…**, **Reset Name** (shown only when the tab has a name) and **Close Tab**. Rename edits the title in place, and IME input works. Enter or a click elsewhere keeps the edit, and Escape cancels it. An empty name goes back to the pane's title. The name also becomes the window title. | `workspace` GPUI tests + manual Pinyin. |
+| A15 | **Kil ▸ Settings…** (`cmd-,`) opens a separate Settings window, or brings the open one forward. It edits font family and size, scrollback, Option as Meta and cursor blink. Each change is written to `config.toml` and applied to the open window at once. The Kil menu also has Services, Hide, Hide Others and Show All. | `settings_window` / `config` tests + manual. |
+| A16 | Double-clicking empty space in the sidebar opens a tab, the same as `cmd-t`. Double-clicking a row does not. | `workspace` GPUI tests. |
 
 ### Non-goals (v1)
 These are left out and can be added later:
@@ -44,7 +48,8 @@ These are left out and can be added later:
 - Ligatures, image protocols (sixel, kitty) and the kitty keyboard protocol.
 - OSC 133 shell integration, OSC 8 hyperlinks, URL click.
 - Scrollback search and tab drag-reorder.
-- A settings UI, themes beyond one built-in dark theme, and plugins.
+- Themes beyond one built-in dark theme, a keymap editor in the Settings window (it links to `keymap.toml` instead), and plugins.
+- Saving tab names across launches (there is no session restore).
 - Auto-update.
 - Intel and universal builds (arm64 only).
 - The Mac App Store, because a terminal can't run in the App Sandbox (§11).
@@ -101,6 +106,8 @@ kil/
 │     ├─ src/terminal_pane.rs Entity owning a Session; event pump; title/cwd cache
 │     ├─ src/terminal_element.rs  gpui::Element: snapshot → quads + glyph runs
 │     ├─ src/sidebar.rs       vertical tab list
+│     ├─ src/text_field.rs    one-line IME text field (tab rename, Settings)
+│     ├─ src/settings_window.rs  Kil ▸ Settings…: edits config.toml key by key
 │     ├─ src/motion.rs        Tween (retargetable), Motion durations/easings
 │     ├─ src/keymap.rs        defaults + keymap.toml → gpui KeyBinding
 │     ├─ src/keys.rs          keystroke → PTY bytes (modes, option-as-meta)
@@ -333,10 +340,11 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 **Sidebar** (220 px)
 - 44 px rows with a title (13 pt medium) and the cwd (11 pt, middle-truncated).
 - An accent dot when the tab is **busy**, a dim dot for unseen output in a background tab, and an `×` on hover.
-- A footer `+ New Tab` button.
+- A footer `+ New Tab` button. Double-clicking empty sidebar space also opens a tab.
+- Right-click on a row opens a menu: Rename Tab…, Reset Name, Close Tab. A rename edits the title in place in a `TextField`. The user's name overrides the pane's title in the row, in the closing ghost and in the window title.
 - The selection highlight is a rounded 8 px pill that **slides** between rows.
 
-**Panes:** 1 px dividers with a 6 px hit area. Inactive panes are dimmed (a 0.85 overlay), and that dim is the focus cue.
+**Panes:** 1 px dividers with a 6 px hit area. When a tab has more than one pane, the others are dimmed by a 50% near-black overlay. Their text drops to about half brightness, and their cursor is hollow while the focused one is solid. That is the focus cue. A lighter dim doesn't work: on the near-black background it moves the background by only ~2/255.
 
 **Motion.** Every animation is a retargetable `Tween { from, to, start, dur, ease }`.
 `retarget(to, now)` restarts from the *current* value, so pressing a key repeatedly never makes the
@@ -370,7 +378,9 @@ struct Split<T> { axis: Axis, ratio: Tween, first: Node<T>, second: Node<T> }
 
 **Actions** (`actions!(kil, […])`): `NewTab`, `ClosePane`, `CloseTab`, `SplitRight`, `SplitDown`,
 `FocusLeft/Right/Up/Down`, `NextTab`, `PrevTab`, `SelectTab(n)`, `Copy`, `Paste`, `ClearScrollback`,
-`FontBigger`, `FontSmaller`, `FontReset`, `ToggleMemoryHud`, `Quit`.
+`FontBigger`, `FontSmaller`, `FontReset`, `ToggleMemoryHud`, `OpenSettings`, `Hide`, `HideOthers`, `ShowAll`, `Quit`.
+
+App-level commands (`open_settings`, `hide`, `hide_others`, `quit`) bind with no key context, so they work in the Settings window too. Global fallbacks in `main.rs` handle them there. For example, `quit` runs the terminal window's close confirmation.
 
 **Defaults**
 
@@ -387,6 +397,8 @@ struct Split<T> { axis: Axis, ratio: Tween, first: Node<T>, second: Node<T> }
 | `cmd-c` / `cmd-v` | `copy` / `paste` |
 | `cmd-k` | `clear_scrollback` |
 | `cmd-=` / `cmd--` / `cmd-0` | font size |
+| `cmd-,` | `open_settings` |
+| `cmd-h` / `cmd-alt-h` | `hide` / `hide_others` |
 | `cmd-q` | `quit` |
 
 **`~/.config/kil/keymap.toml`** (`$XDG_CONFIG_HOME` is respected):
@@ -404,6 +416,7 @@ struct Split<T> { axis: Axis, ratio: Tween, first: Node<T>, second: Node<T> }
 - Keys are checked with GPUI `Keystroke::parse`.
 - Errors are collected as `Vec<KeymapError { key, reason }>` and shown in a banner. Valid entries still apply.
 - The merged set is applied with `cx.clear_key_bindings()` and then `cx.bind_keys(defaults ⊕ user)`, in the `Workspace` key context. Bindings therefore win over terminal input, and unbound keys fall through.
+- Text field editing keys (`TextField` context: arrows, home/end, backspace, delete, `cmd-a`, `cmd-v`, enter, escape) and the Settings window's `cmd-w` are fixed. They are bound after the merged set and can't be changed in `keymap.toml`.
 
 **Fallthrough to the PTY** (`keys.rs`, written from xterm ctlseqs):
 - App-cursor and app-keypad modes, `CSI 1;mods` modifier encoding, ctrl-letters, function keys.
@@ -421,6 +434,8 @@ scrollback_lines = 10000
 option_as_meta = true
 cursor_blink = true
 ```
+
+The Settings window writes one key per change (`config::write_setting`). It replaces the line that assigns the key, or appends one, and keeps every other line, comments included. If the result would not parse, nothing is written. The file is written in place, not renamed over, so a symlinked dotfile stays a symlink. The terminal window then reloads through the same mtime path. Scrollback and cursor blink apply to new tabs and panes, because a blink timer for existing panes would break idle CPU (A12).
 
 Both files are re-read when the window gains focus and the file's mtime has changed. There is no
 watcher thread and no extra dependency.

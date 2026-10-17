@@ -35,7 +35,9 @@ impl Theme {
             sidebar_selected: rgba(0xff_ff_ff_1f).into(),
             accent: rgb(0x6c_a8_ff).into(),
             divider: rgb(0x26_29_30).into(),
-            inactive_dim: rgba(0x0b_0c_0f_4d).into(),
+            // Half: on a near-black background a lighter dim moves the background by ~2/255
+            // and leaves only the text to show which pane has focus.
+            inactive_dim: rgba(0x05_06_08_80).into(),
             banner_bg: rgba(0x1d_20_26_f2).into(),
         }
     }

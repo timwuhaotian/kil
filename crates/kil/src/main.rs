@@ -6,17 +6,21 @@ mod keys;
 mod motion;
 mod pane_tree;
 mod settings;
+mod settings_window;
 mod terminal_element;
 mod terminal_pane;
+mod text_field;
 mod theme;
 mod workspace;
 
 use gpui::{
-    App, Application, Bounds, Menu, MenuItem, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, point, prelude::*, px, size,
+    App, Application, Bounds, Menu, MenuItem, SystemMenuType, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point, prelude::*, px, size,
 };
 
 use crate::{theme::Theme, workspace::Workspace};
+
+actions!(kil, [OpenSettings, Hide, HideOthers, ShowAll]);
 
 /// An unbundled binary started from another terminal inherits that app's
 /// `__CFBundleIdentifier`, and `AppKit` then names and badges kil as that app (e.g. "Otty").
@@ -38,7 +42,17 @@ fn menus() -> Vec<Menu> {
     vec![
         Menu {
             name: "Kil".into(),
-            items: vec![MenuItem::action("Quit Kil", w::Quit)],
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide Kil", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit Kil", w::Quit),
+            ],
         },
         Menu {
             name: "Shell".into(),
@@ -83,6 +97,15 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
+/// Fallbacks for actions no focused element handled, e.g. from the Settings window.
+fn register_app_actions(cx: &mut App) {
+    cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
+    cx.on_action(|_: &Hide, cx| cx.hide());
+    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &workspace::Quit, cx| workspace::quit_app(cx));
+}
+
 fn main() {
     forget_launcher_identity();
     env_logger::init();
@@ -90,8 +113,14 @@ fn main() {
         cx.set_global(Theme::dark());
         let notices = config::apply(cx);
         cx.set_menus(menus());
+        register_app_actions(cx);
+        // Settings alone doesn't keep the app alive.
         cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
+            if !cx
+                .windows()
+                .iter()
+                .any(|w| w.downcast::<Workspace>().is_some())
+            {
                 cx.quit();
             }
         })

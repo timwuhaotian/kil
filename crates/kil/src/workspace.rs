@@ -7,9 +7,10 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, AnyView, ClickEvent, Context, CursorStyle, Div,
-    DragMoveEvent, ElementId, Entity, EntityId, FocusHandle, Focusable, Hsla, PromptLevel,
-    SharedString, Stateful, StyleRefinement, Subscription, Window, actions, div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, AnyView, AnyWindowHandle, App, ClickEvent, Context,
+    CursorStyle, Div, DragMoveEvent, ElementId, Entity, EntityId, FocusHandle, Focusable, Hsla,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, SharedString, Stateful,
+    StyleRefinement, Subscription, Window, actions, anchored, deferred, div, prelude::*, px,
     relative,
 };
 
@@ -19,7 +20,8 @@ use crate::{
     pane_tree::{Axis, Close, Direction, Node, PaneTree, Split, SplitId},
     settings::Settings,
     terminal_element::cells,
-    terminal_pane::{PaneEvent, PaneInfo, TerminalPane},
+    terminal_pane::{PaneEvent, TerminalPane},
+    text_field::{FieldEvent, TextField},
     theme::Theme,
 };
 
@@ -66,14 +68,38 @@ struct Tab {
     id: TabId,
     tree: PaneTree<Entity<TerminalPane>>,
     focused: Entity<TerminalPane>,
+    /// Set by the user (Rename Tab); otherwise the row follows the focused pane.
+    name: Option<SharedString>,
     animating: bool,
+}
+
+impl Tab {
+    fn title(&self, cx: &App) -> SharedString {
+        self.name
+            .clone()
+            .unwrap_or_else(|| self.focused.read(cx).info().title.clone())
+    }
 }
 
 /// A closed tab's row while it animates out.
 struct Ghost {
     id: TabId,
     after: Option<TabId>,
-    info: PaneInfo,
+    title: SharedString,
+}
+
+/// The right-click menu of a sidebar row, at the click.
+#[derive(Clone, Copy)]
+struct TabMenu {
+    tab: TabId,
+    position: Point<Pixels>,
+}
+
+/// A row whose title is being edited in place.
+struct Rename {
+    tab: TabId,
+    field: Entity<TextField>,
+    _subscription: Subscription,
 }
 
 #[derive(Clone, Copy)]
@@ -131,6 +157,10 @@ pub struct Workspace {
     /// slides from the previous row.
     pill: Tween,
     ghosts: Vec<Ghost>,
+    menu: Option<TabMenu>,
+    /// Held by the open menu so Escape reaches it instead of the terminal.
+    menu_focus: FocusHandle,
+    rename: Option<Rename>,
     notices: Vec<SharedString>,
     config: config::Stamp,
     pane_subscriptions: HashMap<EntityId, Subscription>,
@@ -160,6 +190,9 @@ impl Workspace {
             next_tab: 0,
             pill: Tween::settled(0.),
             ghosts: Vec::new(),
+            menu: None,
+            menu_focus: cx.focus_handle(),
+            rename: None,
             notices,
             config: config::stamp(),
             pane_subscriptions: HashMap::new(),
@@ -200,6 +233,7 @@ impl Workspace {
             id,
             tree: PaneTree::new(pane.clone()),
             focused: pane,
+            name: None,
             animating: false,
         });
         self.activate(self.tabs.len() - 1, window, cx);
@@ -260,15 +294,22 @@ impl Workspace {
             pane.update(cx, |pane, _| pane.shutdown());
             self.pane_subscriptions.remove(&pane.entity_id());
         }
+        self.menu = self.menu.filter(|menu| menu.tab != tab.id);
+        if self
+            .rename
+            .as_ref()
+            .is_some_and(|rename| rename.tab == tab.id)
+        {
+            self.rename = None;
+        }
         let after = index
             .checked_sub(1)
             .and_then(|i| self.tabs.get(i))
             .map(|tab| tab.id);
-        let info = tab.focused.read(cx).info().clone();
         self.ghosts.push(Ghost {
             id: tab.id,
             after,
-            info,
+            title: tab.title(cx),
         });
         let ghost = tab.id;
         cx.spawn(async move |this, cx| {
@@ -303,6 +344,84 @@ impl Workspace {
         let focused = self.tabs[self.active].focused.focus_handle(cx);
         window.focus(&focused);
         cx.notify();
+    }
+
+    // ── row menu, rename ──────────────────────────────────────────────────────────────
+
+    fn open_menu(
+        &mut self,
+        tab: TabId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = Some(TabMenu { tab, position });
+        window.focus(&self.menu_focus);
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            window.focus(&tab.focused.focus_handle(cx));
+        }
+    }
+
+    fn start_rename(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|t| t.title(cx))
+        else {
+            return;
+        };
+        let field = cx.new(|cx| TextField::new(&title, window, cx));
+        let subscription = cx.subscribe_in(&field, window, Self::end_rename);
+        window.focus(&field.focus_handle(cx));
+        self.rename = Some(Rename {
+            tab: id,
+            field,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// An empty name gives the row back to the pane's title.
+    fn end_rename(
+        &mut self,
+        field: &Entity<TextField>,
+        event: &FieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rename) = self.rename.take_if(|rename| &rename.field == field) else {
+            return;
+        };
+        if let FieldEvent::Confirmed(text) = event {
+            let name = text.trim();
+            self.set_name(
+                rename.tab,
+                (!name.is_empty()).then(|| name.to_owned().into()),
+            );
+        }
+        // Enter or Escape: back to the terminal. A click elsewhere already moved focus.
+        if field.focus_handle(cx).is_focused(window) {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn set_name(&mut self, id: TabId, name: Option<SharedString>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.name = name;
+        }
     }
 
     // ── panes ─────────────────────────────────────────────────────────────────────────
@@ -491,6 +610,7 @@ impl Workspace {
 
     // ── settings ──────────────────────────────────────────────────────────────────────
 
+    /// Also called by the Settings window right after it writes `config.toml`.
     fn reload_config_if_changed(&mut self, cx: &mut Context<Self>) {
         let stamp = config::stamp();
         if stamp != self.config {
@@ -576,6 +696,12 @@ impl Workspace {
                     .px_2()
                     .flex()
                     .flex_col()
+                    // Rows stop their clicks, so this is a double-click on the empty space.
+                    .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                        if event.click_count() == 2 {
+                            this.new_tab(&NewTab, window, cx);
+                        }
+                    }))
                     .children(rows),
             )
             .child(
@@ -611,6 +737,12 @@ impl Workspace {
     ) -> AnyElement {
         let id = tab.id;
         let info = tab.focused.read(cx).info().clone();
+        let title = tab.title(cx);
+        let editing = self
+            .rename
+            .as_ref()
+            .filter(|rename| rename.tab == id)
+            .map(|rename| rename.field.clone());
         let busy = tab
             .tree
             .leaves()
@@ -641,8 +773,16 @@ impl Workspace {
             .cursor_pointer()
             .when(!active, |row| row.hover(|style| style.bg(chrome.hover)))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
                 this.activate_id(id, window, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_menu(id, event.position, window, cx);
+                }),
+            )
             .children(pill)
             .child(
                 div()
@@ -655,15 +795,7 @@ impl Workspace {
                     } else {
                         gpui::transparent_black()
                     }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(13.))
-                            .text_color(if active { chrome.text } else { chrome.muted })
-                            .child(info.title),
-                    )
+                    .child(row_title(title, editing, active, chrome))
                     .child(
                         div()
                             .id(ElementId::NamedInteger("tab-close".into(), id.0))
@@ -700,6 +832,113 @@ impl Workspace {
                 |row, t| row.h(px(ROW_HEIGHT * t)).opacity(t),
             )
             .into_any_element()
+    }
+}
+
+impl Workspace {
+    fn render_menu(
+        &self,
+        menu: TabMenu,
+        chrome: Chrome,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = menu.tab;
+        let named = self
+            .tabs
+            .iter()
+            .any(|tab| tab.id == id && tab.name.is_some());
+        let item = |key: &'static str,
+                    label: &'static str,
+                    run: fn(&mut Self, TabId, &mut Window, &mut Context<Self>),
+                    cx: &mut Context<Self>| {
+            div()
+                .id(key)
+                .h(px(26.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(chrome.accent))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.close_menu(window, cx);
+                    run(this, id, window, cx);
+                }))
+                .child(label)
+        };
+        let panel = div()
+            .id("tab-menu")
+            .track_focus(&self.menu_focus)
+            .occlude()
+            .w(px(180.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(chrome.divider)
+            .bg(chrome.banner)
+            .shadow_lg()
+            .text_size(px(13.))
+            .text_color(chrome.text)
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.close_menu(window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.close_menu(window, cx);
+                }
+            }))
+            .child(item("menu-rename", "Rename Tab…", Self::start_rename, cx))
+            .when(named, |panel| {
+                panel.child(item(
+                    "menu-reset-name",
+                    "Reset Name",
+                    |this, id, _, cx| {
+                        this.set_name(id, None);
+                        cx.notify();
+                    },
+                    cx,
+                ))
+            })
+            .child(div().my_1().mx_2().h(px(1.)).bg(chrome.divider))
+            .child(item("menu-close", "Close Tab", Self::close_tab_id, cx));
+        deferred(
+            anchored()
+                .position(menu.position)
+                .snap_to_window_with_margin(px(8.))
+                .child(panel),
+        )
+        .with_priority(1)
+    }
+}
+
+/// Runs `Quit` in the terminal window, for when another window (Settings) has focus.
+pub fn quit_app(cx: &mut App) {
+    match cx
+        .windows()
+        .iter()
+        .find_map(AnyWindowHandle::downcast::<Workspace>)
+    {
+        Some(workspace) => {
+            let _ = workspace.update(cx, |this, window, cx| {
+                window.activate_window();
+                this.quit(&Quit, window, cx);
+            });
+        }
+        None => cx.quit(),
+    }
+}
+
+/// Re-applies the config files in the terminal window after the Settings window wrote one.
+pub fn reload_config(cx: &mut App) {
+    for workspace in cx
+        .windows()
+        .iter()
+        .filter_map(AnyWindowHandle::downcast::<Workspace>)
+    {
+        let _ = workspace.update(cx, |this, _, cx| this.reload_config_if_changed(cx));
     }
 }
 
@@ -886,6 +1125,23 @@ fn split_id_bits(tab: TabId, split: SplitId) -> u64 {
     (tab.0 << 32) ^ split.bits()
 }
 
+/// The row's title, or the field editing it.
+fn row_title(
+    title: SharedString,
+    editing: Option<Entity<TextField>>,
+    active: bool,
+    chrome: Chrome,
+) -> Div {
+    let title_box = div().flex_1().min_w_0().text_size(px(13.));
+    match editing {
+        Some(field) => title_box.text_color(chrome.text).child(field),
+        None => title_box
+            .truncate()
+            .text_color(if active { chrome.text } else { chrome.muted })
+            .child(title),
+    }
+}
+
 fn render_ghost(ghost: &Ghost, chrome: Chrome) -> AnyElement {
     div()
         .flex_none()
@@ -901,7 +1157,7 @@ fn render_ghost(ghost: &Ghost, chrome: Chrome) -> AnyElement {
                 .truncate()
                 .text_size(px(13.))
                 .text_color(chrome.muted)
-                .child(ghost.info.title.clone()),
+                .child(ghost.title.clone()),
         )
         .with_animation(
             ElementId::NamedInteger("tab-out".into(), ghost.id.0),
@@ -979,7 +1235,7 @@ impl Render for Workspace {
             window.request_animation_frame();
         }
         if let Some(tab) = self.tabs.get(self.active) {
-            let title = tab.focused.read(cx).info().title.clone();
+            let title = tab.title(cx);
             if title != self.window_title {
                 window.set_window_title(&title);
                 self.window_title = title;
@@ -1042,5 +1298,140 @@ impl Render for Workspace {
                     .children(content)
                     .children(notices),
             )
+            .children(self.menu.map(|menu| self.render_menu(menu, chrome, cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Modifiers, MouseUpEvent, TestAppContext, VisualTestContext, point};
+
+    use super::*;
+    use crate::text_field;
+
+    const ROW: Point<Pixels> = point(px(100.), px(SIDEBAR_TOP + ROW_HEIGHT / 2.));
+    const EMPTY_SIDEBAR: Point<Pixels> = point(px(100.), px(400.));
+
+    fn workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            cx.set_global(Settings::default());
+            cx.bind_keys(text_field::bindings());
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(Vec::new(), window, cx));
+        // Rows grow in over `ROW_IN` of wall time; click them at full height.
+        std::thread::sleep(motion::ROW_IN + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        (workspace, cx)
+    }
+
+    fn click(
+        cx: &mut VisualTestContext,
+        position: Point<Pixels>,
+        button: MouseButton,
+        count: usize,
+    ) {
+        for click_count in 1..=count {
+            cx.simulate_event(MouseDownEvent {
+                position,
+                button,
+                modifiers: Modifiers::none(),
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                position,
+                button,
+                modifiers: Modifiers::none(),
+                click_count,
+            });
+        }
+    }
+
+    fn tab_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+        workspace.read_with(cx, |this, _| this.tabs.len())
+    }
+
+    fn first_name(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<SharedString> {
+        workspace.read_with(cx, |this, _| this.tabs[0].name.clone())
+    }
+
+    /// Right-click the first row, then pick "Rename Tab…" (the menu's first item).
+    fn start_rename(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        click(cx, ROW, MouseButton::Right, 1);
+        assert!(workspace.read_with(cx, |this, _| this.menu.is_some()));
+        click(cx, ROW + point(px(20.), px(18.)), MouseButton::Left, 1);
+        assert!(workspace.read_with(cx, |this, _| this.menu.is_none() && this.rename.is_some()));
+    }
+
+    #[gpui::test]
+    fn double_click_on_empty_sidebar_should_open_a_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        click(cx, EMPTY_SIDEBAR, MouseButton::Left, 2);
+        assert_eq!(tab_count(&workspace, cx), 2);
+    }
+
+    #[gpui::test]
+    fn double_click_on_a_row_should_not_open_a_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        click(cx, ROW, MouseButton::Left, 2);
+        assert_eq!(tab_count(&workspace, cx), 1);
+    }
+
+    #[gpui::test]
+    fn rename_from_the_row_menu_should_name_the_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        start_rename(&workspace, cx);
+        cx.simulate_input("构建");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(first_name(&workspace, cx), Some("构建".into()));
+        let title = workspace.read_with(cx, |this, cx| this.tabs[0].title(cx));
+        assert_eq!(title, SharedString::from("构建"));
+    }
+
+    #[gpui::test]
+    fn escape_should_cancel_a_rename(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        start_rename(&workspace, cx);
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(first_name(&workspace, cx), None);
+        assert!(workspace.read_with(cx, |this, _| this.rename.is_none()));
+    }
+
+    #[gpui::test]
+    fn clicking_a_pane_should_make_it_the_undimmed_one(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(SplitRight);
+        std::thread::sleep(motion::SPLIT + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let focused_is_first = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |this, _| {
+                let tab = &this.tabs[0];
+                tab.focused == *tab.tree.leaves()[0]
+            })
+        };
+        assert!(!focused_is_first(cx), "the new right pane takes focus");
+        click(
+            cx,
+            point(px(SIDEBAR_WIDTH + 100.), px(300.)),
+            MouseButton::Left,
+            1,
+        );
+        assert!(focused_is_first(cx));
+    }
+
+    #[gpui::test]
+    fn escape_should_close_the_row_menu(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        click(cx, ROW, MouseButton::Right, 1);
+        cx.simulate_keystrokes("escape");
+        assert!(workspace.read_with(cx, |this, _| this.menu.is_none()));
     }
 }
