@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/kil-term", "crates/kil"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace.dependencies]
+kil-term = { path = "crates/kil-term" }
+# Exact pins: both are pre-1.0 and we implement alacritty's PTY traits (DESIGN.md §2, §13).
+alacritty_terminal = "=0.26.0"
+gpui = "=0.2.2"
+# Must stay on the same major as alacritty_terminal's poller, which hands us its `Poller`.
+polling = "3.8"
+libc = "0.2.183"
+log = "0.4"
+thiserror = "2"
+anyhow = "1"
+env_logger = "0.11"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+redundant_clone = "deny"
+large_enum_variant = "deny"
+needless_collect = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# A half-dead pane is worse than a crash; the kernel hangs up every PTY on exit (DESIGN.md §4.6).
+panic = "abort"
+debug = "line-tables-only"

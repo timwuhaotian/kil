@@ -1,0 +1,72 @@
+//! Terminal plumbing that must work without a UI (DESIGN.md §6.1).
+
+mod common;
+
+use std::time::Duration;
+
+use common::{screen, sh, start, wait_for_text, wait_until};
+use kil_term::GridSize;
+
+#[test]
+fn cursor_position_query_should_be_answered_without_ui() {
+    let script = "stty raw -echo; printf '\\033[6n'; r=$(dd bs=1 count=6 2>/dev/null); \
+                  stty sane; printf 'GOT:%s' \"$r\" | tr -d '\\033'; exec /bin/sleep 600";
+    let probe = start(&sh(script));
+    assert!(wait_for_text(&probe.session, "GOT:[1;1R"));
+}
+
+#[test]
+fn resize_should_send_exactly_one_sigwinch_with_new_size() {
+    let probe = start(&sh(
+        "trap 'echo WINCH $(stty size)' WINCH; echo READY; while :; do /bin/sleep 0.05; done",
+    ));
+    assert!(wait_for_text(&probe.session, "READY"));
+    probe.session.resize(GridSize {
+        rows: 30,
+        cols: 100,
+        cell_width: 8,
+        cell_height: 16,
+    });
+    assert!(wait_for_text(&probe.session, "WINCH 30 100"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(screen(&probe.session).matches("WINCH").count(), 1);
+}
+
+#[test]
+fn clear_history_should_drop_scrollback() {
+    let probe = start(&sh("seq 1 300; exec /bin/sleep 600"));
+    assert!(wait_until(Duration::from_secs(5), || probe
+        .session
+        .memory()
+        .history_lines
+        > 250));
+    probe.session.clear_history();
+    assert_eq!(probe.session.memory().history_lines, 0);
+}
+
+#[test]
+fn memory_should_follow_cells_formula() {
+    let probe = start(&sh("seq 1 300; exec /bin/sleep 600"));
+    assert!(wait_until(Duration::from_secs(5), || probe
+        .session
+        .memory()
+        .history_lines
+        > 250));
+    let usage = probe.session.memory();
+    assert_eq!(usage.grid_bytes, (usage.history_lines + 24) * 80 * 24);
+}
+
+#[test]
+fn selection_text_should_return_selected_word() {
+    let probe = start(&sh("printf 'alpha beta gamma'; exec /bin/sleep 600"));
+    assert!(wait_for_text(&probe.session, "alpha beta gamma"));
+    let cell = kil_term::ViewportCell {
+        row: 0,
+        col: 7,
+        right_half: false,
+    };
+    probe
+        .session
+        .start_selection(kil_term::SelectionKind::Words, cell);
+    assert_eq!(probe.session.selection_text().as_deref(), Some("beta"));
+}

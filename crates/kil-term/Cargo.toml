@@ -1,0 +1,19 @@
+[package]
+name = "kil-term"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+polling.workspace = true
+libc.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+libc.workspace = true

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Kil</string>
+	<key>CFBundleDisplayName</key>
+	<string>Kil</string>
+	<key>CFBundleExecutable</key>
+	<string>kil</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.kil.terminal</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<!-- Quit must run our orderly session shutdown (DESIGN.md §4.6). -->
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<!-- A throttled PTY reader stalls builds running in background tabs. -->
+	<key>NSAppSleepDisabled</key>
+	<true/>
+	<!-- Kil is the TCC responsible process for every program it runs (DESIGN.md §11). -->
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Programs you run in Kil want to access your Desktop folder.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Programs you run in Kil want to access your Documents folder.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Programs you run in Kil want to access your Downloads folder.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Programs you run in Kil want to access removable volumes.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Programs you run in Kil want to access network volumes.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>A program you run in Kil wants to use the camera.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A program you run in Kil wants to use the microphone.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>A program you run in Kil wants to control another app.</string>
+</dict>
+</plist>
