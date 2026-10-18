@@ -375,6 +375,19 @@ impl Session {
         proc_info::foreground(self.shell?, self.tty)
     }
 
+    /// Working directory of the shell itself, even while its job runs elsewhere.
+    #[must_use]
+    pub fn shell_cwd(&self) -> Option<PathBuf> {
+        proc_info::shell_cwd(self.shell?)
+    }
+
+    /// Arguments of the foreground job, `argv[0]` first, verified like [`Self::foreground`].
+    /// `None` while the shell is idle.
+    #[must_use]
+    pub fn job_args(&self) -> Option<Vec<OsString>> {
+        proc_info::job_args(self.shell?, self.tty)
+    }
+
     /// Whether a job other than the shell is in the foreground (closing should confirm).
     #[must_use]
     pub fn is_busy(&self) -> bool {

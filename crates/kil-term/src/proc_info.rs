@@ -1,6 +1,6 @@
 //! Process identity and foreground-job queries (DESIGN.md §4.3).
 
-use std::{num::NonZeroI32, path::PathBuf};
+use std::{ffi::OsString, num::NonZeroI32, path::PathBuf};
 
 use crate::sys;
 
@@ -123,6 +123,19 @@ pub(crate) fn foreground(shell: ProcIdentity, tty: TtyId) -> Option<ForegroundPr
         name: leader.name,
         is_shell: false,
     })
+}
+
+/// Arguments of the foreground job, `argv[0]` first. `None` while the shell itself is in the
+/// foreground, or when the job's arguments can't be read (another user's process, e.g. `sudo`).
+pub(crate) fn job_args(shell: ProcIdentity, tty: TtyId) -> Option<Vec<OsString>> {
+    let job = foreground(shell, tty).filter(|job| !job.is_shell)?;
+    sys::proc_args(job.pid.get())
+}
+
+/// Working directory of the shell itself, wherever its foreground job runs.
+pub(crate) fn shell_cwd(shell: ProcIdentity) -> Option<PathBuf> {
+    shell.info().filter(|info| !info.zombie)?;
+    sys::cwd(shell.pid.get())
 }
 
 #[cfg(test)]

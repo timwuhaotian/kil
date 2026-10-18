@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -18,6 +19,7 @@ use crate::{
     config,
     motion::{self, Ease, Tween},
     pane_tree::{Axis, Close, Direction, Node, PaneTree, Split, SplitId},
+    restore::{SavedPane, SavedTab, SavedWorkspace, Store},
     settings::Settings,
     terminal_element::cells,
     terminal_pane::{BLINK_INTERVAL, PaneEvent, TerminalPane},
@@ -63,6 +65,8 @@ const STATUS_SLOT: f32 = 10.;
 const TITLE_INSET: f32 = STATUS_SLOT + 6.;
 /// Natural exit before the reaper escalates on quit (DESIGN.md §4.6).
 const QUIT_GRACE: Duration = Duration::from_millis(500);
+/// What closing does to running jobs, for the confirmation.
+const STOPPED: &str = "will be stopped";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TabId(u64);
@@ -197,6 +201,11 @@ pub struct Workspace {
     config: config::Stamp,
     pane_subscriptions: HashMap<EntityId, Subscription>,
     close_confirmed: bool,
+    /// Where quitting saves the tabs for the next launch; `None` saves nothing (tests).
+    store: Option<Store>,
+    /// Every session was shut down: the window closed, or its last tab. The next launch then
+    /// starts fresh, so there is nothing left to save.
+    ended: bool,
     window_title: SharedString,
     /// Font size from the config file, for `font_reset`.
     base_font_size: f32,
@@ -208,7 +217,12 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(notices: Vec<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        notices: Vec<SharedString>,
+        store: Option<Store>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.reload_config_if_changed(window, cx);
@@ -224,6 +238,11 @@ impl Workspace {
             weak.update(cx, |this, cx| this.should_close_window(window, cx))
                 .unwrap_or(true)
         });
+        // A system logout or restart terminates the app without our Quit flow.
+        let quitting = cx.on_app_quit(|this, cx| {
+            this.save_session(cx);
+            async {}
+        });
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             tabs: Vec::new(),
@@ -238,39 +257,124 @@ impl Workspace {
             config: config::stamp(),
             pane_subscriptions: HashMap::new(),
             close_confirmed: false,
+            store: None,
+            ended: false,
             window_title: SharedString::default(),
             base_font_size: f32::from(cx.global::<Settings>().font_size),
             blink: None,
             blinking: None,
-            _subscriptions: vec![activation],
+            _subscriptions: vec![activation, quitting],
         };
-        this.open_tab(None, window, cx);
+        let saved = match store.as_ref().map(Store::take) {
+            Some(Ok(saved)) => saved,
+            Some(Err(err)) => {
+                this.notices.push(err.into());
+                None
+            }
+            None => None,
+        };
+        this.store = store;
+        if !saved.is_some_and(|saved| this.restore(saved, window, cx)) {
+            this.open_tab(None, window, cx);
+        }
         this.sync_blink(window, cx);
         this
+    }
+
+    /// Reopens the tabs of the last launch, each pane re-running its job; false if there
+    /// were none (DESIGN.md §4.9).
+    fn restore(
+        &mut self,
+        saved: SavedWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        for tab in saved.tabs {
+            let shape = tab.root.map(&mut |pane: SavedPane| {
+                self.new_pane(pane.cwd.map(PathBuf::from), pane.command, window, cx)
+            });
+            let tree = PaneTree::from_shape(shape);
+            let leaves = tree.leaves();
+            let Some(focused) = leaves
+                .get(tab.focused)
+                .or(leaves.first())
+                .map(|&pane| pane.clone())
+            else {
+                continue;
+            };
+            let id = TabId(self.next_tab);
+            self.next_tab += 1;
+            self.tabs.push(Tab {
+                id,
+                tree,
+                focused,
+                name: tab
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .map(Into::into),
+                finished: false,
+                animating: false,
+            });
+        }
+        let Some(last) = self.tabs.len().checked_sub(1) else {
+            return false;
+        };
+        // Set first, so the selection pill starts on the row instead of sliding to it.
+        self.active = saved.active.min(last);
+        self.activate(self.active, window, cx);
+        true
+    }
+
+    /// Saves the tabs, splits and running jobs for the next launch. Once the sessions have
+    /// ended there is nothing to save, and the next launch starts fresh.
+    fn save_session(&self, cx: &App) {
+        let Some(store) = self.store.as_ref().filter(|_| !self.ended) else {
+            return;
+        };
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| SavedTab {
+                name: tab.name.as_ref().map(ToString::to_string),
+                focused: tab
+                    .tree
+                    .leaves()
+                    .iter()
+                    .position(|&pane| *pane == tab.focused)
+                    .unwrap_or(0),
+                root: tab
+                    .tree
+                    .shape()
+                    .map(&mut |pane: &Entity<TerminalPane>| pane.read(cx).saved()),
+            })
+            .collect();
+        let saved = SavedWorkspace {
+            active: self.active,
+            tabs,
+        };
+        if let Err(err) = store.save(&saved) {
+            log::error!("{err}");
+        }
     }
 
     // ── tabs ──────────────────────────────────────────────────────────────────────────
 
     fn new_pane(
         &mut self,
-        cwd: Option<std::path::PathBuf>,
+        cwd: Option<PathBuf>,
+        rerun: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalPane> {
-        let pane = cx.new(|cx| TerminalPane::new(cwd, cx));
+        let pane = cx.new(|cx| TerminalPane::new(cwd, rerun, cx));
         let subscription = cx.subscribe_in(&pane, window, Self::on_pane_event);
         self.pane_subscriptions
             .insert(pane.entity_id(), subscription);
         pane
     }
 
-    fn open_tab(
-        &mut self,
-        cwd: Option<std::path::PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let pane = self.new_pane(cwd, window, cx);
+    fn open_tab(&mut self, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.new_pane(cwd, None, window, cx);
         let id = TabId(self.next_tab);
         self.next_tab += 1;
         self.tabs.push(Tab {
@@ -324,6 +428,7 @@ impl Workspace {
         self.confirm_close(
             &panes,
             "Close this tab?",
+            STOPPED,
             window,
             cx,
             move |this, window, cx| {
@@ -512,7 +617,7 @@ impl Workspace {
             return;
         };
         let cwd = target.read(cx).current_dir();
-        let pane = self.new_pane(cwd, window, cx);
+        let pane = self.new_pane(cwd, None, window, cx);
         let tab = &mut self.tabs[self.active];
         if tab.tree.split(&target, axis, pane.clone(), Instant::now()) {
             tab.focused = pane.clone();
@@ -574,12 +679,13 @@ impl Workspace {
 
     // ── closing, quitting ─────────────────────────────────────────────────────────────
 
-    /// Runs `then` now if no pane in `panes` has a foreground job; otherwise asks first
-    /// (DESIGN.md §4.7).
+    /// Runs `then` now if no pane in `panes` has a foreground job; otherwise asks first,
+    /// saying what happens to the jobs (DESIGN.md §4.7).
     fn confirm_close(
         &mut self,
         panes: &[Entity<TerminalPane>],
         message: &'static str,
+        outcome: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
@@ -593,10 +699,7 @@ impl Workspace {
             return;
         }
         let verb = if jobs.len() == 1 { "is" } else { "are" };
-        let detail = format!(
-            "{} {verb} still running and will be stopped.",
-            jobs.join(", ")
-        );
+        let detail = format!("{} {verb} still running and {outcome}.", jobs.join(", "));
         let answer = window.prompt(
             PromptLevel::Warning,
             message,
@@ -622,6 +725,7 @@ impl Workspace {
     /// Hangs up every session, gives shells a moment to exit (and save history), then lets
     /// the reaper SIGKILL stragglers. Blocks the UI for at most ~1 s, only on quit.
     fn shutdown_all(&mut self, cx: &mut Context<Self>) {
+        self.ended = true;
         for pane in self.all_panes() {
             pane.update(cx, |pane, _| pane.shutdown());
         }
@@ -651,6 +755,7 @@ impl Workspace {
         self.confirm_close(
             &self.all_panes(),
             "Close the window?",
+            STOPPED,
             window,
             cx,
             |this, window, cx| {
@@ -663,11 +768,25 @@ impl Workspace {
     }
 
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_close(&self.all_panes(), "Quit Kil?", window, cx, |this, _, cx| {
-            this.close_confirmed = true;
-            this.shutdown_all(cx);
-            cx.quit();
-        });
+        let outcome = if self.store.is_some() {
+            "will be stopped, then run again when Kil reopens"
+        } else {
+            STOPPED
+        };
+        self.confirm_close(
+            &self.all_panes(),
+            "Quit Kil?",
+            outcome,
+            window,
+            cx,
+            |this, _, cx| {
+                this.close_confirmed = true;
+                // Before the shutdown: it is the running jobs that get saved.
+                this.save_session(cx);
+                this.shutdown_all(cx);
+                cx.quit();
+            },
+        );
     }
 
     // ── settings ──────────────────────────────────────────────────────────────────────
@@ -1202,6 +1321,7 @@ impl Workspace {
         self.confirm_close(
             std::slice::from_ref(&pane),
             "Close this pane?",
+            STOPPED,
             window,
             cx,
             move |this, window, cx| this.remove_pane(&target, window, cx),
@@ -1442,13 +1562,20 @@ mod tests {
     const EMPTY_SIDEBAR: Point<Pixels> = point(px(100.), px(400.));
 
     fn workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+        workspace_saving_to(None, cx)
+    }
+
+    fn workspace_saving_to(
+        store: Option<Store>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
             cx.set_global(Theme::dark());
             cx.set_global(Settings::default());
             cx.bind_keys(text_field::bindings());
         });
         let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::new(Vec::new(), window, cx));
+            cx.add_window_view(|window, cx| Workspace::new(Vec::new(), store, window, cx));
         // Rows grow in over `ROW_IN` of wall time; click them at full height.
         std::thread::sleep(motion::ROW_IN + Duration::from_millis(20));
         cx.update(|window, _| window.refresh());
@@ -1597,6 +1724,94 @@ mod tests {
         assert!(blinking(cx));
         cx.deactivate_window();
         assert!(!blinking(cx));
+    }
+
+    fn scratch_store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("kil-ws-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::at(dir.join("session.toml"))
+    }
+
+    fn shell_in(cwd: &str, command: Option<&str>) -> crate::pane_tree::Shape<SavedPane> {
+        crate::pane_tree::Shape::Leaf(SavedPane {
+            cwd: Some(cwd.to_owned()),
+            command: command.map(str::to_owned),
+        })
+    }
+
+    #[gpui::test]
+    fn launch_should_reopen_the_saved_tabs_splits_and_names(cx: &mut TestAppContext) {
+        use crate::pane_tree::Shape;
+        let saved = SavedWorkspace {
+            active: 1,
+            tabs: vec![
+                SavedTab {
+                    name: None,
+                    focused: 0,
+                    root: shell_in("/", None),
+                },
+                SavedTab {
+                    name: Some("构建".to_owned()),
+                    focused: 2,
+                    root: Shape::Split {
+                        axis: Axis::Horizontal,
+                        ratio: 0.3,
+                        first: Box::new(shell_in("/tmp", Some("true"))),
+                        second: Box::new(Shape::Split {
+                            axis: Axis::Vertical,
+                            ratio: 0.5,
+                            first: Box::new(shell_in("/", None)),
+                            second: Box::new(shell_in("/usr", None)),
+                        }),
+                    },
+                },
+            ],
+        };
+        let store = scratch_store("reopen");
+        store.save(&saved).unwrap();
+        let (workspace, cx) = workspace_saving_to(Some(store), cx);
+        workspace.read_with(cx, |this, _| {
+            let tab = &this.tabs[1];
+            let leaves = tab.tree.leaves();
+            assert_eq!((this.tabs.len(), this.active), (2, 1));
+            assert_eq!(tab.name, Some("构建".into()));
+            assert_eq!(leaves.len(), 3);
+            assert!(tab.focused == *leaves[2]);
+            assert!(!tab.tree.is_animating(Instant::now()));
+        });
+    }
+
+    #[gpui::test]
+    fn quit_should_save_the_layout_for_the_next_launch(cx: &mut TestAppContext) {
+        let store = scratch_store("quit");
+        let path = store.path().to_owned();
+        let (workspace, cx) = workspace_saving_to(Some(store), cx);
+        cx.dispatch_action(SplitRight);
+        workspace.update(cx, |this, _| this.tabs[0].name = Some("dev".into()));
+        cx.dispatch_action(Quit);
+        cx.run_until_parked();
+        let saved = Store::at(path).take().unwrap().unwrap();
+        assert_eq!(saved.tabs.len(), 1);
+        assert_eq!(saved.tabs[0].name.as_deref(), Some("dev"));
+        assert_eq!(saved.tabs[0].focused, 1);
+        assert!(matches!(
+            saved.tabs[0].root,
+            crate::pane_tree::Shape::Split {
+                axis: Axis::Horizontal,
+                ..
+            }
+        ));
+    }
+
+    #[gpui::test]
+    fn closing_the_last_tab_should_leave_nothing_to_restore(cx: &mut TestAppContext) {
+        let store = scratch_store("closed");
+        let path = store.path().to_owned();
+        let (workspace, cx) = workspace_saving_to(Some(store), cx);
+        cx.dispatch_action(CloseTab);
+        // What the app-quit hook that follows does.
+        workspace.read_with(cx, Workspace::save_session);
+        assert_eq!(Store::at(path).take(), Ok(None));
     }
 
     #[gpui::test]

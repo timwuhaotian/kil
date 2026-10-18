@@ -21,6 +21,7 @@ use kil_term::{
 
 use crate::{
     keys,
+    restore::{self, SavedPane},
     settings::Settings,
     terminal_element::{TerminalElement, cells},
     theme::Theme,
@@ -31,6 +32,9 @@ actions!(terminal, [Copy, Paste, ClearScrollback]);
 pub const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// Process info (title, cwd, busy) refreshes at most this often, trailing the last output.
 const INFO_DEBOUNCE: Duration = Duration::from_millis(250);
+/// A restored job is typed this long after its shell started, if the shell's line editor
+/// never announced itself (see [`TerminalPane::rerun`]).
+const RERUN_FALLBACK: Duration = Duration::from_secs(3);
 
 /// What a pane tells its tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +103,10 @@ pub struct TerminalPane {
     /// While the tab's layout animates, keep the grid: one resize when it settles, not one
     /// per frame (DESIGN.md §6.3).
     frozen: bool,
+    /// Where the shell was asked to start.
+    start_dir: Option<PathBuf>,
+    /// A job from the last launch, typed into the shell once it is ready (DESIGN.md §4.9).
+    rerun: Option<String>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -111,7 +119,7 @@ impl Focusable for TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+    pub fn new(cwd: Option<PathBuf>, rerun: Option<String>, cx: &mut Context<Self>) -> Self {
         let settings = cx.global::<Settings>();
         let mut config = SessionConfig::new(GridSize {
             rows: 24,
@@ -119,7 +127,7 @@ impl TerminalPane {
             cell_width: 8,
             cell_height: 16,
         });
-        config.cwd = cwd;
+        config.cwd.clone_from(&cwd);
         config.scrollback_lines = settings.scrollback_lines;
 
         let (tx, rx) = mpsc::unbounded();
@@ -158,6 +166,8 @@ impl TerminalPane {
             },
             info_refresh: None,
             frozen: false,
+            start_dir: cwd,
+            rerun,
             _tasks: tasks,
         }
     }
@@ -198,6 +208,42 @@ impl TerminalPane {
         }
     }
 
+    /// What to reopen here at the next launch: the shell's directory and its foreground job,
+    /// or the job still waiting to be re-run.
+    pub fn saved(&self) -> SavedPane {
+        let session = self.session.as_ref();
+        let cwd = session
+            .and_then(Session::shell_cwd)
+            .or_else(|| self.start_dir.clone());
+        let command = self.rerun.clone().or_else(|| {
+            session
+                .and_then(Session::job_args)
+                .and_then(|args| restore::command_line(&args))
+        });
+        SavedPane {
+            cwd: cwd.and_then(|dir| dir.into_os_string().into_string().ok()),
+            command,
+        }
+    }
+
+    /// Types the restored job into the shell once its line editor waits for input, which
+    /// zsh, bash 5.1+ and fish announce by turning on bracketed paste; pasted, the line can't
+    /// trigger completion or other widgets. `force` types it anyway, for shells that never do.
+    fn rerun(&mut self, force: bool) {
+        let Some(session) = self.session.as_ref().filter(|_| self.rerun.is_some()) else {
+            return;
+        };
+        let bracketed = session.input_mode().bracketed_paste();
+        if !bracketed && !force {
+            return;
+        }
+        if let Some(command) = self.rerun.take() {
+            let mut bytes = keys::paste(&command, bracketed);
+            bytes.push(b'\r');
+            session.write(bytes);
+        }
+    }
+
     /// Ends the session now (hangup + reaper), keeping the last frame on screen for the
     /// close animation.
     pub fn shutdown(&mut self) {
@@ -225,6 +271,7 @@ impl TerminalPane {
         if self.session.as_ref().is_some_and(Session::take_dirty) {
             self.stale = true;
         }
+        self.rerun(false);
         let foreground = self.session.as_ref().and_then(Session::foreground);
         let cwd = foreground.as_ref().and_then(|fg| fg.cwd.clone());
         let job = foreground
@@ -263,6 +310,13 @@ impl TerminalPane {
                 self.stale = true;
                 self.status = Status::Running;
                 self.schedule_info_refresh(cx);
+                if self.rerun.is_some() {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(RERUN_FALLBACK).await;
+                        let _ = this.update(cx, |pane, _| pane.rerun(true));
+                    })
+                    .detach();
+                }
             }
             Err(err) => {
                 log::error!("session failed to start: {err:#}");
@@ -281,6 +335,7 @@ impl TerminalPane {
         for event in batch.drain(..) {
             match event {
                 SessionEvent::Wakeup => {
+                    self.rerun(false);
                     self.schedule_info_refresh(cx);
                     cx.notify();
                 }
@@ -339,6 +394,8 @@ impl TerminalPane {
 
     fn send(&mut self, bytes: impl Into<Cow<'static, [u8]>>, cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
+        // Typing before the restored job ran: the user has taken the pane over.
+        self.rerun = None;
         session.scroll_to_bottom();
         session.clear_selection();
         session.write(bytes);

@@ -3,10 +3,13 @@
 
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use crate::motion::{self, Ease, Tween};
 
 /// `Horizontal` places children side by side; `Vertical` stacks them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Axis {
     Horizontal,
     Vertical,
@@ -98,6 +101,41 @@ enum Side {
     Second,
 }
 
+/// A tree's structure without animation state, leaves in [`PaneTree::leaves`] order: what a
+/// saved layout holds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Shape<T> {
+    // First, so reading tries it first: a leaf's optional fields would accept a split's table.
+    Split {
+        axis: Axis,
+        ratio: f32,
+        first: Box<Shape<T>>,
+        second: Box<Shape<T>>,
+    },
+    Leaf(T),
+}
+
+impl<T> Shape<T> {
+    /// The same shape with each leaf replaced by `f(leaf)`, in leaf order.
+    pub fn map<U>(self, f: &mut impl FnMut(T) -> U) -> Shape<U> {
+        match self {
+            Self::Leaf(leaf) => Shape::Leaf(f(leaf)),
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => Shape::Split {
+                axis,
+                ratio,
+                first: Box::new(first.map(f)),
+                second: Box::new(second.map(f)),
+            },
+        }
+    }
+}
+
 /// What closing a leaf did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Close {
@@ -129,6 +167,18 @@ impl<T: Clone + PartialEq> PaneTree<T> {
 
     pub fn root(&self) -> &Node<T> {
         &self.root
+    }
+
+    /// A settled tree laid out like `shape`, e.g. one saved by an earlier launch.
+    pub fn from_shape(shape: Shape<T>) -> Self {
+        let mut next_id = 0;
+        let root = node_from(shape, &mut next_id);
+        Self { root, next_id }
+    }
+
+    /// Where the layout is heading: target ratios, closing leaves left out.
+    pub fn shape(&self) -> Shape<&T> {
+        shape_of(&self.root)
     }
 
     /// Splits `target`: it keeps the first half and `new` animates in as the second.
@@ -245,6 +295,51 @@ impl<T: Clone + PartialEq> PaneTree<T> {
             })
             .min_by(|a, b| a.1.total_cmp(&b.1).then(b.2.total_cmp(&a.2)))
             .map(|(leaf, _, _)| leaf)
+    }
+}
+
+fn node_from<T>(shape: Shape<T>, next_id: &mut u64) -> Node<T> {
+    match shape {
+        Shape::Leaf(leaf) => Node::Leaf(leaf),
+        Shape::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let id = SplitId(*next_id);
+            *next_id += 1;
+            // The saved file may have been edited by hand.
+            let ratio = if ratio.is_finite() {
+                ratio.clamp(MIN_RATIO, 1. - MIN_RATIO)
+            } else {
+                0.5
+            };
+            Node::Split(Box::new(Split {
+                id,
+                axis,
+                ratio: Tween::settled(ratio),
+                first: node_from(*first, next_id),
+                second: node_from(*second, next_id),
+                closing: None,
+            }))
+        }
+    }
+}
+
+fn shape_of<T>(node: &Node<T>) -> Shape<&T> {
+    match node {
+        Node::Leaf(leaf) => Shape::Leaf(leaf),
+        Node::Split(split) => match split.closing {
+            Some(Side::First) => shape_of(&split.second),
+            Some(Side::Second) => shape_of(&split.first),
+            None => Shape::Split {
+                axis: split.axis,
+                ratio: split.ratio.target(),
+                first: Box::new(shape_of(&split.first)),
+                second: Box::new(shape_of(&split.second)),
+            },
+        },
     }
 }
 
@@ -416,6 +511,30 @@ mod tests {
         let tree = three_panes();
         let first = tree.target_layout(Rect::UNIT)[0].1;
         assert!((first.w - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn from_shape_should_rebuild_the_layout_settled() {
+        let tree = PaneTree::from_shape(three_panes().shape().map(&mut |leaf| *leaf));
+        assert_eq!(
+            (tree.leaves(), tree.is_animating(Instant::now())),
+            (vec![&1, &2, &3], false)
+        );
+        assert_eq!(tree.neighbor(&2, Direction::Down), Some(&3));
+    }
+
+    #[test]
+    fn shape_should_leave_out_a_closing_leaf() {
+        let mut tree = three_panes();
+        tree.close(&2, Instant::now());
+        let shape = tree.shape().map(&mut |leaf| *leaf);
+        let expected = Shape::Split {
+            axis: Axis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(Shape::Leaf(1)),
+            second: Box::new(Shape::Leaf(3)),
+        };
+        assert_eq!(shape, expected);
     }
 
     #[test]

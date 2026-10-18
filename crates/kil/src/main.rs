@@ -5,6 +5,7 @@ mod keymap;
 mod keys;
 mod motion;
 mod pane_tree;
+mod restore;
 mod settings;
 mod settings_window;
 mod terminal_element;
@@ -139,7 +140,7 @@ fn main() {
             ..Default::default()
         };
         if let Err(err) = cx.open_window(options, |window, cx| {
-            cx.new(|cx| Workspace::new(notices, window, cx))
+            cx.new(|cx| Workspace::new(notices, restore::Store::standard(), window, cx))
         }) {
             log::error!("failed to open window: {err:#}");
             cx.quit();

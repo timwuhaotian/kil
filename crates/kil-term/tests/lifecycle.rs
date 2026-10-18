@@ -172,3 +172,45 @@ fn output_should_appear_in_snapshot_with_wide_chars_aligned() {
     let probe = start(&sh("printf 'hello 中文 kil'; exec /bin/sleep 600"));
     assert!(wait_for_text(&probe.session, "hello 中文 kil"));
 }
+
+#[test]
+fn job_args_should_report_the_foreground_command_line() {
+    let probe = start(&zsh());
+    assert!(wait_until(Duration::from_secs(5), || probe
+        .session
+        .foreground()
+        .is_some_and(|fg| fg.is_shell)));
+    assert_eq!(probe.session.job_args(), None);
+    // `; :` keeps sh from exec-ing into sleep, which would replace the arguments.
+    probe
+        .session
+        .write(b"/bin/sh -c '/bin/sleep 600; :' 'a b' ''\n".as_slice());
+    // macOS /bin/sh re-execs a real shell, so its name varies; its arguments don't.
+    assert!(wait_until(Duration::from_secs(5), || probe
+        .session
+        .job_args()
+        .is_some_and(|args| args.len() == 5)));
+    let args = probe.session.job_args().unwrap();
+    assert_eq!(args[1..], ["-c", "/bin/sleep 600; :", "a b", ""]);
+}
+
+#[test]
+fn shell_cwd_should_stay_with_the_shell_while_a_job_runs_elsewhere() {
+    let mut config = zsh();
+    config.cwd = Some("/private/tmp".into());
+    let probe = start(&config);
+    assert!(wait_until(Duration::from_secs(5), || probe
+        .session
+        .foreground()
+        .is_some()));
+    probe
+        .session
+        .write(b"(cd /usr && exec /bin/sleep 600)\n".as_slice());
+    assert!(wait_for_foreground(&probe.session, "sleep"));
+    let job_cwd = probe.session.foreground().and_then(|fg| fg.cwd);
+    assert_eq!(job_cwd.as_deref(), Some(std::path::Path::new("/usr")));
+    assert_eq!(
+        probe.session.shell_cwd().as_deref(),
+        Some(std::path::Path::new("/private/tmp"))
+    );
+}

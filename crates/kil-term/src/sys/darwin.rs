@@ -5,7 +5,7 @@
 )]
 
 use std::{
-    ffi::{CStr, OsStr, c_char, c_int, c_void},
+    ffi::{CStr, OsStr, OsString, c_char, c_int, c_void},
     io,
     mem::{MaybeUninit, size_of},
     os::{
@@ -314,6 +314,58 @@ pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
     let info: libc::proc_vnodepathinfo = proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO)?;
     let path = c_chars_to_string(info.pvi_cdir.vip_path.as_flattened());
     (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Arguments `pid` was started with, `argv[0]` first. `None` for another user's process.
+pub(crate) fn proc_args(pid: i32) -> Option<Vec<OsString>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0_usize;
+    // SAFETY: a null buffer only asks the kernel for the size, written to `size`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            ptr::null_mut(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0_u8; size];
+    // SAFETY: the kernel writes at most `size` bytes into `buf` and stores how many it wrote.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    parse_proc_args(&buf)
+}
+
+/// `KERN_PROCARGS2` holds `argc` (native `int`), the executable path, NUL padding, then `argc`
+/// NUL-terminated arguments; the environment follows.
+fn parse_proc_args(buf: &[u8]) -> Option<Vec<OsString>> {
+    let (count, rest) = buf.split_first_chunk::<4>()?;
+    let count = usize::try_from(i32::from_ne_bytes(*count)).ok()?;
+    let rest = &rest[rest.iter().position(|&b| b == 0)?..];
+    let rest = &rest[rest.iter().position(|&b| b != 0)?..];
+    let args: Vec<OsString> = rest
+        .split(|&b| b == 0)
+        .take(count)
+        .map(|arg| OsStr::from_bytes(arg).to_os_string())
+        .collect();
+    (count > 0 && args.len() == count).then_some(args)
 }
 
 /// Open descriptor numbers of `pid`.
