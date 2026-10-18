@@ -9,14 +9,14 @@ Kil is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gp
 rendering) and [`alacritty_terminal`](https://github.com/alacritty/alacritty) (VT parsing). It
 owns every process, PID and file descriptor it creates.
 
-> **Status: 0.0.1, early.** macOS only for now: Apple silicon, macOS 14 or later. It is tested
+> **Status: 0.0.2, early.** macOS only for now: Apple silicon, macOS 14 or later. It is tested
 > on macOS 27.
 
 ## Features
 
 - **Vertical tabs** in a sidebar. A ring marks a tab with a running job, and a dot marks one
-  whose job finished while you weren't looking. Tabs can be renamed (IME works, Chinese
-  included).
+  whose job finished while you weren't looking. Double-click a tab to rename it (IME works,
+  Chinese included).
 - **Split panes** that animate open and closed. Drag the dividers; the focused pane is the
   bright one.
 - **Jobs outlive the window.** A small session server (`kil --server`, the same binary) holds
@@ -26,20 +26,25 @@ owns every process, PID and file descriptor it creates.
 - **Comes back after a restart, too.** The layout, each pane's directory, its screen and
   scrollback, and the window frame are saved every 2 s. After a logout or a reboot, the
   processes themselves are gone, so each pane's last job is typed into a new shell instead.
-- **Rebindable keys** in `~/.config/kil/keymap.toml`, and settings in a Settings window
-  (`⌘,`) or `~/.config/kil/config.toml`.
+- **Five themes**: Night, Paper (light), Fjord, Ember and Dusk. Programs that ask for the
+  terminal's colors, like vim deciding between light and dark, are told the theme's.
+- **A default directory** for new tabs, if you want one. Splits still open where their pane
+  is.
+- **Rebindable keys** in `~/.config/kil/keymap.toml` (**Kil ▸ Keyboard Shortcuts…** opens it),
+  with the menus showing whatever is bound. Settings live in a Settings window (`⌘,`) or
+  `~/.config/kil/config.toml`.
 - **Strict about processes.** Children get clean descriptors and signal masks. A closed pane is
   hung up, then killed after 3 s if it ignores the hangup. No zombies, no leaked jobs. It is
   covered by integration tests that run real processes.
 
 ## Install
 
-Download [`releases/Kil-0.0.1-arm64.dmg`](releases/Kil-0.0.1-arm64.dmg), open it, and drag
+Download [`releases/Kil-0.0.2-arm64.dmg`](releases/Kil-0.0.2-arm64.dmg), open it, and drag
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
 `releases/` also holds a `.sha256` for each DMG:
 
 ```sh
-shasum -a 256 -c Kil-0.0.1-arm64.dmg.sha256
+shasum -a 256 -c Kil-0.0.2-arm64.dmg.sha256
 ```
 
 ## Build from source
@@ -86,7 +91,7 @@ version comes from `Cargo.toml`.
 
 | Keys | Action |
 |---|---|
-| `⌘T` | New tab, in the focused pane's directory |
+| `⌘T` | New tab, in the default directory, else the focused pane's |
 | `⌘D` / `⌘⇧D` | Split right / split down |
 | `⌘W` / `⌘⇧W` | Close pane / close tab |
 | `⌘⌥←→↑↓` | Focus the pane in that direction |
@@ -97,10 +102,13 @@ version comes from `Cargo.toml`.
 | `⌘,` | Settings |
 | `⌘Q` | Quit; running jobs keep going |
 
-Right-click a tab to rename or close it, and double-click empty sidebar space for a new tab.
+Double-click a tab to rename it (Enter or clicking away saves, Esc cancels), right-click it
+for Rename / Close, and double-click empty sidebar space for a new tab.
 
-**`~/.config/kil/keymap.toml`** overrides any default. Unknown keys or commands show up in a
-banner, and the valid entries still apply. It is reloaded when the window regains focus.
+**`~/.config/kil/keymap.toml`** overrides any default. **Kil ▸ Keyboard Shortcuts…** opens it,
+creating a commented template the first time. Unknown keys or commands show up in a banner,
+and the valid entries still apply. It is reloaded when the window regains focus, and the menu
+bar then shows the new keys.
 
 ```toml
 [bindings]
@@ -112,8 +120,10 @@ banner, and the valid entries still apply. It is reloaded when the window regain
 **`~/.config/kil/config.toml`** (`$XDG_CONFIG_HOME` is respected):
 
 ```toml
+theme = "night"                  # night, paper, fjord, ember or dusk
 font_family = "Menlo"
 font_size = 13.0
+default_directory = "~/code"     # where new tabs open; leave out to follow the focused pane
 scrollback_lines = 10000
 option_as_meta = true
 cursor_blink = true

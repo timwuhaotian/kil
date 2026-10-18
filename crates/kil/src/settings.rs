@@ -1,9 +1,11 @@
 //! `~/.config/kil/config.toml` (DESIGN.md §9).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{Global, Pixels, SharedString, px};
 use serde::Deserialize;
+
+use crate::theme::ThemeName;
 
 /// User settings; every key is optional in the file.
 #[derive(Clone, Debug, PartialEq)]
@@ -13,6 +15,10 @@ pub struct Settings {
     pub scrollback_lines: usize,
     pub option_as_meta: bool,
     pub cursor_blink: bool,
+    pub theme: ThemeName,
+    /// Where new tabs open; splits follow their pane instead. `None`: new tabs follow the
+    /// focused pane too.
+    pub default_directory: Option<PathBuf>,
 }
 
 impl Global for Settings {}
@@ -25,6 +31,8 @@ impl Default for Settings {
             scrollback_lines: 10_000,
             option_as_meta: true,
             cursor_blink: true,
+            theme: ThemeName::default(),
+            default_directory: None,
         }
     }
 }
@@ -37,6 +45,8 @@ struct SettingsFile {
     scrollback_lines: Option<usize>,
     option_as_meta: Option<bool>,
     cursor_blink: Option<bool>,
+    theme: Option<ThemeName>,
+    default_directory: Option<String>,
 }
 
 impl Settings {
@@ -58,7 +68,36 @@ impl Settings {
             scrollback_lines: file.scrollback_lines.unwrap_or(defaults.scrollback_lines),
             option_as_meta: file.option_as_meta.unwrap_or(defaults.option_as_meta),
             cursor_blink: file.cursor_blink.unwrap_or(defaults.cursor_blink),
+            theme: file.theme.unwrap_or(defaults.theme),
+            default_directory: file.default_directory.as_deref().and_then(expand_home),
         })
+    }
+}
+
+/// `~` and `~/…` under `$HOME`; an empty path is no path.
+pub fn expand_home(path: &str) -> Option<PathBuf> {
+    let path = path.trim();
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    match path {
+        "" => None,
+        "~" => home(),
+        _ => match path.strip_prefix("~/") {
+            Some(rest) => home().map(|home| home.join(rest)),
+            None => Some(PathBuf::from(path)),
+        },
+    }
+}
+
+/// `path` with `$HOME` written as `~`, for showing and saving.
+pub fn abbreviate_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -125,6 +164,28 @@ mod tests {
     #[test]
     fn parse_should_reject_absurd_font_size() {
         assert!(Settings::parse("font_size = 400.0").is_err());
+    }
+
+    #[test]
+    fn parse_should_read_the_theme_and_expand_the_default_directory() {
+        let settings =
+            Settings::parse("theme = \"paper\"\ndefault_directory = \"~/code\"").unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            (settings.theme, settings.default_directory),
+            (ThemeName::Paper, Some(home.join("code")))
+        );
+    }
+
+    #[test]
+    fn parse_should_treat_an_empty_default_directory_as_none() {
+        let settings = Settings::parse("default_directory = \"\"").unwrap();
+        assert_eq!(settings.default_directory, None);
+    }
+
+    #[test]
+    fn parse_should_reject_an_unknown_theme() {
+        assert!(Settings::parse("theme = \"neon\"").is_err());
     }
 
     #[test]

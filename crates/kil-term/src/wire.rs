@@ -9,11 +9,16 @@ use std::{
     process::ExitStatus,
 };
 
-use crate::session::{GridSize, Program, SessionConfig};
+use crate::{
+    session::{GridSize, Program, SessionConfig},
+    snapshot::{Palette, Rgba},
+};
 
-/// Bumped only when frames change incompatibly: a mismatch costs every running job
-/// (DESIGN.md §14.3).
-pub(crate) const PROTOCOL: u32 = 1;
+/// The newest protocol spoken. 2 added `Palette`, and the palette at the end of a `Spawn`,
+/// which a protocol-1 server ignores. Each side speaks down to `MIN_PROTOCOL`, so a new app
+/// keeps the jobs of a server started by an older one (DESIGN.md §14.3).
+pub(crate) const PROTOCOL: u32 = 2;
+pub(crate) const MIN_PROTOCOL: u32 = 1;
 /// A frame larger than this is a corrupt or hostile stream.
 const MAX_FRAME: usize = 16 << 20;
 /// Output is forwarded in chunks of at most this many bytes.
@@ -59,6 +64,8 @@ pub(crate) enum Frame {
     Failed(String),
     Output(Vec<u8>),
     Exited(ExitStatus),
+    /// Client to server, protocol 2: answer color queries from this from now on.
+    Palette(Palette),
 }
 
 impl Frame {
@@ -79,6 +86,7 @@ impl Frame {
             Self::Failed(_) => 13,
             Self::Output(_) => OUTPUT,
             Self::Exited(_) => 15,
+            Self::Palette(_) => 16,
         }
     }
 
@@ -113,6 +121,7 @@ impl Frame {
             }
             Self::Failed(message) => put.str(message),
             Self::Exited(status) => put.u32(status.into_raw().cast_unsigned()),
+            Self::Palette(palette) => put.palette(palette),
         }
         let len = u32::try_from(out.len() - start - 4).unwrap_or(u32::MAX);
         out[start..start + 4].copy_from_slice(&len.to_le_bytes());
@@ -150,6 +159,7 @@ impl Frame {
             13 => Self::Failed(get.str()?),
             OUTPUT => Self::Output(get.rest()),
             15 => Self::Exited(ExitStatus::from_raw(get.u32()?.cast_signed())),
+            16 => Self::Palette(get.palette()?),
             _ => return Err(invalid("unknown frame kind")),
         };
         Ok(frame)
@@ -199,6 +209,17 @@ impl Put<'_> {
         self.u16(size.cell_height);
     }
 
+    fn palette(&mut self, palette: &Palette) {
+        let colors =
+            palette
+                .ansi
+                .iter()
+                .chain([&palette.foreground, &palette.background, &palette.cursor]);
+        for color in colors {
+            self.0.extend_from_slice(&[color.r, color.g, color.b]);
+        }
+    }
+
     fn config(&mut self, config: &SessionConfig) {
         match &config.program {
             Program::LoginShell => self.0.push(0),
@@ -226,6 +247,8 @@ impl Put<'_> {
             self.os(value);
         }
         self.bytes(&config.replay);
+        // Last, so a protocol-1 server stops reading before it.
+        self.palette(&config.palette);
     }
 }
 
@@ -293,6 +316,28 @@ impl Get<'_> {
         })
     }
 
+    fn color(&mut self) -> io::Result<Rgba> {
+        let rgb = self.take(3)?;
+        Ok(Rgba {
+            r: rgb[0],
+            g: rgb[1],
+            b: rgb[2],
+        })
+    }
+
+    fn palette(&mut self) -> io::Result<Palette> {
+        let mut ansi = [Rgba::default(); 16];
+        for slot in &mut ansi {
+            *slot = self.color()?;
+        }
+        Ok(Palette {
+            ansi,
+            foreground: self.color()?,
+            background: self.color()?,
+            cursor: self.color()?,
+        })
+    }
+
     fn config(&mut self) -> io::Result<SessionConfig> {
         let program = match self.u8()? {
             0 => Program::LoginShell,
@@ -315,7 +360,14 @@ impl Get<'_> {
             .map(|_| Ok((self.os()?, self.os()?)))
             .collect::<io::Result<_>>()?;
         let replay = self.bytes()?;
+        // A protocol-1 client sends none.
+        let palette = if self.0.is_empty() {
+            Palette::default()
+        } else {
+            self.palette()?
+        };
         let mut config = SessionConfig::new(size);
+        config.palette = palette;
         config.program = program;
         config.cwd = cwd;
         config.scrollback_lines = scrollback_lines;
@@ -445,6 +497,8 @@ mod tests {
         config.cwd = Some("/tmp".into());
         config.env = vec![("A".into(), "b".into())];
         config.replay = b"\x1b[31mold".to_vec();
+        config.palette.background = Rgba { r: 1, g: 2, b: 3 };
+        let palette = config.palette.clone();
         let frames = [
             Frame::Hello { protocol: PROTOCOL },
             Frame::Spawn {
@@ -462,6 +516,7 @@ mod tests {
             Frame::Output(b"\x00\xff".to_vec()),
             Frame::Exited(ExitStatus::from_raw(3 << 8)),
             Frame::Close,
+            Frame::Palette(palette),
         ];
         for frame in frames {
             assert_eq!(round_trip(&frame), frame);

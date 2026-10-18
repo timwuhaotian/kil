@@ -17,6 +17,7 @@ Build status:
 - **A18** (reopen everything after any exit: quit, closed window, logout, crash) is implemented (§4.9). `workspace`, `restore`, `transcript`, `terminal` and `lifecycle` tests cover it. A run of the real binary was checked by hand: a `kill -9` and a terminate (as at logout) each reopened the screen and re-ran the job, and a crash during reopening skipped the re-run. No jobs were left behind.
 - A dev bundle is built with `scripts/bundle.sh`. The icon source is `packaging/app-icon.png` (1254 px, transparent outside its rounded square); `sips` renders the sizes.
 - Release signing and notarization (the rest of M6) is not done yet.
+- **0.0.2** adds five themes (A22), a default directory for new tabs (A23), renaming a tab with a double-click (A16), and menus that follow `keymap.toml` plus **Keyboard Shortcuts…** (A8). The session server protocol is 2, and it talks down to 0.0.1's server.
 - **§14, the session server** (jobs continue across a quit or an app crash), is built through S3. Its tests pass (`server.rs`, the server half of `crash.rs`, and `workspace` GPUI tests), and the real binary was checked by hand. The app was quit, and separately `kill -9`ed. Each time, three panes kept the same shell PIDs and their jobs kept running, and the next launch went back on them. Killing the server hung its jobs up. Throughput and echo latency through the server match a local session (§6.4). S4's TCC check on a fresh install is not done yet.
 
 ---
@@ -34,17 +35,19 @@ Build status:
 | A5 | A non-zero exit or a signal death keeps the pane open with a banner showing `exited 1` or `killed: SIGKILL`. Any key closes it. | `exit 3`. |
 | A6 | Focus moves between panes with `cmd-alt-arrows` or a click. The focused pane is the bright one, and the others are dimmed to about half. Dividers can be dragged to resize. | Manual + `workspace` GPUI test (click focuses). |
 | A7 | Switch tabs by clicking, `cmd-1…9`, or `cmd-shift-[ / ]`. | Manual. |
-| A8 | `~/.config/kil/keymap.toml` overrides any default, including the split keys. Invalid entries appear in a banner with the key and the reason, and valid entries still apply. The file is reloaded when the window regains focus. | Rebind the split keys. |
+| A8 | `~/.config/kil/keymap.toml` overrides any default, including the split and close keys. Invalid entries appear in a banner with the key and the reason, and valid entries still apply. The file is reloaded when the window regains focus, and the menu bar is set again so its items show the keys now bound. **Kil ▸ Keyboard Shortcuts…** opens the file in the default text editor, first writing a commented template that lists the commands. | Rebind the split keys; `keymap` template test. |
 | A9 | Terminal correctness: vim, htop, less, tmux, 256-color and truecolor, CJK wide characters aligned to the grid, **Chinese IME preedit at the cursor**, selection, copy, bracketed paste, trackpad scrollback. | Manual checklist. |
 | A10 | **Process hygiene.** Child fds are exactly 0, 1, 2 plus whatever the shell opens. Signal mask and ignore set are empty. Closing never blocks the UI thread. The session process is reaped within ≤ 3 s even if it ignores SIGHUP or is blocked writing. There are no zombies. | M1 integration tests (§4.8). |
 | A11 | **Memory.** Per-pane overhead without scrollback is ≤ 2 MB. Scrollback cost matches the formula in §5 within ±10%. A churn of 500 open/close cycles returns threads, fds, child count and live `TerminalPane` count to baseline. | Churn test plus `footprint`. |
 | A12 | **Performance.** Idle CPU is 0.0% with blink off and < 1% with blink on. Animations run at 120 fps with 4 panes streaming output (Metal HUD). Throughput is at least Terminal.app's on the same file. Keypress-to-photon is ≤ 1 frame after the PTY echo. | §6.4 |
 | A13 | Release build is signed with **Developer ID Application (team 43VLF3KTFZ)**, notarized and stapled, and `spctl -a -vv` accepts it. | §11 |
 | A14 | Right-clicking a sidebar row opens a menu with **Rename Tab…**, **Reset Name** (shown only when the tab has a name) and **Close Tab**. Rename edits the title in place, and IME input works. Enter or a click elsewhere keeps the edit, and Escape cancels it. An empty name goes back to the pane's title. The name also becomes the window title. | `workspace` GPUI tests + manual Pinyin. |
-| A15 | **Kil ▸ Settings…** (`cmd-,`) opens a separate Settings window, or brings the open one forward. It edits font family and size, scrollback, Option as Meta and cursor blink. Each change is written to `config.toml` and applied to the open window at once. The Kil menu also has Services, Hide, Hide Others and Show All. | `settings_window` / `config` tests + manual. |
-| A16 | Double-clicking empty space in the sidebar opens a tab, the same as `cmd-t`. Double-clicking a row does not. | `workspace` GPUI tests. |
+| A15 | **Kil ▸ Settings…** (`cmd-,`) opens a separate Settings window, or brings the open one forward. It edits the theme, font family and size, the default directory (typed, or picked with **Choose…**), scrollback, Option as Meta and cursor blink, and opens `keymap.toml`. Each change is written to `config.toml` and applied to the open window at once. The Kil menu also has Services, Hide, Hide Others and Show All. | `settings_window` / `config` tests + manual. |
+| A16 | Double-clicking empty space in the sidebar opens a tab, the same as `cmd-t`. Double-clicking a row renames it in place, as Rename Tab… does: Enter or focus leaving the field saves, and Escape cancels. | `workspace` GPUI tests. |
 | A17 | A sidebar row shows a **ring** while any of its panes runs a foreground job, a **dot** when a job ended while the tab was not in view (a background tab, or the window inactive) until the tab is viewed, and a red **!** while a pane shows its exit banner. The marks are static: nothing animates while a job runs. | `workspace` GPUI tests + `take_dirty` test. |
 | A18 | However kil ended (`cmd-q`, the window's close button, a logout or restart, a crash or `kill -9`), the next launch reopens what was there: the window frame, the tabs with their names and order, the active tab, each tab's splits, ratios and focused pane, and in each pane the shell's cwd and its old screen and scrollback with colors. A pane that had a foreground job types that job's command line into its new shell again. While kil runs this is saved at most every 2 s, which bounds what a crash can lose. Closing the last tab leaves nothing to reopen. If kil dies within 10 s of reopening, the next launch reopens without re-running the jobs. | `workspace` / `restore` / `transcript` / `lifecycle` tests + manual. |
+| A22 | Five themes (Night, Paper, Fjord, Ember, Dusk), picked from swatches in Settings or with `theme` in `config.toml`. A change restyles the chrome and every pane at once, and programs that ask for the terminal's colors (OSC 10/11/4, e.g. vim choosing light or dark) get the new palette. | `theme` tests, `color_queries_should_follow_the_theme_palette`, contrast checked (§7). |
+| A23 | With a default directory set, new tabs open there (`cmd-t`, `+ New Tab`, a double-click on the sidebar, the first tab of a fresh launch). Splits still open where their pane is. Without one, a new tab follows the focused pane, as before. | `workspace` GPUI test + manual. |
 
 ### Non-goals (v1)
 These are left out and can be added later:
@@ -387,6 +390,8 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 
 ## 7. UI and motion
 
+**Themes** (`theme.rs`, A22). Each is a terminal palette (16 ANSI colors, foreground, background, cursor) plus chrome colors. **Night** is the original near-black. **Paper** is light, and its inactive panes fade toward the paper instead of darkening. **Fjord** is a cool steel blue, **Ember** a warm brown, **Dusk** a violet. Default text contrasts with the background by at least 11.5:1 in all five. Paper's colors 1–6 and 9–14 are at least 4.5:1 (WCAG AA), and bright black (comments, shell autosuggestions) is ~3.2:1 in the dark themes. A change re-snapshots every pane, because cells are resolved to colors when copied, and sends the palette to each session (§14.4).
+
 **Window**
 - `TitlebarOptions { appears_transparent: true, traffic_light_position: (14, 18) }`, so the sidebar runs to the top edge.
 - `WindowBackgroundAppearance::Blurred` behind the sidebar. The terminal area stays opaque for readability and to avoid overdraw.
@@ -471,6 +476,7 @@ App-level commands (`open_settings`, `hide`, `hide_others`, `quit`) bind with no
 - Errors are collected as `Vec<KeymapError { key, reason }>` and shown in a banner. Valid entries still apply.
 - The merged set is applied with `cx.clear_key_bindings()` and then `cx.bind_keys(defaults ⊕ user)`, in the `Workspace` key context. Bindings therefore win over terminal input, and unbound keys fall through.
 - Text field editing keys (`TextField` context: arrows, home/end, backspace, delete, `cmd-a`, `cmd-v`, enter, escape) and the Settings window's `cmd-w` are fixed. They are bound after the merged set and can't be changed in `keymap.toml`.
+- **Menus follow the keymap.** GPUI writes a menu item's key equivalent only when the menus are set. `config::apply` therefore sets them again after every bind, or a rebound `split_right` would still show, and trigger, its old key.
 
 **Fallthrough to the PTY** (`keys.rs`, written from xterm ctlseqs):
 - App-cursor and app-keypad modes, `CSI 1;mods` modifier encoding, ctrl-letters, function keys.
@@ -482,8 +488,10 @@ App-level commands (`open_settings`, `hide`, `hide_others`, `quit`) bind with no
 ## 9. Config (`~/.config/kil/config.toml`)
 
 ```toml
+theme = "night"                  # night, paper, fjord, ember or dusk
 font_family = "Menlo"
 font_size = 13.0
+default_directory = "~/code"     # where new tabs open; "" or absent: follow the focused pane
 scrollback_lines = 10000
 option_as_meta = true
 cursor_blink = true
@@ -656,7 +664,10 @@ The invariants of §4 move to the server unchanged: spawn hygiene, ownership-onl
 
 - **Starting.** At launch the app connects to `~/Library/Application Support/kil/server.sock`. If nothing answers, it runs `kil --server <dir>` with the same hygiene as a shell (§4.2: `setsid`, an empty signal mask, default dispositions, a CLOEXEC sweep), with stderr in `server.log`. The app waits ≤ 3 s for the socket. Two launches racing to start a server are serialized by `flock` on `server.lock`, and the loser exits, leaving the winner. If no server can be started, a server on a thread of the app stands in, and a notice says that jobs will end with Kil.
 - **No zombie, no ownership by the app.** `kil --server` forks first thing, while it is still single-threaded, and the parent exits. The app reaps that parent at once. The server itself is launchd's child from the start, so it never needs reaping by the app, and nothing in the app could kill it.
-- **Handshake.** The first frame on every connection is `Hello { protocol }`, checked for equality. *As built*, a mismatch fails the connection, and the stand-in thread server takes over. **Open, to do before the first protocol bump:** the planned hand-over. The app would take a §4.9 snapshot from the old server, stop its sessions, start the new server and reopen by re-running. Without it, an old server's jobs would keep running unseen. The protocol is versioned apart from the app (`wire::PROTOCOL = 1`) so that it changes only when it must.
+- **Handshake.** The first frame on every connection is `Hello { protocol }`. The protocol is versioned apart from the app. It is 2 now (0.0.2), and protocol 1 was 0.0.1's. Both sides speak down to `MIN_PROTOCOL` = 1:
+  - A server accepts any client protocol from `MIN_PROTOCOL` up to its own, and answers with its own.
+  - A protocol-1 server hangs up on any other hello, after answering it. The client then connects again in protocol 1. So an app upgraded while 0.0.1's server still runs keeps its jobs. It only loses palette updates, because protocol 2 added the `Palette` frame and a palette at the end of `Spawn`, which a protocol-1 server ignores (`client_should_speak_down_to_a_protocol_1_server`).
+  - **Open, before `MIN_PROTOCOL` is ever raised:** the hand-over. The app would take a §4.9 snapshot from the old server, stop its sessions, start the new server and reopen by re-running. Without it, an old server's jobs would keep running unseen.
 - **Detach.** `cmd-q` and the close button save the layout (§4.9), close the connections and exit. The sessions keep running.
 - **Reattach.** On launch the app asks the server for its sessions. Every pane in `session.toml` whose id the server still has is **attached**. Any other pane falls back to §4.9 (replay its screen, re-run its job). A session the server has but the layout doesn't is opened in an extra tab, so a running job is never left unseen.
 - **Losing the server.** Each pane's connection ends: its program ended, as far as the app can tell, so the pane shows the exit banner. The next launch finds no live sessions and reopens every pane through §4.9, as after a restart.
@@ -674,7 +685,7 @@ keys ─► app ─► socket ─► server ─► PTY master
 ```
 
 - **The server needs its own pane loop, not alacritty's `EventLoop`.** alacritty reads the PTY *before* it takes the terminal lock (`event_loop.rs`, `pty_read`). If the output were copied to the client at read time, an attach could land between that read and the parse, and those bytes would be lost or doubled. The server loop reads, parses and forwards under one lock, and an attach (render the state, then install the client) takes the same lock, so the hand-off is exact. The loop is small (read, write queue, resize, child exit through `Pty`'s kqueue), and it is the "custom loop" §13 already names as a trigger.
-- **Only the server answers.** Both Terms see every query (DA, CPR, OSC 10/11/4). The mirror's `PtyWrite`, size and color requests are dropped (`Role::Mirror`), and the server answers alone. Colors come from the program's own overrides, then kil-term's default palette, which is the app's theme. A query asked while no window is open is still answered.
+- **Only the server answers.** Both Terms see every query (DA, CPR, OSC 10/11/4). The mirror's `PtyWrite`, size and color requests are dropped (`Role::Mirror`), and the server answers alone. Colors come from the program's own overrides, then the session's palette. That is the app's theme, sent in `Spawn` and again in a `Palette` frame when it changes or a client attaches (protocol 2). A query asked while no window is open is still answered, with the last theme.
 - **One connection per pane, plus one control connection.** A pane connection starts with `Spawn` or `Attach`. After that it carries output and exit status (server to app) and input, resize and `Close` (app to server). Control carries `List` and `StopAll`. Frames are `u32` length + `u8` kind + payload, hand-written little-endian: no new dependency. Output is encoded and parsed in place, without a copy per frame.
 - **Flow control.** The server writes to a client without blocking. While more than 1 MiB waits for it, the server stops reading the PTY, so the program waits, as with any terminal that falls behind. A client that takes nothing for 2 s while output waits (the app is stopped or hung) is dropped. Its pane is detached, the PTY is read again, and the app reattaches later with the full state. A first version dropped any client 4 MiB behind instead, and a healthy client fell that far behind within milliseconds of `cat`ting a large file.
 - **Cost (measured, release).** `cat` of 27 MB takes 191–195 ms through the server against 178–200 ms locally. Keypress echo through `cat` has a p50 of 79 µs against 87 µs locally, and the p95 is ~170 µs for both. A new session's round trip (connect, spawn, attach) is ~1.7 ms. Scrollback is held twice, by the server and by the mirror, so A11's per-pane formula doubles.

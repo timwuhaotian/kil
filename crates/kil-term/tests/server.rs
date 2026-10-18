@@ -225,3 +225,62 @@ fn spawn_should_paint_the_replay_before_the_program_output() {
     assert!(text.find("OLD") < text.find("NEW"), "{text}");
     client.stop_all().unwrap();
 }
+
+#[test]
+fn color_queries_should_follow_the_theme_palette() {
+    let (dir, client) = server("palette");
+    let flag = dir.join("go");
+    let script = format!(
+        "stty raw -echo min 0 time 5; ask() {{ printf '\\033]11;?\\033\\\\' > /dev/tty; /bin/sleep 0.3; \
+         dd bs=256 count=1 2>/dev/null | tr -d '\\033\\\\'; }}; printf 'ONE:%s:\\r\\n' \"$(ask)\"; \
+         while [ ! -e '{}' ]; do /bin/sleep 0.05; done; printf 'TWO:%s:END' \"$(ask)\"; \
+         exec /bin/sleep 600",
+        flag.display()
+    );
+    let mut config = sh(&script);
+    config.palette.background = kil_term::Rgba::hex(0x00fb_faf7);
+    let session = spawn(&client, "a-1", &config);
+    assert!(wait_for_text(&session, "ONE:"));
+    let mut light = config.palette;
+    light.background = kil_term::Rgba::hex(0x0001_0203);
+    session.set_palette(&light);
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::write(&flag, "").unwrap();
+    assert!(wait_for_text(&session, ":END"));
+    let text = screen(&session);
+    assert!(text.contains("ONE:]11;rgb:fbfb/fafa/f7f7"), "{text}");
+    assert!(text.contains("TWO:]11;rgb:0101/0202/0303"), "{text}");
+    client.stop_all().unwrap();
+}
+
+/// A protocol-1 server: hangs up on any other hello, then lists no sessions.
+#[expect(clippy::unwrap_used, reason = "test helper: a failure fails the test")]
+fn protocol_1_server(dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(server::socket_path(dir)).unwrap();
+    std::thread::spawn(move || {
+        let hello_1 = frame(1, &1_u32.to_le_bytes());
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut hello = [0_u8; 9];
+            stream.read_exact(&mut hello).unwrap();
+            stream.write_all(&hello_1).unwrap();
+            if hello[5..9] != 1_u32.to_le_bytes() {
+                continue;
+            }
+            let mut list = [0_u8; 5];
+            if stream.read_exact(&mut list).is_ok() {
+                stream.write_all(&frame(9, &0_u32.to_le_bytes())).unwrap();
+            }
+        }
+    });
+}
+
+#[test]
+fn client_should_speak_down_to_a_protocol_1_server() {
+    let dir = std::env::temp_dir().join(format!("kil-srv-{}-v1", std::process::id()));
+    protocol_1_server(&dir);
+    let client = Client::connect(&dir).unwrap();
+    assert!(client.sessions().unwrap().is_empty());
+}

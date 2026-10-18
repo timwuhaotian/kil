@@ -332,7 +332,8 @@ impl Workspace {
             restored.is_some_and(|restored| this.restore(restored, &mut live, window, cx));
         this.adopt(live, window, cx);
         if !reopened && this.tabs.is_empty() {
-            this.open_tab(None, window, cx);
+            let cwd = cx.global::<Settings>().default_directory.clone();
+            this.open_tab(cwd, window, cx);
         } else if !reopened {
             this.activate(0, window, cx);
         }
@@ -1065,7 +1066,7 @@ impl Workspace {
 
     fn refresh_panes(&mut self, cx: &mut Context<Self>) {
         for pane in self.all_panes() {
-            pane.update(cx, |_, cx| cx.notify());
+            pane.update(cx, TerminalPane::restyle);
         }
         cx.notify();
     }
@@ -1199,9 +1200,17 @@ impl Workspace {
             .rounded_lg()
             .cursor_pointer()
             .when(!active, |row| row.hover(|style| style.bg(chrome.hover)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                this.activate_id(id, window, cx);
+                // Clicks inside the title being edited belong to the field.
+                if this.rename.as_ref().is_some_and(|rename| rename.tab == id) {
+                    return;
+                }
+                if event.click_count() == 2 {
+                    this.start_rename(id, window, cx);
+                } else {
+                    this.activate_id(id, window, cx);
+                }
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1519,11 +1528,18 @@ fn divider(drag: DividerDrag, horizontal: bool, ratio: f32, chrome: Chrome) -> i
 impl Workspace {
     // ── action handlers ───────────────────────────────────────────────────────────────
 
+    /// In the default directory if one is set (Settings); otherwise where the focused pane
+    /// is. Splits always follow their pane.
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.focused.read(cx).current_dir());
+        let cwd = cx
+            .global::<Settings>()
+            .default_directory
+            .clone()
+            .or_else(|| {
+                self.tabs
+                    .get(self.active)
+                    .and_then(|tab| tab.focused.read(cx).current_dir())
+            });
         self.open_tab(cwd, window, cx);
     }
 
@@ -1814,7 +1830,7 @@ mod tests {
     ) -> (Entity<Workspace>, &mut VisualTestContext) {
         let restored = store.as_ref().and_then(|store| store.load().unwrap());
         cx.update(|cx| {
-            cx.set_global(Theme::dark());
+            cx.set_global(Theme::default());
             cx.set_global(Settings::default());
             cx.bind_keys(text_field::bindings());
         });
@@ -1882,6 +1898,62 @@ mod tests {
         let (workspace, cx) = workspace(cx);
         click(cx, ROW, MouseButton::Left, 2);
         assert_eq!(tab_count(&workspace, cx), 1);
+    }
+
+    #[gpui::test]
+    fn double_click_on_a_row_should_rename_it_and_enter_should_save(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        click(cx, ROW, MouseButton::Left, 2);
+        assert!(workspace.read_with(cx, |this, _| this.rename.is_some()));
+        cx.simulate_input("日志");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(first_name(&workspace, cx), Some("日志".into()));
+    }
+
+    #[gpui::test]
+    fn a_rename_should_be_saved_when_its_field_loses_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        // GPUI tells views about focus leaving only in the active window.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        click(cx, ROW, MouseButton::Left, 2);
+        cx.simulate_input("x");
+        // Into the terminal: the field loses focus.
+        click(
+            cx,
+            point(px(SIDEBAR_WIDTH + 100.), px(300.)),
+            MouseButton::Left,
+            1,
+        );
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |this, _| this.rename.is_none()));
+        assert_ne!(first_name(&workspace, cx), None);
+    }
+
+    #[gpui::test]
+    fn new_tabs_should_open_in_the_default_directory_and_splits_follow_their_pane(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = workspace(cx);
+        let home = std::path::PathBuf::from("/usr");
+        cx.update(|_, cx| {
+            let settings = Settings {
+                default_directory: Some(home.clone()),
+                ..cx.global::<Settings>().clone()
+            };
+            cx.set_global(settings);
+        });
+        let started_in = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |this, cx| {
+                this.tabs[this.active].focused.read(cx).start_dir().cloned()
+            })
+        };
+        // The first tab's shell is not in the default directory, and its split follows it.
+        cx.dispatch_action(SplitRight);
+        assert_ne!(started_in(&workspace, cx), Some(home.clone()));
+        cx.dispatch_action(NewTab);
+        assert_eq!(started_in(&workspace, cx), Some(home));
     }
 
     #[gpui::test]

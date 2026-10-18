@@ -6,16 +6,16 @@ use std::fs;
 
 use gpui::{
     AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, Div, Entity, FocusHandle,
-    Focusable, Hsla, KeyBinding, MouseButton, MouseDownEvent, SharedString, Stateful, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, point, prelude::*, px,
-    size,
+    Focusable, Hsla, KeyBinding, MouseButton, MouseDownEvent, PathPromptOptions, SharedString,
+    Stateful, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
+    point, prelude::*, px, size,
 };
 
 use crate::{
     config,
-    settings::{Settings, config_dir},
+    settings::{Settings, abbreviate_home, config_dir, expand_home},
     text_field::{FieldEvent, TextField},
-    theme::{Theme, hsla},
+    theme::{Theme, ThemeName, hsla},
     workspace,
 };
 
@@ -40,7 +40,7 @@ pub fn open(cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(460.), px(470.)),
+            size(px(460.), px(700.)),
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
@@ -70,6 +70,7 @@ pub struct SettingsWindow {
     file: Settings,
     font_family: Entity<TextField>,
     scrollback: Entity<TextField>,
+    directory: Entity<TextField>,
     /// Last problem reading or writing the file.
     error: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
@@ -90,15 +91,18 @@ impl SettingsWindow {
         let font_family = cx.new(|cx| TextField::new(&file.font_family, window, cx));
         let scrollback =
             cx.new(|cx| TextField::new(&file.scrollback_lines.to_string(), window, cx));
+        let directory = cx.new(|cx| TextField::new(&shown_directory(&file), window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&font_family, window, Self::font_family_edited),
             cx.subscribe_in(&scrollback, window, Self::scrollback_edited),
+            cx.subscribe_in(&directory, window, Self::directory_edited),
         ];
         Self {
             focus_handle: cx.focus_handle(),
             file,
             font_family,
             scrollback,
+            directory,
             error,
             _subscriptions: subscriptions,
         }
@@ -152,6 +156,56 @@ impl SettingsWindow {
         field.update(cx, |field, cx| field.set_text(&shown, cx));
     }
 
+    /// Saves `dir` as where new tabs open; `None` clears it.
+    fn set_directory(&mut self, dir: Option<&std::path::Path>, cx: &mut Context<Self>) {
+        match dir {
+            None => self.write("default_directory", &"".into(), cx),
+            Some(dir) if dir.is_dir() => {
+                self.write("default_directory", &abbreviate_home(dir).into(), cx);
+            }
+            Some(dir) => self.error = Some(format!("No such folder: {}", dir.display()).into()),
+        }
+        let shown = shown_directory(&self.file);
+        self.directory
+            .update(cx, |field, cx| field.set_text(&shown, cx));
+    }
+
+    fn directory_edited(
+        &mut self,
+        _: &Entity<TextField>,
+        event: &FieldEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let FieldEvent::Confirmed(text) = event {
+            self.set_directory(expand_home(text).as_deref(), cx);
+        }
+    }
+
+    fn choose_directory(cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = chosen.await
+                && let Some(dir) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |this, cx| this.set_directory(Some(&dir), cx));
+            }
+        })
+        .detach();
+    }
+
+    fn edit_keymap(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = config::open_keymap(cx) {
+            self.error = Some(err.into());
+            cx.notify();
+        }
+    }
+
     fn step_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = (f32::from(self.file.font_size) + delta).clamp(6., 72.);
         self.write("font_size", &f64::from(size).into(), cx);
@@ -167,6 +221,53 @@ impl SettingsWindow {
         }
         cx.notify();
     }
+}
+
+/// The default directory as typed in the field: `~` for home, empty for none.
+fn shown_directory(file: &Settings) -> String {
+    file.default_directory
+        .as_deref()
+        .map(abbreviate_home)
+        .unwrap_or_default()
+}
+
+/// A theme's card: its background, its accent and a run of its ANSI colors.
+fn swatch(name: ThemeName, chosen: bool, c: Colors) -> Stateful<Div> {
+    let theme = Theme::named(name);
+    let strip = [1, 2, 3, 4, 5, 6].map(|index| {
+        div()
+            .size(px(7.))
+            .rounded_full()
+            .bg(hsla(theme.terminal.ansi[index]))
+    });
+    div()
+        .id(name.key())
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(64.))
+                .h(px(44.))
+                .p(px(7.))
+                .flex()
+                .flex_col()
+                .justify_between()
+                .rounded_md()
+                .border_2()
+                .border_color(if chosen { c.accent } else { c.divider })
+                .bg(theme.terminal_bg)
+                .child(div().w(px(26.)).h(px(4.)).rounded_full().bg(theme.accent))
+                .child(div().flex().gap(px(2.)).children(strip)),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(if chosen { c.text } else { c.muted })
+                .child(name.label()),
+        )
 }
 
 /// Theme colors copied out so `cx` stays free for listeners while rendering.
@@ -324,9 +425,39 @@ impl SettingsWindow {
         ]
     }
 
+    fn appearance_rows(&self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let chosen = self.file.theme;
+        let swatches = ThemeName::ALL.map(|name| {
+            swatch(name, name == chosen, c).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| this.write("theme", &name.key().into(), cx),
+            ))
+        });
+        vec![
+            div()
+                .py_3()
+                .flex()
+                .justify_between()
+                .children(swatches)
+                .into_any_element(),
+        ]
+    }
+
     fn terminal_rows(&self, c: Colors, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let file = &self.file;
         vec![
+            row(
+                "Default directory",
+                Some("New tabs open here; splits follow their pane"),
+                c,
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(field_box(&self.directory, 130., window, c, cx))
+                    .child(button("choose-directory", "Choose…", c).on_click(
+                        cx.listener(|_, _: &ClickEvent, _, cx| Self::choose_directory(cx)),
+                    )),
+            ),
             row(
                 "Scrollback lines",
                 Some("Applies to new tabs and panes"),
@@ -364,13 +495,23 @@ impl Render for SettingsWindow {
         let c = Colors::of(cx.global::<Theme>());
         let font = self.font_rows(c, window, cx);
         let terminal = self.terminal_rows(c, window, cx);
-        let files = vec![row(
-            "Config files",
-            Some("config.toml, keymap.toml"),
-            c,
-            button("open-folder", "Open Folder", c)
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_folder(cx))),
-        )];
+        let appearance = self.appearance_rows(c, cx);
+        let files = vec![
+            row(
+                "Keyboard shortcuts",
+                Some("keymap.toml; the menus follow it"),
+                c,
+                button("edit-keymap", "Edit…", c)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.edit_keymap(cx))),
+            ),
+            row(
+                "Config files",
+                Some("config.toml, keymap.toml"),
+                c,
+                button("open-folder", "Open Folder", c)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_folder(cx))),
+            ),
+        ];
 
         div()
             .key_context("Settings")
@@ -407,6 +548,7 @@ impl Render for SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap_4()
+                    .child(section("THEME", c, appearance))
                     .child(section("FONT", c, font))
                     .child(section("TERMINAL", c, terminal))
                     .child(section("FILES", c, files))
@@ -431,7 +573,7 @@ mod tests {
     #[gpui::test]
     fn open_settings_should_open_one_window_and_reuse_it(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            cx.set_global(Theme::dark());
+            cx.set_global(Theme::default());
             cx.set_global(Settings::default());
             crate::register_app_actions(cx);
             cx.dispatch_action(&crate::OpenSettings);

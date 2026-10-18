@@ -30,7 +30,7 @@ use crate::{
     reaper,
     session::Session,
     spawn, sys,
-    wire::{self, Frame, PROTOCOL},
+    wire::{self, Frame, MIN_PROTOCOL, PROTOCOL},
 };
 
 /// With no session and no client for this long, the server exits.
@@ -278,7 +278,7 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
         return Ok(());
     };
     wire::send(&mut stream, &Frame::Hello { protocol: PROTOCOL })?;
-    if protocol != PROTOCOL {
+    if !(MIN_PROTOCOL..=PROTOCOL).contains(&protocol) {
         return Ok(());
     }
     loop {

@@ -59,6 +59,8 @@ pub(crate) enum Command {
     Resize(WindowSize),
     /// Hand this connection the session: its state, then its output.
     Attach(UnixStream),
+    /// Answer color queries from this palette.
+    Palette(Palette),
     Shutdown,
 }
 
@@ -110,6 +112,7 @@ pub(crate) fn spawn(
     term: Arc<FairMutex<Term<EventProxy>>>,
     events: EventProxy,
     pty: Pty,
+    palette: Palette,
 ) -> io::Result<()> {
     let pane_loop = PaneLoop {
         poller: Arc::clone(&channel.sender.poller),
@@ -123,6 +126,7 @@ pub(crate) fn spawn(
         interest: Event::readable(READ_WRITE_TOKEN),
         client: None,
         nudge: None,
+        palette,
     };
     thread::Builder::new()
         .name("kil-pane".into())
@@ -145,6 +149,8 @@ struct PaneLoop {
     client: Option<Client>,
     /// When to restore the size shrunk to make a full-screen program redraw.
     nudge: Option<(Instant, WindowSize)>,
+    /// What color queries are answered from, after the program's own overrides.
+    palette: Palette,
 }
 
 /// What ended the loop.
@@ -263,6 +269,7 @@ impl PaneLoop {
             match self.rx.try_recv() {
                 Ok(Command::Input(bytes)) => self.writes.push_back(bytes),
                 Ok(Command::Resize(size)) => self.pty.on_resize(size),
+                Ok(Command::Palette(palette)) => self.palette = palette,
                 Ok(Command::Attach(stream)) => {
                     if let Err(err) = self.attach(stream) {
                         log::warn!("attach failed: {err}");
@@ -310,17 +317,16 @@ impl PaneLoop {
     }
 
     /// OSC 4/10/11 queries from the parse just done: the program's own overrides first,
-    /// then the palette (the app's theme is kil-term's default).
+    /// then the palette of the app's theme.
     fn answer_colors(&mut self) {
         let queries = self.events.take_color_queries();
         if queries.is_empty() {
             return;
         }
-        let palette = Palette::default();
         let term = self.term.lock();
         for query in queries {
-            let color =
-                term.colors()[query.index].map_or_else(|| palette.slot(query.index), Rgba::from);
+            let color = term.colors()[query.index]
+                .map_or_else(|| self.palette.slot(query.index), Rgba::from);
             self.writes
                 .push_back((query.reply)(color.into()).into_bytes().into());
         }
@@ -424,6 +430,7 @@ impl PaneLoop {
             match frame {
                 Frame::Input(bytes) => self.writes.push_back(bytes.into()),
                 Frame::Resize(size) => self.resize(size),
+                Frame::Palette(palette) => self.palette = palette,
                 Frame::Close => close = true,
                 other => log::warn!("unexpected frame from client: {other:?}"),
             }

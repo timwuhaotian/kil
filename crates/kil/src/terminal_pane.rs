@@ -24,7 +24,7 @@ use kil_term::{
 use crate::{
     keys,
     restore::{self, SavedPane},
-    settings::Settings,
+    settings::{Settings, abbreviate_home},
     terminal_element::{TerminalElement, cells},
     theme::Theme,
 };
@@ -160,6 +160,7 @@ impl TerminalPane {
         config.cwd.clone_from(&cwd);
         config.scrollback_lines = settings.scrollback_lines;
         config.replay = replay;
+        config.palette = cx.global::<Theme>().terminal.clone();
 
         let (tx, rx) = mpsc::unbounded();
         let sink = move |event| {
@@ -272,6 +273,11 @@ impl TerminalPane {
     }
 
     #[cfg(test)]
+    pub fn start_dir(&self) -> Option<&PathBuf> {
+        self.start_dir.as_ref()
+    }
+
+    #[cfg(test)]
     pub fn pid(&self) -> Option<kil_term::Pid> {
         self.session.as_ref().map(Session::pid)
     }
@@ -306,6 +312,16 @@ impl TerminalPane {
             bytes.push(b'\r');
             session.write(bytes);
         }
+    }
+
+    /// Applies a new theme or font: redraws from a fresh snapshot (cells are resolved to
+    /// colors when copied), and tells the program's color queries about the palette.
+    pub fn restyle(&mut self, cx: &mut Context<Self>) {
+        self.stale = true;
+        if let Some(session) = &self.session {
+            session.set_palette(&cx.global::<Theme>().terminal);
+        }
+        cx.notify();
     }
 
     /// Ends the session now (hangup + reaper), keeping the last frame on screen for the
@@ -372,6 +388,8 @@ impl TerminalPane {
                 if let Some(grid) = self.grid {
                     session.resize(grid);
                 }
+                // An attached session started with whatever theme was on then.
+                session.set_palette(&cx.global::<Theme>().terminal);
                 self.session = Some(session);
                 self.stale = true;
                 self.status = Status::Running;
@@ -647,15 +665,6 @@ impl Render for TerminalPane {
             .on_scroll_wheel(cx.listener(Self::scroll))
             .child(TerminalElement::new(cx.entity(), focused))
             .children(banner)
-    }
-}
-
-fn abbreviate_home(dir: &std::path::Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    match home.as_deref().and_then(|home| dir.strip_prefix(home).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => dir.display().to_string(),
     }
 }
 

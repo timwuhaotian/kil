@@ -25,9 +25,9 @@ use gpui::{
 };
 use kil_term::Client;
 
-use crate::{theme::Theme, workspace::Workspace};
+use crate::workspace::Workspace;
 
-actions!(kil, [OpenSettings, Hide, HideOthers, ShowAll]);
+actions!(kil, [OpenSettings, OpenKeymap, Hide, HideOthers, ShowAll]);
 
 /// An unbundled binary started from another terminal inherits that app's
 /// `__CFBundleIdentifier`, and `AppKit` then names and badges kil as that app (e.g. "Otty").
@@ -44,6 +44,8 @@ fn forget_launcher_identity() {
     }
 }
 
+/// The menu bar. Set again whenever the keymap changes, so the shortcuts it shows are the
+/// ones bound.
 fn menus() -> Vec<Menu> {
     use workspace as w;
     vec![
@@ -51,6 +53,7 @@ fn menus() -> Vec<Menu> {
             name: "Kil".into(),
             items: vec![
                 MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Keyboard Shortcuts…", OpenKeymap),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
@@ -108,6 +111,11 @@ fn menus() -> Vec<Menu> {
 /// Fallbacks for actions no focused element handled, e.g. from the Settings window.
 fn register_app_actions(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
+    cx.on_action(|_: &OpenKeymap, cx| {
+        if let Err(err) = config::open_keymap(cx) {
+            log::error!("{err}");
+        }
+    });
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -166,7 +174,6 @@ fn main() {
     }
     env_logger::init();
     Application::new().run(|cx: &mut App| {
-        cx.set_global(Theme::dark());
         let mut notices = config::apply(cx);
         let store = restore::Store::standard();
         let restored = match store.as_ref().map(restore::Store::load) {
@@ -185,7 +192,6 @@ fn main() {
             cx.quit();
             return;
         };
-        cx.set_menus(menus());
         register_app_actions(cx);
         // Settings alone doesn't keep the app alive.
         cx.on_window_closed(|cx| {

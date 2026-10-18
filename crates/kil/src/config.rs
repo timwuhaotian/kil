@@ -4,15 +4,17 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
     time::SystemTime,
 };
 
-use gpui::{App, SharedString};
+use gpui::{App, AppContext as _, SharedString};
 
 use crate::{
     keymap, settings,
     settings::{Settings, config_dir},
     settings_window, text_field,
+    theme::Theme,
 };
 
 /// Modification times of both files; a change triggers a reload.
@@ -108,6 +110,7 @@ pub fn apply(cx: &mut App) -> Vec<SharedString> {
     if !cx.has_global::<Settings>() {
         cx.set_global(Settings::default());
     }
+    cx.set_global(Theme::named(cx.global::<Settings>().theme));
     let user_keymap = read("keymap.toml", &mut notices);
     let (table, errors) = keymap::resolve(user_keymap.as_deref());
     notices.extend(
@@ -122,7 +125,35 @@ pub fn apply(cx: &mut App) -> Vec<SharedString> {
             .chain(text_field::bindings())
             .chain(settings_window::bindings()),
     );
+    // A menu shows the keys bound when it was set, so it is set again with these.
+    cx.set_menus(crate::menus());
     notices
+}
+
+/// Opens `keymap.toml` in the default text editor, first writing a commented starting point
+/// if there is none.
+///
+/// # Errors
+/// If the file can't be written or the editor can't be started.
+pub fn open_keymap(cx: &App) -> Result<(), String> {
+    let path = file("keymap.toml").ok_or("keymap.toml: no home directory")?;
+    if !path.exists() {
+        path.parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| fs::write(&path, keymap::TEMPLATE))
+            .map_err(|err| format!("keymap.toml: {err}"))?;
+    }
+    // `-t`: a text editor, whatever app claims `.toml`.
+    let mut open = Command::new("/usr/bin/open")
+        .arg("-t")
+        .arg(&path)
+        .spawn()
+        .map_err(|err| format!("keymap.toml: {err}"))?;
+    cx.background_spawn(async move {
+        let _ = open.wait();
+    })
+    .detach();
+    Ok(())
 }
 
 #[cfg(test)]

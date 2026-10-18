@@ -165,6 +165,25 @@ pub struct KeymapError {
     pub reason: String,
 }
 
+/// What Kil ▸ Keyboard Shortcuts… writes when there is no `keymap.toml` yet.
+pub const TEMPLATE: &str = r#"# Kil key bindings. Each entry replaces the default for its keys; "unbind" removes one.
+# Saved changes apply when Kil's window is focused again, and the menus show them.
+#
+# Commands: new_tab, close_tab, close_pane, split_right, split_down,
+#   focus_left, focus_right, focus_up, focus_down, next_tab, prev_tab, select_tab_1 … select_tab_9,
+#   copy, paste, clear_scrollback, font_bigger, font_smaller, font_reset,
+#   open_settings, hide, hide_others, quit, unbind
+# Keys: cmd, ctrl, alt, shift and a key, joined with "-" ("cmd-shift-d"); "ctrl-a |" is two strokes.
+
+[bindings]
+# Panes and tabs, as they are by default:
+# "cmd-d"       = "split_right"
+# "cmd-shift-d" = "split_down"
+# "cmd-w"       = "close_pane"
+# "cmd-shift-w" = "close_tab"
+# "cmd-t"       = "new_tab"
+"#;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeymapFile {
@@ -248,6 +267,11 @@ mod tests {
             .iter()
             .find(|(k, _)| k == keys)
             .map(|(_, command)| *command)
+    }
+
+    #[test]
+    fn template_should_parse_and_change_nothing() {
+        assert_eq!(resolve(Some(TEMPLATE)), resolve(None));
     }
 
     #[test]

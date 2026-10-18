@@ -105,6 +105,8 @@ pub struct SessionConfig {
     /// Painted into the terminal before the program starts, e.g. a [`Transcript`] of an
     /// earlier launch.
     pub replay: Vec<u8>,
+    /// Colors reported to programs that ask (OSC 4/10/11), e.g. to tell a light theme.
+    pub palette: Palette,
 }
 
 impl SessionConfig {
@@ -118,6 +120,7 @@ impl SessionConfig {
             scrollback_lines: 10_000,
             env: Vec::new(),
             replay: Vec::new(),
+            palette: Palette::default(),
         }
     }
 }
@@ -253,8 +256,14 @@ impl Session {
         let io = channel.sender();
         // Detached on purpose: the thread ends on Shutdown or child exit and drops the PTY
         // itself, so nothing ever joins (and blocks on) it.
-        pane_loop::spawn(channel, Arc::clone(&term), events.clone(), pty)
-            .map_err(SpawnError::EventLoop)?;
+        pane_loop::spawn(
+            channel,
+            Arc::clone(&term),
+            events.clone(),
+            pty,
+            config.palette.clone(),
+        )
+        .map_err(SpawnError::EventLoop)?;
         Ok(Self {
             term,
             link: Link::Local(io),
@@ -285,6 +294,15 @@ impl Session {
             )),
             tty: TtyId(identity.tty),
         })
+    }
+
+    /// Colors reported to programs that ask from now on, e.g. after the theme changed. A
+    /// server older than protocol 2 keeps the palette the session started with.
+    pub fn set_palette(&self, palette: &Palette) {
+        match &self.link {
+            Link::Local(io) => io.send(Command::Palette(palette.clone())),
+            Link::Remote(remote) => remote.send_palette(palette),
+        }
     }
 
     /// Ends the session: hangs the program up, wherever it runs.

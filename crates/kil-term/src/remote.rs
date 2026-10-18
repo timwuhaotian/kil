@@ -26,7 +26,8 @@ use crate::{
     events::{EventProxy, Role, SessionEvent},
     server,
     session::{Session, SessionConfig, term_config},
-    wire::{self, Frame, Inbox, PROTOCOL},
+    snapshot::Palette,
+    wire::{self, Frame, Inbox, MIN_PROTOCOL, PROTOCOL},
 };
 
 /// How long a request to the server may take before it counts as gone.
@@ -40,6 +41,8 @@ const FLUSH_ON_DROP: Duration = Duration::from_millis(200);
 pub struct Client {
     dir: PathBuf,
     control: Mutex<UnixStream>,
+    /// What the server and this client both speak.
+    protocol: u32,
 }
 
 impl Client {
@@ -48,12 +51,29 @@ impl Client {
     /// # Errors
     /// If no server answers there, or it speaks another protocol.
     pub fn connect(dir: &Path) -> io::Result<Self> {
-        let control = connect(dir)?;
+        let (control, server) = handshake(dir, PROTOCOL)?;
+        let (control, protocol) = if server >= PROTOCOL {
+            (control, PROTOCOL)
+        } else if server >= MIN_PROTOCOL {
+            // An older server hangs up on a newer hello: speak its protocol instead.
+            (handshake(dir, server)?.0, server)
+        } else {
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                format!("the session server speaks protocol {server}, older than {MIN_PROTOCOL}"),
+            ));
+        };
         control.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         Ok(Self {
             dir: dir.to_owned(),
             control: Mutex::new(control),
+            protocol,
         })
+    }
+
+    /// A new connection to the server, past the handshake.
+    fn connection(&self) -> io::Result<UnixStream> {
+        handshake(&self.dir, self.protocol).map(|(stream, _)| stream)
     }
 
     /// Connects, first starting `exe --server <dir>` if no server answers.
@@ -113,17 +133,16 @@ impl Client {
         config: &SessionConfig,
         sink: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> Result<Session, SpawnError> {
-        let mut stream = connect(&self.dir).map_err(SpawnError::Server)?;
+        let mut stream = self.connection().map_err(SpawnError::Server)?;
         let request = Frame::Spawn {
             id: id.to_owned(),
             config: config.clone(),
         };
         wire::send(&mut stream, &request).map_err(SpawnError::Server)?;
         match wire::receive(&mut stream).map_err(SpawnError::Server)? {
-            Some(Frame::Attached(identity)) => {
-                mirror(stream, identity, config.scrollback_lines, Box::new(sink))
-                    .map_err(SpawnError::Server)
-            }
+            Some(Frame::Attached(identity)) => self
+                .mirror(stream, identity, config.scrollback_lines, Box::new(sink))
+                .map_err(SpawnError::Server),
             Some(Frame::Failed(message)) => Err(SpawnError::Refused(message)),
             other => Err(SpawnError::Server(match other {
                 Some(frame) => unexpected(&frame),
@@ -142,12 +161,12 @@ impl Client {
         scrollback_lines: usize,
         sink: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> io::Result<Option<Session>> {
-        let mut stream = connect(&self.dir)?;
+        let mut stream = self.connection()?;
         wire::send(&mut stream, &Frame::Attach { id: id.to_owned() })?;
         match wire::receive(&mut stream)? {
-            Some(Frame::Attached(identity)) => {
-                mirror(stream, identity, scrollback_lines, Box::new(sink)).map(Some)
-            }
+            Some(Frame::Attached(identity)) => self
+                .mirror(stream, identity, scrollback_lines, Box::new(sink))
+                .map(Some),
             Some(Frame::Missing) => Ok(None),
             Some(other) => Err(unexpected(&other)),
             None => Err(ErrorKind::UnexpectedEof.into()),
@@ -162,28 +181,37 @@ fn unexpected(frame: &Frame) -> io::Error {
     )
 }
 
-/// A new connection to the server, past the handshake.
-fn connect(dir: &Path) -> io::Result<UnixStream> {
+/// A new connection saying hello in `protocol`; returns the server's protocol too.
+fn handshake(dir: &Path, protocol: u32) -> io::Result<(UnixStream, u32)> {
     let mut stream = UnixStream::connect(server::socket_path(dir))?;
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-    wire::send(&mut stream, &Frame::Hello { protocol: PROTOCOL })?;
+    wire::send(&mut stream, &Frame::Hello { protocol })?;
     match wire::receive(&mut stream)? {
-        Some(Frame::Hello { protocol }) if protocol == PROTOCOL => Ok(stream),
-        Some(Frame::Hello { protocol }) => Err(io::Error::new(
-            ErrorKind::Unsupported,
-            format!("the session server speaks protocol {protocol}, not {PROTOCOL}"),
-        )),
+        Some(Frame::Hello { protocol: server }) => Ok((stream, server)),
         _ => Err(ErrorKind::ConnectionAborted.into()),
     }
 }
 
 type Sink = Box<dyn Fn(SessionEvent) + Send + Sync>;
 
+impl Client {
+    fn mirror(
+        &self,
+        stream: UnixStream,
+        identity: wire::Identity,
+        scrollback_lines: usize,
+        sink: Sink,
+    ) -> io::Result<Session> {
+        mirror(stream, identity, scrollback_lines, sink, self.protocol >= 2)
+    }
+}
+
 fn mirror(
     stream: UnixStream,
     identity: wire::Identity,
     scrollback_lines: usize,
     sink: Sink,
+    palettes: bool,
 ) -> io::Result<Session> {
     let size = identity.size.clamped();
     let events = EventProxy::new(sink, size, Role::Mirror);
@@ -199,6 +227,7 @@ fn mirror(
     let remote = Remote {
         tx: Some(tx),
         poller: Arc::clone(&poller),
+        palettes,
     };
     let feed = Feed {
         stream,
@@ -223,12 +252,21 @@ fn mirror(
 pub(crate) struct Remote {
     tx: Option<Sender<Frame>>,
     poller: Arc<Poller>,
+    /// The server takes `Palette` frames (protocol 2).
+    palettes: bool,
 }
 
 impl Remote {
     pub(crate) fn send(&self, frame: Frame) {
         if self.tx.as_ref().is_some_and(|tx| tx.send(frame).is_ok()) {
             let _ = self.poller.notify();
+        }
+    }
+
+    /// A protocol-1 server would drop the connection on a frame it doesn't know.
+    pub(crate) fn send_palette(&self, palette: &Palette) {
+        if self.palettes {
+            self.send(Frame::Palette(palette.clone()));
         }
     }
 }
