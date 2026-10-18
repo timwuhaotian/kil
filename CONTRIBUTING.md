@@ -48,9 +48,9 @@ reaping and leaks. They must leave no process behind. One test expects your logi
 
 ## Releases
 
-Releases are built and notarized locally by the maintainer with `scripts/release.sh`; see
-the README. Each one replaces `releases/Kil-arm64.dmg`, bumps the version in `Cargo.toml`,
-and adds its entry to [`CHANGELOG.md`](CHANGELOG.md).
+Releases are built and notarized locally by the maintainer; [`RELEASING.md`](RELEASING.md)
+has the steps. Each one replaces `releases/Kil-arm64.dmg`, bumps the version in `Cargo.toml`,
+and dates the `Unreleased` entries in [`CHANGELOG.md`](CHANGELOG.md).
 
 By contributing, you agree that your contributions are licensed under the MIT license, and
 to follow the [code of conduct](CODE_OF_CONDUCT.md).

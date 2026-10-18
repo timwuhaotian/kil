@@ -76,22 +76,9 @@ fine on the machine that built it.
 
 ### Making a release (maintainers)
 
-Releases are built locally and committed under `releases/`; CI only checks pull requests and
-`main`. With a
-Developer ID identity in the login keychain:
-
-```sh
-KIL_NOTARY_KEY=~/.appstoreconnect/private_keys/AuthKey_XXXX.p8 \
-KIL_NOTARY_KEY_ID=XXXX KIL_NOTARY_ISSUER=<issuer-id> \
-  scripts/release.sh                 # → releases/Kil-arm64.dmg + .sha256
-```
-
-The script signs with the hardened runtime, notarizes and staples the app, then the DMG. It
-fails unless Apple accepts both. Instead of the API key variables, it can use a
-`notarytool store-credentials` profile (`KIL_NOTARY_PROFILE`), or the key stored by the
-[`asc`](https://asccli.sh) CLI when that is installed. The
-version comes from `Cargo.toml`; it is for us, so add the release to
-[`CHANGELOG.md`](CHANGELOG.md) when you bump it.
+Releases are built, signed and notarized locally and committed under `releases/`; CI only
+checks pull requests and `main`. [`RELEASING.md`](RELEASING.md) has the steps; the build itself
+is `scripts/release.sh` → `releases/Kil-arm64.dmg` + `.sha256`.
 
 ## Using Kil
 
