@@ -504,6 +504,7 @@ Only single chords are recorded; multi-stroke keys stay a `keymap.toml` feature.
 **Fallthrough to the PTY** (`keys.rs`, written from xterm ctlseqs):
 - App-cursor and app-keypad modes, `CSI 1;mods` modifier encoding, ctrl-letters, function keys.
 - `option_as_meta` (default `true`) sends ESC + key. The tradeoff: Option-composed characters such as `é` need the setting off.
+- The wheel follows xterm. A program that turned mouse reporting on (1000/1002/1003) gets wheel events, buttons 64 and 65 at the pointer's cell, SGR-encoded under 1006 (1005 and the byte encoding otherwise). Claude Code does this in its full-screen view and scrolls itself; arrow keys made it move the input history and warn "Scroll wheel is sending arrow keys". Otherwise the alternate screen with 1007 gets arrow keys, and the normal screen scrolls Kil's scrollback. Clicks and drags are not reported yet: they still select text.
 - Shift-Enter sends ESC CR, the same as Option-Enter, whatever `option_as_meta` says. Claude Code and kimi read it as a newline in their input (checked against both), and zsh inserts a line break; Enter alone sends CR and submits. Without the kitty keyboard protocol (a non-goal) a terminal has no other way to tell Shift-Enter from Enter.
 - Paste uses bracketed paste when that mode is set, and strips ESC from the pasted text.
 

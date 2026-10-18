@@ -1813,7 +1813,10 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Modifiers, MouseUpEvent, TestAppContext, VisualTestContext, point};
+    use gpui::{
+        Modifiers, MouseUpEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+        VisualTestContext, point,
+    };
 
     use super::*;
     use crate::text_field;
@@ -2068,6 +2071,49 @@ mod tests {
         });
     }
 
+    /// Polls `done` while letting the window draw, for up to 5 s of real time.
+    fn wait_for(cx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestContext) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(cx) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    fn the_wheel_should_send_mouse_events_to_a_program_that_reports_the_mouse(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        // Turns on mouse reporting as Claude Code does (1003 + SGR 1006), then shows the
+        // bytes of one wheel notch: two would be 22, but one is enough.
+        cx.simulate_input(
+            "printf '\\033[?1003h\\033[?1006h'; stty raw -echo; \
+             r=$(dd bs=1 count=11 2>/dev/null); stty sane; echo; echo \"GOT:$r\" | cat -v\n",
+        );
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| {
+                pane.input_mode()
+                    .is_some_and(kil_term::InputMode::mouse_reporting)
+            })
+        });
+        let position = point(px(SIDEBAR_WIDTH + 200.), px(300.));
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| pane.screen_text().contains("GOT:^[[<64;"))
+        });
+        let screen = pane.read_with(cx, |pane, _| pane.screen_text());
+        assert!(screen.contains("GOT:^[[<64;"), "{screen}");
+        assert!(!screen.contains("GOT:^[[A") && !screen.contains("GOT:^[OA"));
+    }
+
     #[gpui::test]
     fn clicking_a_pane_should_make_it_the_undimmed_one(cx: &mut TestAppContext) {
         let (workspace, cx) = workspace(cx);
@@ -2190,7 +2236,7 @@ mod tests {
             assert_eq!((this.tabs.len(), this.active), (2, 1));
             assert_eq!(tab.name, Some("构建".into()));
             assert_eq!(leaves.len(), 3);
-            assert!(tab.focused == *leaves[2]);
+            assert_eq!(tab.focused, *leaves[2]);
             assert!(!tab.tree.is_animating(Instant::now()));
         });
     }

@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use gpui::Keystroke;
+use gpui::{Keystroke, Modifiers};
 use kil_term::InputMode;
 
 /// Bytes for `keystroke`, or `None` to let it through.
@@ -55,6 +55,37 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
+}
+
+/// One wheel notch at viewport `col`, `row` (0-based), reported to a program that turned
+/// mouse reporting on: button 64 (up) or 65 (down) plus modifier bits, in SGR encoding when it
+/// asked for that, else xterm's byte encoding. `None` where the byte encoding can't reach.
+pub fn wheel_report(
+    up: bool,
+    col: usize,
+    row: usize,
+    modifiers: Modifiers,
+    mode: InputMode,
+) -> Option<Vec<u8>> {
+    let button = if up { 64 } else { 65 }
+        + 4 * u32::from(modifiers.shift)
+        + 8 * u32::from(modifiers.alt)
+        + 16 * u32::from(modifiers.control);
+    let (x, y) = (u32::try_from(col).ok()? + 1, u32::try_from(row).ok()? + 1);
+    if mode.sgr_mouse() {
+        return Some(format!("\x1b[<{button};{x};{y}M").into_bytes());
+    }
+    let mut bytes = b"\x1b[M".to_vec();
+    for value in [button, x, y] {
+        let value = value + 32;
+        if mode.utf8_mouse() {
+            let mut buf = [0; 4];
+            bytes.extend_from_slice(char::from_u32(value)?.encode_utf8(&mut buf).as_bytes());
+        } else {
+            bytes.push(u8::try_from(value).ok()?);
+        }
+    }
+    Some(bytes)
 }
 
 /// Arrow-key bytes for one wheel notch in the alternate screen.
@@ -190,6 +221,36 @@ mod tests {
         InputMode::default()
     }
 
+    /// The input mode of a real terminal after a program printed `modes` (DECSET sequences).
+    fn mode_after(modes: &str) -> InputMode {
+        let mut config = kil_term::SessionConfig::new(kil_term::GridSize {
+            rows: 24,
+            cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        });
+        config.program = kil_term::Program::Command {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("printf '{modes}'; exec /bin/sleep 600").into(),
+            ],
+        };
+        let session = kil_term::Session::spawn(&config, |_| {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.input_mode() == normal() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        session.input_mode()
+    }
+
+    fn report(up: bool, col: usize, row: usize, modifiers: &str, mode: InputMode) -> Vec<u8> {
+        let modifiers = Keystroke::parse(&format!("{modifiers}a"))
+            .unwrap()
+            .modifiers;
+        wheel_report(up, col, row, modifiers, mode).unwrap()
+    }
+
     #[test]
     fn encode_should_send_csi_arrow_in_normal_mode() {
         assert_eq!(bytes("up", normal()), Some(b"\x1b[A".to_vec()));
@@ -215,6 +276,27 @@ mod tests {
         assert_eq!(bytes("enter", normal()), Some(b"\r".to_vec()));
         assert_eq!(bytes("shift-enter", normal()), Some(b"\x1b\r".to_vec()));
         assert_eq!(bytes("alt-enter", normal()), Some(b"\x1b\r".to_vec()));
+    }
+
+    #[test]
+    fn wheel_report_should_use_sgr_buttons_64_and_65_at_the_pointer() {
+        let sgr = mode_after("\\033[?1003h\\033[?1006h");
+        assert!(sgr.mouse_reporting() && sgr.sgr_mouse());
+        assert_eq!(report(true, 0, 0, "", sgr), b"\x1b[<64;1;1M");
+        assert_eq!(report(false, 9, 4, "", sgr), b"\x1b[<65;10;5M");
+        assert_eq!(report(true, 300, 2, "ctrl-", sgr), b"\x1b[<80;301;3M");
+    }
+
+    #[test]
+    fn wheel_report_should_use_xterm_bytes_without_sgr_and_stop_past_column_223() {
+        let plain = mode_after("\\033[?1000h");
+        assert!(plain.mouse_reporting() && !plain.sgr_mouse());
+        assert_eq!(
+            report(true, 9, 4, "", plain),
+            [0x1b, b'[', b'M', 96, 42, 37]
+        );
+        let modifiers = Keystroke::parse("a").unwrap().modifiers;
+        assert_eq!(wheel_report(true, 223, 0, modifiers, plain), None);
     }
 
     #[test]

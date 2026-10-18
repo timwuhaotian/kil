@@ -165,6 +165,18 @@ impl InputMode {
     pub fn mouse_reporting(self) -> bool {
         self.0.intersects(TermMode::MOUSE_MODE)
     }
+
+    /// Mouse reports use SGR encoding (`CSI < … M`, mode 1006).
+    #[must_use]
+    pub fn sgr_mouse(self) -> bool {
+        self.0.contains(TermMode::SGR_MOUSE)
+    }
+
+    /// Mouse report coordinates are UTF-8 encoded (mode 1005).
+    #[must_use]
+    pub fn utf8_mouse(self) -> bool {
+        self.0.contains(TermMode::UTF8_MOUSE)
+    }
 }
 
 /// How a mouse selection grows.

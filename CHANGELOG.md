@@ -6,6 +6,9 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- The wheel sends mouse wheel events to programs that ask for mouse reporting, as Claude
+  Code's full-screen view does, instead of arrow keys that barely scrolled it.
+
 ## 0.0.5 — 2026-10-18
 
 - `⇧↩` inserts a newline in Claude Code, kimi and other TUIs instead of sending the line: it

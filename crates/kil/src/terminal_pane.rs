@@ -282,6 +282,22 @@ impl TerminalPane {
         self.session.as_ref().map(Session::pid)
     }
 
+    #[cfg(test)]
+    pub fn input_mode(&self) -> Option<kil_term::InputMode> {
+        self.session.as_ref().map(Session::input_mode)
+    }
+
+    #[cfg(test)]
+    pub fn screen_text(&self) -> String {
+        let session = self.session.as_ref().expect("session");
+        let mut frame = Frame::default();
+        session.snapshot_into(&mut frame, &Palette::default());
+        (0..frame.rows)
+            .map(|row| frame.row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The screen to save, if it changed since last taken.
     pub fn take_screen(&mut self) -> Option<(String, Transcript)> {
         let session = self.session.as_ref().filter(|_| self.screen_changed)?;
@@ -556,9 +572,21 @@ impl TerminalPane {
             return;
         };
         let mode = session.input_mode();
-        if mode.alt_screen() && mode.alternate_scroll() {
+        let notches = usize::try_from(steps.unsigned_abs()).unwrap_or(0);
+        if mode.mouse_reporting() {
+            // The program scrolls itself (e.g. Claude Code): it gets wheel events, as in xterm.
+            // Arrow keys would move its cursor or history instead.
+            let Some(cell) = self.cell_at(event.position) else {
+                return;
+            };
+            let col = cell.col.min(self.frame.cols.saturating_sub(1));
+            let row = cell.row.min(self.frame.rows.saturating_sub(1));
+            if let Some(report) = keys::wheel_report(steps > 0, col, row, event.modifiers, mode) {
+                session.write(report.repeat(notches));
+            }
+        } else if mode.alt_screen() && mode.alternate_scroll() {
             let arrow = keys::wheel_arrow(steps > 0, mode);
-            session.write(arrow.repeat(usize::try_from(steps.unsigned_abs()).unwrap_or(0)));
+            session.write(arrow.repeat(notches));
         } else {
             session.scroll(steps);
         }
