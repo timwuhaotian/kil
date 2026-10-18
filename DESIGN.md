@@ -504,6 +504,7 @@ Only single chords are recorded; multi-stroke keys stay a `keymap.toml` feature.
 **Fallthrough to the PTY** (`keys.rs`, written from xterm ctlseqs):
 - App-cursor and app-keypad modes, `CSI 1;mods` modifier encoding, ctrl-letters, function keys.
 - `option_as_meta` (default `true`) sends ESC + key. The tradeoff: Option-composed characters such as `é` need the setting off.
+- Shift-Enter sends ESC CR, the same as Option-Enter, whatever `option_as_meta` says. Claude Code and kimi read it as a newline in their input (checked against both), and zsh inserts a line break; Enter alone sends CR and submits. Without the kitty keyboard protocol (a non-goal) a terminal has no other way to tell Shift-Enter from Enter.
 - Paste uses bracketed paste when that mode is set, and strips ESC from the pasted text.
 
 **IME:** `TerminalPane` implements `EntityInputHandler`. Marked text is drawn at the cursor. Committed text goes to the PTY. `bounds_for_range` returns the cursor rect so the candidate window sits next to the cursor. A cursor the program hid (DECTCEM, e.g. a TUI such as `kimi` that draws its own) is not drawn but keeps its place in the snapshot (`CursorShape::Hidden`), because such programs leave it at their input; without it the candidate window fell back to the screen's bottom-left corner. The acceptance test is Pinyin input.

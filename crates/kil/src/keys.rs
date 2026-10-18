@@ -83,7 +83,10 @@ impl Mods {
 
 fn named_key(key: &str, pressed: Mods, mode: InputMode) -> Option<Cow<'static, [u8]>> {
     let bytes: Cow<'static, [u8]> = match key {
-        "enter" => with_meta(pressed.alt, b"\r"),
+        // Shift-Enter is ESC CR, like Option-Enter: the newline-without-sending that Claude
+        // Code, kimi and other TUIs read, and zsh inserts as a line break. A plain CR would
+        // send the line.
+        "enter" => with_meta(pressed.alt || pressed.shift, b"\r"),
         "tab" if pressed.shift => Cow::Borrowed(b"\x1b[Z"),
         "tab" => with_meta(pressed.alt, b"\t"),
         "backspace" => with_meta(pressed.alt, if pressed.ctrl { b"\x08" } else { b"\x7f" }),
@@ -205,6 +208,13 @@ mod tests {
     #[test]
     fn encode_should_prefix_esc_for_option_as_meta() {
         assert_eq!(bytes("alt-b", normal()), Some(b"\x1bb".to_vec()));
+    }
+
+    #[test]
+    fn encode_should_send_esc_cr_for_shift_enter_so_tuis_insert_a_newline() {
+        assert_eq!(bytes("enter", normal()), Some(b"\r".to_vec()));
+        assert_eq!(bytes("shift-enter", normal()), Some(b"\x1b\r".to_vec()));
+        assert_eq!(bytes("alt-enter", normal()), Some(b"\x1b\r".to_vec()));
     }
 
     #[test]

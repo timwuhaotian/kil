@@ -102,6 +102,7 @@ version comes from `Cargo.toml`; it is for us, so add the release to
 | `⌘⇧C` / `⌘⇧W` | Close pane / close tab |
 | `⌘⌥←→↑↓` | Focus the pane in that direction |
 | `⌘1`…`⌘9`, `⌘⇧[` / `⌘⇧]` | Select a tab, previous / next tab |
+| `⇧↩` | New line without sending, in Claude Code, kimi and other TUIs (sends ESC CR, like `⌥↩`) |
 | `⌘C` / `⌘V` | Copy / paste (bracketed paste when the program asks for it) |
 | `⌘K` | Clear scrollback |
 | `⌘=` / `⌘-` / `⌘0` | Font bigger / smaller / reset |

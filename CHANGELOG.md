@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- `⇧↩` inserts a newline in Claude Code, kimi and other TUIs instead of sending the line: it
+  sends ESC CR, like `⌥↩`.
 - The README's download link fetches the DMG directly, and `scripts/release.sh` refuses to
   build a release unless the README links it.
 - Open-source project files: contributing guide, code of conduct, security policy, issue and
