@@ -125,7 +125,7 @@ kil/
 │     ├─ src/config.rs        config.toml
 │     └─ src/theme.rs
 ├─ packaging/                 Info.plist, kil.entitlements, AppIcon.icns   (M6)
-└─ scripts/release.sh         build → bundle → sign → notarize → staple   (M6)
+└─ scripts/release.sh         build → sign → notarize → staple → releases/*.dmg (local, no CI)
 ```
 
 The split has a purpose. `kil-term` holds every invariant about processes and memory, and it compiles
@@ -504,7 +504,7 @@ watcher thread and no extra dependency.
 - Runtime failures become a pane banner (for example "Failed to start /bin/zsh: …"). They never panic.
 
 **Unsafe**
-- Allowed only in `kil-term/src/sys/darwin.rs`, via `#[expect(unsafe_code, reason = "Darwin FFI")]`. *As built*, there are two more scoped `expect`s: `Pty::register`, because alacritty's trait method is itself `unsafe`, and the first statement of `main`, because edition 2024 makes env mutation `unsafe`.
+- Allowed only in `kil-term/src/sys/darwin.rs`, via `#[expect(unsafe_code, reason = "Darwin FFI")]`. *As built*, there are more scoped `expect`s. One is each registration of a source with a `polling::Poller`, which is `unsafe` because the source must outlive it: `Pty::register`, the pane loop's client, the mirror feed and the server's listener. Each deletes its source before dropping it. The other is the first statement of `main`, because edition 2024 makes env mutation `unsafe`.
 - Every block has a `// SAFETY:` comment.
 - Everything else is safe Rust under `unsafe_code = "deny"`.
 
@@ -548,32 +548,25 @@ needless_collect = "deny"
 
 ## 11. Packaging, signing and notarization (your Apple Developer account)
 
-**What's on this machine:** a valid **`Developer ID Application` identity, team `43VLF3KTFZ`**, in the login keychain. `notarytool` is 1.1.2. No notary profile is stored yet.
+**What's on this machine:** a valid **`Developer ID Application` identity, team `43VLF3KTFZ`**, in the login keychain, and an App Store Connect API key for notarization.
 
-**One-time step that you run** (the password goes to the Keychain, not to the repo or to me):
+**Notary credentials**, either of (neither goes in the repo):
 ```sh
+# An App Store Connect API key (Users and Access → Integrations): key file, key id, issuer id.
+KIL_NOTARY_KEY=~/.appstoreconnect/private_keys/AuthKey_XXXX.p8 KIL_NOTARY_KEY_ID=XXXX \
+  KIL_NOTARY_ISSUER=<issuer-uuid> scripts/release.sh
+# Or a keychain profile, stored once (prompts for an app-specific password):
 xcrun notarytool store-credentials kil-notary --apple-id <your-apple-id> --team-id 43VLF3KTFZ
-# prompts for an app-specific password (account.apple.com → Sign-In and Security → App-Specific Passwords)
 ```
-For CI, use an App Store Connect API key instead (`--key/--key-id/--issuer`).
+With neither set, the script uses the `asc` CLI's key from the keychain when `asc` is installed (`asc notarization submit --wait`), which is how 0.0.1 was notarized.
 
-**Why Developer ID and not the Mac App Store:** a terminal has to exec arbitrary binaries anywhere on disk, and the App Sandbox (which the App Store requires) forbids that. Distribution is notarized Developer ID, as a zip or dmg.
+**Why Developer ID and not the Mac App Store:** a terminal has to exec arbitrary binaries anywhere on disk, and the App Sandbox (which the App Store requires) forbids that. Distribution is a notarized Developer ID DMG.
 
-**`scripts/release.sh`** (M6). The build is arm64 only:
-```sh
-cargo build --release -p kil
-APP=dist/Kil.app; rm -rf dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/kil "$APP/Contents/MacOS/kil"
-cp packaging/Info.plist "$APP/Contents/"; cp packaging/AppIcon.icns "$APP/Contents/Resources/"
-codesign --force --timestamp --options runtime \
-  --entitlements packaging/kil.entitlements \
-  --sign "Developer ID Application" "$APP"            # unique identity in keychain (team 43VLF3KTFZ)
-codesign --verify --strict --verbose=2 "$APP"
-ditto -c -k --keepParent "$APP" dist/Kil.zip
-xcrun notarytool submit dist/Kil.zip --keychain-profile kil-notary --wait
-xcrun stapler staple "$APP"
-spctl -a -vv "$APP"                                    # expect: accepted, source=Notarized Developer ID
-```
+**Releases are built locally and committed; there is no CI.** `scripts/release.sh` builds arm64 only. It writes `releases/Kil-<version>-arm64.dmg` and its `.sha256`, both tracked by git:
+1. `bundle.sh release`, then `codesign --options runtime --timestamp --entitlements packaging/kil.entitlements` with the Developer ID identity, then `codesign --verify --strict`.
+2. The app is zipped, notarized and stapled first, so a copy dragged out of the DMG carries its own ticket and opens offline.
+3. A DMG of the stapled app plus an `Applications` link is created, signed, notarized and stapled.
+4. `spctl` assesses the app (`execute`) and the DMG (`open`). The script fails unless Apple returns `Accepted`.
 
 **Info.plist**
 - `CFBundleIdentifier`: choose a reverse-DNS id you control.

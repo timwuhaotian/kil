@@ -1,22 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Kil app icon. Strictly two-tone: #000 and #fff, on the macOS 1024 grid (824 body).
-     Left: the vertical tab sidebar (white, black tabs); right: the terminal (black, white >_). -->
+     The wordmark KIL in heavy straight-stroke letters, slanted 12°, sliced at the midline
+     with the upper half pushed forward. Letters are drawn upright in #kil; the group skews them. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
-    <clipPath id="body"><rect x="100" y="100" width="824" height="824" rx="186"/></clipPath>
+    <!-- Cap height 400 (312–712), stems 100, tracking 28. -->
+    <path id="kil" d="M236,312 H336 V412 L401,312 H508 L378,512 L508,712 H401 L336,612 V712 H236 Z
+                      M536,312 H636 V712 H536 Z
+                      M664,312 H764 V616 H868 V712 H664 Z"/>
+    <!-- An 18-unit slice through the midline. -->
+    <clipPath id="upper"><rect width="1024" height="503"/></clipPath>
+    <clipPath id="lower"><rect y="521" width="1024" height="503"/></clipPath>
   </defs>
-  <g clip-path="url(#body)">
-    <rect x="100" y="100" width="824" height="824" fill="#000"/>
-    <rect x="100" y="100" width="276" height="824" fill="#fff"/>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="#000"/>
+  <g fill="#fff" transform="translate(512 512) skewX(-12) translate(-512 -512)">
+    <use href="#kil" clip-path="url(#upper)" transform="translate(10 0)"/>
+    <use href="#kil" clip-path="url(#lower)" transform="translate(-10 0)"/>
   </g>
-  <!-- Inner edge keeps the white sidebar's silhouette on light backgrounds. -->
-  <rect x="109" y="109" width="806" height="806" rx="177" fill="none" stroke="#000" stroke-width="18"/>
-  <!-- Tabs: active solid, others outlined. -->
-  <rect x="166" y="246" width="144" height="48" rx="24" fill="#000"/>
-  <rect x="172" y="330" width="132" height="36" rx="18" fill="none" stroke="#000" stroke-width="12"/>
-  <rect x="172" y="402" width="132" height="36" rx="18" fill="none" stroke="#000" stroke-width="12"/>
-  <!-- Prompt and cursor. -->
-  <polyline points="536,424 632,512 536,600" fill="none" stroke="#fff" stroke-width="64"
-            stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="680" y="558" width="152" height="58" rx="10" fill="#fff"/>
 </svg>
