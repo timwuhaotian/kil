@@ -63,9 +63,9 @@ const NAMED: &[(&str, Command)] = &[
 const DEFAULTS: &[(&str, &str)] = &[
     ("cmd-t", "new_tab"),
     ("cmd-shift-w", "close_tab"),
-    ("cmd-w", "close_pane"),
-    ("cmd-d", "split_right"),
-    ("cmd-shift-d", "split_down"),
+    ("cmd-shift-c", "close_pane"),
+    ("cmd-shift-d", "split_right"),
+    ("cmd-d", "split_down"),
     ("cmd-alt-left", "focus_left"),
     ("cmd-alt-right", "focus_right"),
     ("cmd-alt-up", "focus_up"),
@@ -96,6 +96,16 @@ const DEFAULTS: &[(&str, &str)] = &[
 ];
 
 impl Command {
+    /// Every command the Settings window lists, in menu order.
+    pub fn all() -> Vec<Self> {
+        NAMED
+            .iter()
+            .map(|(_, command)| *command)
+            .filter(|command| *command != Self::Unbind)
+            .chain((1..=9).map(Self::SelectTab))
+            .collect()
+    }
+
     pub fn parse(name: &str) -> Option<Self> {
         if let Some(n) = name.strip_prefix("select_tab_") {
             return n
@@ -156,6 +166,54 @@ impl Command {
             _ => Some("Workspace"),
         }
     }
+
+    /// The name it has in the Settings list and in a conflict message.
+    pub fn title(self) -> String {
+        match self {
+            Self::NewTab => "New tab".into(),
+            Self::CloseTab => "Close tab".into(),
+            Self::ClosePane => "Close pane".into(),
+            Self::SplitRight => "Split right".into(),
+            Self::SplitDown => "Split down".into(),
+            Self::FocusLeft => "Focus left".into(),
+            Self::FocusRight => "Focus right".into(),
+            Self::FocusUp => "Focus up".into(),
+            Self::FocusDown => "Focus down".into(),
+            Self::NextTab => "Next tab".into(),
+            Self::PrevTab => "Previous tab".into(),
+            Self::SelectTab(n) => format!("Select tab {n}"),
+            Self::Copy => "Copy".into(),
+            Self::Paste => "Paste".into(),
+            Self::ClearScrollback => "Clear scrollback".into(),
+            Self::FontBigger => "Bigger text".into(),
+            Self::FontSmaller => "Smaller text".into(),
+            Self::FontReset => "Reset text size".into(),
+            Self::OpenSettings => "Settings…".into(),
+            Self::Hide => "Hide Kil".into(),
+            Self::HideOthers => "Hide Others".into(),
+            Self::Quit => "Quit Kil".into(),
+            Self::Unbind => "Unbind".into(),
+        }
+    }
+
+    /// The name it has in `keymap.toml`.
+    pub fn key(self) -> String {
+        match self {
+            Self::SelectTab(n) => format!("select_tab_{n}"),
+            _ => NAMED
+                .iter()
+                .find(|(_, command)| *command == self)
+                .map_or_else(|| self.title(), |(name, _)| (*name).to_owned()),
+        }
+    }
+
+    /// The keys it runs on by default, as written in `keymap.toml`.
+    pub fn default_keys(self) -> Option<&'static str> {
+        DEFAULTS
+            .iter()
+            .find(|(_, name)| Command::parse(name) == Some(self))
+            .map(|(keys, _)| *keys)
+    }
 }
 
 /// A user entry that was skipped.
@@ -177,9 +235,9 @@ pub const TEMPLATE: &str = r#"# Kil key bindings. Each entry replaces the defaul
 
 [bindings]
 # Panes and tabs, as they are by default:
-# "cmd-d"       = "split_right"
-# "cmd-shift-d" = "split_down"
-# "cmd-w"       = "close_pane"
+# "cmd-shift-d" = "split_right"
+# "cmd-d"       = "split_down"
+# "cmd-shift-c" = "close_pane"
 # "cmd-shift-w" = "close_tab"
 # "cmd-t"       = "new_tab"
 "#;
@@ -258,8 +316,137 @@ fn normalize(keys: &str) -> Result<String, String> {
     Ok(strokes.join(" "))
 }
 
+/// The keys a pressed chord runs on, as the file writes them: `cmd-shift-d`.
+pub fn keystroke_of(event: &Keystroke) -> Option<String> {
+    let keys = event.unparse();
+    // Releasing a lone modifier arrives as a keystroke named after it; that is not a shortcut.
+    let alone = matches!(
+        keys.as_str(),
+        "shift" | "control" | "alt" | "platform" | "fn"
+    );
+    (!alone).then_some(keys)
+}
+
+/// The same keys as macOS writes them in a menu: `cmd-shift-d` → `⌘⇧D`.
+pub fn display(keys: &str) -> String {
+    keys.split(' ')
+        .map(|stroke| {
+            let (modifiers, key) = stroke.rsplit_once('-').unwrap_or(("", stroke));
+            let symbols: String = modifiers
+                .split('-')
+                .filter(|modifier| !modifier.is_empty())
+                .map(|modifier| match modifier {
+                    "cmd" => "⌘",
+                    "shift" => "⇧",
+                    "ctrl" => "⌃",
+                    "alt" => "⌥",
+                    "fn" => "fn",
+                    _ => "",
+                })
+                .collect();
+            let key = match key {
+                "left" => "←",
+                "right" => "→",
+                "up" => "↑",
+                "down" => "↓",
+                "enter" => "↩",
+                "space" => "␣",
+                "tab" => "⇥",
+                "escape" => "esc",
+                _ if key.chars().count() == 1 => return format!("{symbols}{}", key.to_uppercase()),
+                _ => key,
+            };
+            format!("{symbols}{key}")
+        })
+        .collect::<Vec<_>>()
+        .join(" then ")
+}
+
+/// Drops every line in `[bindings]` that gives `command` its keys, so it runs on its default
+/// again. Only the lines naming that command are touched.
+pub fn clear_command(text: &str, command: Command) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_bindings = false;
+    for line in text.lines() {
+        let header = line.trim();
+        if header.starts_with('[') {
+            in_bindings = header == "[bindings]";
+        }
+        let mine = parses(line).is_some_and(|(keys, name)| {
+            name == command.key() || (name == "unbind" && Some(keys) == command.default_keys())
+        });
+        if !(in_bindings && mine) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `text` with `command` running on `keys` and nowhere else: whatever the file said about it
+/// goes, and its default is unbound unless it is the key pressed.
+pub fn rebind(text: &str, command: Command, keys: &str) -> String {
+    let text = clear_command(text, command);
+    match command.default_keys() {
+        Some(default) if default == keys => text,
+        Some(default) => set_binding(&set_binding(&text, default, "unbind"), keys, &command.key()),
+        None => set_binding(&text, keys, &command.key()),
+    }
+}
+
+/// Binds `keys` to `name` in `[bindings]`: an existing line for those keys is replaced, else
+/// one is added to the table, which is written if the file has none. Comments are kept.
+pub fn set_binding(text: &str, keys: &str, name: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_bindings = false;
+    let mut found = false;
+    for line in text.lines() {
+        let header = line.trim();
+        if header.starts_with('[') {
+            in_bindings = header == "[bindings]";
+        }
+        if in_bindings && !found && parses(line).is_some_and(|(written, _)| written == keys) {
+            out.push_str(&assignment(keys, name));
+            found = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !found {
+        if !in_bindings {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[bindings]\n");
+        }
+        out.push_str(&assignment(keys, name));
+        out.push('\n');
+    }
+    out
+}
+
+/// The line a `[bindings]` entry is written as.
+fn assignment(keys: &str, name: &str) -> String {
+    format!("\"{keys}\" = \"{name}\"")
+}
+
+/// A `[bindings]` line as its keys and command name, when it is one. A trailing comment
+/// after the value is ignored.
+fn parses(line: &str) -> Option<(&str, &str)> {
+    let (keys, rest) = line.trim_start().strip_prefix('"')?.split_once('"')?;
+    let name = rest
+        .trim_start()
+        .strip_prefix('=')?
+        .trim_start()
+        .strip_prefix('"')?;
+    Some((keys, name.split_once('"')?.0))
+}
+
 #[cfg(test)]
 mod tests {
+    use gpui::Modifiers;
+
     use super::*;
 
     fn command_for(table: &[(String, Command)], keys: &str) -> Option<Command> {
@@ -275,24 +462,32 @@ mod tests {
     }
 
     #[test]
-    fn resolve_should_bind_split_right_to_cmd_d_by_default() {
+    fn resolve_should_bind_the_split_keys_as_documented() {
         let (table, _) = resolve(None);
-        assert_eq!(command_for(&table, "cmd-d"), Some(Command::SplitRight));
+        assert_eq!(
+            (
+                command_for(&table, "cmd-d"),
+                command_for(&table, "cmd-shift-d"),
+                command_for(&table, "cmd-shift-c")
+            ),
+            (
+                Some(Command::SplitDown),
+                Some(Command::SplitRight),
+                Some(Command::ClosePane)
+            )
+        );
     }
 
     #[test]
     fn resolve_should_let_user_rebind_split_keys() {
-        let (table, _) = resolve(Some("[bindings]\n\"cmd-d\" = \"split_down\"\n"));
-        assert_eq!(command_for(&table, "cmd-d"), Some(Command::SplitDown));
+        let (table, _) = resolve(Some("[bindings]\n\"cmd-y\" = \"split_down\"\n"));
+        assert_eq!(command_for(&table, "cmd-y"), Some(Command::SplitDown));
     }
 
     #[test]
     fn resolve_should_treat_modifier_order_as_same_key() {
-        let (table, _) = resolve(Some("[bindings]\n\"shift-cmd-d\" = \"split_right\"\n"));
-        assert_eq!(
-            command_for(&table, "cmd-shift-d"),
-            Some(Command::SplitRight)
-        );
+        let (table, _) = resolve(Some("[bindings]\n\"shift-cmd-c\" = \"copy\"\n"));
+        assert_eq!(command_for(&table, "cmd-shift-c"), Some(Command::Copy));
     }
 
     #[test]
@@ -325,5 +520,124 @@ mod tests {
     fn bindings_should_build_one_per_bound_key() {
         let (table, _) = resolve(None);
         assert_eq!(bindings(&table).len(), DEFAULTS.len());
+    }
+
+    #[test]
+    fn keystroke_should_ignore_a_lone_modifier() {
+        let shift = Keystroke {
+            key: "shift".into(),
+            key_char: None,
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(keystroke_of(&shift), None);
+        let chord = Keystroke {
+            key: "d".into(),
+            key_char: Some("d".into()),
+            modifiers: Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(keystroke_of(&chord).as_deref(), Some("cmd-d"));
+    }
+
+    #[test]
+    fn display_should_write_keys_as_macos_shows_them() {
+        assert_eq!(
+            ["cmd-d", "cmd-shift-]", "ctrl-tab", "cmd-alt-left"]
+                .map(display)
+                .join(" "),
+            "⌘D ⌘⇧] ⌃⇥ ⌘⌥←"
+        );
+    }
+
+    #[test]
+    fn set_binding_should_replace_the_line_and_keep_comments() {
+        let text = "# mine\n[bindings]\n\"cmd-x\" = \"new_tab\" # note\nfont_size = 1\n";
+        assert_eq!(
+            set_binding(text, "cmd-x", "split_right"),
+            "# mine\n[bindings]\n\"cmd-x\" = \"split_right\"\nfont_size = 1\n"
+        );
+    }
+
+    #[test]
+    fn set_binding_should_add_a_key_to_the_table() {
+        assert_eq!(
+            set_binding(
+                "# mine\n[bindings]\n\"cmd-x\" = \"new_tab\"\n",
+                "cmd-k",
+                "copy"
+            ),
+            "# mine\n[bindings]\n\"cmd-x\" = \"new_tab\"\n\"cmd-k\" = \"copy\"\n"
+        );
+    }
+
+    #[test]
+    fn set_binding_should_write_the_table_when_the_file_has_none() {
+        assert_eq!(
+            set_binding("# mine\n", "cmd-k", "copy"),
+            "# mine\n\n[bindings]\n\"cmd-k\" = \"copy\"\n"
+        );
+    }
+
+    #[test]
+    fn clear_command_should_leave_other_commands_alone() {
+        let text =
+            "[bindings]\n\"cmd-x\" = \"new_tab\"\n\"cmd-y\" = \"copy\"\n\"cmd-z\" = \"unbind\"\n";
+        assert_eq!(
+            clear_command(text, Command::Copy),
+            "[bindings]\n\"cmd-x\" = \"new_tab\"\n\"cmd-z\" = \"unbind\"\n"
+        );
+    }
+
+    #[test]
+    fn clear_command_should_take_the_unbind_of_a_default_away_too() {
+        let text = "[bindings]\n\"cmd-k\" = \"unbind\"\n\"cmd-y\" = \"copy\"\n";
+        assert_eq!(
+            clear_command(text, Command::ClearScrollback),
+            "[bindings]\n\"cmd-y\" = \"copy\"\n"
+        );
+    }
+
+    #[test]
+    fn rebind_should_move_a_default_key_off_and_onto_the_pressed_one() {
+        let rebound = rebind(TEMPLATE, Command::SplitRight, "cmd-shift-k");
+        let (table, errors) = resolve(Some(&rebound));
+        assert_eq!(
+            (
+                errors,
+                command_for(&table, "cmd-shift-d"),
+                command_for(&table, "cmd-shift-k")
+            ),
+            (vec![], None, Some(Command::SplitRight))
+        );
+    }
+
+    #[test]
+    fn rebind_should_replace_a_binding_the_user_wrote() {
+        let once = rebind(TEMPLATE, Command::SplitRight, "cmd-shift-k");
+        let twice = rebind(&once, Command::SplitRight, "cmd-k");
+        let (table, _) = resolve(Some(&twice));
+        assert_eq!(
+            (
+                command_for(&table, "cmd-shift-d"),
+                command_for(&table, "cmd-shift-k"),
+                command_for(&table, "cmd-k")
+            ),
+            (None, None, Some(Command::SplitRight))
+        );
+    }
+
+    #[test]
+    fn clearing_a_rebound_command_should_give_it_the_default_back() {
+        let rebound = rebind(TEMPLATE, Command::SplitRight, "cmd-shift-k");
+        let (table, _) = resolve(Some(&clear_command(&rebound, Command::SplitRight)));
+        assert_eq!(
+            (
+                command_for(&table, "cmd-shift-d"),
+                command_for(&table, "cmd-shift-k")
+            ),
+            (Some(Command::SplitRight), None)
+        );
     }
 }

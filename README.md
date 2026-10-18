@@ -17,8 +17,8 @@ owns every process, PID and file descriptor it creates.
 - **Vertical tabs** in a sidebar. A ring marks a tab with a running job, and a dot marks one
   whose job finished while you weren't looking. Double-click a tab to rename it (IME works,
   Chinese included).
-- **Split panes** that animate open and closed. Drag the dividers; the focused pane is the
-  bright one.
+- **Split panes** that animate open and closed. They share the tab evenly whenever a pane
+  comes or goes. Drag the dividers; the focused pane is the bright one.
 - **Jobs outlive the window.** A small session server (`kil --server`, the same binary) holds
   every pane's terminal. `⌘Q` and closing the window only detach from it, and so does a crash.
   The next launch goes back on the same processes, with the full screen, scrollback and input
@@ -92,8 +92,8 @@ version comes from `Cargo.toml`.
 | Keys | Action |
 |---|---|
 | `⌘T` | New tab, in the default directory, else the focused pane's |
-| `⌘D` / `⌘⇧D` | Split right / split down |
-| `⌘W` / `⌘⇧W` | Close pane / close tab |
+| `⌘⇧D` / `⌘D` | Split right / split down |
+| `⌘⇧C` / `⌘⇧W` | Close pane / close tab |
 | `⌘⌥←→↑↓` | Focus the pane in that direction |
 | `⌘1`…`⌘9`, `⌘⇧[` / `⌘⇧]` | Select a tab, previous / next tab |
 | `⌘C` / `⌘V` | Copy / paste (bracketed paste when the program asks for it) |
@@ -105,16 +105,20 @@ version comes from `Cargo.toml`.
 Double-click a tab to rename it (Enter or clicking away saves, Esc cancels), right-click it
 for Rename / Close, and double-click empty sidebar space for a new tab.
 
-**`~/.config/kil/keymap.toml`** overrides any default. **Kil ▸ Keyboard Shortcuts…** opens it,
-creating a commented template the first time. Unknown keys or commands show up in a banner,
-and the valid entries still apply. It is reloaded when the window regains focus, and the menu
-bar then shows the new keys.
+**Rebinding is in the app.** **Settings ▸ Keyboard** lists every command and the keys it runs on.
+Click a shortcut, press the new one, and it is saved and applied at once — the old keys stop
+working, a key another command already has is refused by name, and **Reset** brings the default
+back.
+
+**`~/.config/kil/keymap.toml`** overrides any default, and is what the recorder writes. **Kil ▸
+Keyboard Shortcuts…** opens it, creating a commented template the first time. Unknown keys or
+commands show up in a banner, and the valid entries still apply. It is reloaded when the window
+regains focus, and the menu bar then shows the new keys.
 
 ```toml
 [bindings]
-"cmd-d"       = "split_down"
-"cmd-shift-d" = "split_right"
-"cmd-k"       = "unbind"
+"cmd-y" = "split_right"
+"cmd-k" = "unbind"
 ```
 
 **`~/.config/kil/config.toml`** (`$XDG_CONFIG_HOME` is respected):

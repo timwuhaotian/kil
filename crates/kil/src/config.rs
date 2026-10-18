@@ -130,6 +130,29 @@ pub fn apply(cx: &mut App) -> Vec<SharedString> {
     notices
 }
 
+/// `keymap.toml`'s text, if there is one.
+pub fn read_keymap() -> Result<Option<String>, String> {
+    load("keymap.toml")
+}
+
+/// Rewrites `keymap.toml` with `edit` applied to its text — the template if there is no file
+/// yet — and writes it in place, as `config.toml` is written.
+///
+/// # Errors
+/// If the file can't be created or written.
+pub fn update_keymap(edit: impl FnOnce(&str) -> String) -> Result<(), String> {
+    let path = file("keymap.toml").ok_or("keymap.toml: no home directory")?;
+    update_keymap_at(&path, edit).map_err(|err| format!("keymap.toml: {err}"))
+}
+
+fn update_keymap_at(path: &Path, edit: impl FnOnce(&str) -> String) -> io::Result<()> {
+    let current = read_path(path)?;
+    let text = edit(current.as_deref().unwrap_or(keymap::TEMPLATE));
+    path.parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::write(path, text))
+}
+
 /// Opens `keymap.toml` in the default text editor, first writing a commented starting point
 /// if there is none.
 ///
@@ -187,6 +210,43 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "# mine\nfont_size = 13.0\n"
+        );
+    }
+
+    #[test]
+    fn update_keymap_should_start_from_the_template_and_keep_the_comments() {
+        let path = scratch("keymap-new").with_file_name("keymap.toml");
+        update_keymap_at(&path, |text| {
+            keymap::rebind(text, keymap::Command::SplitRight, "cmd-k")
+        })
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(keymap::TEMPLATE), "{text}");
+        let (table, errors) = keymap::resolve(Some(&text));
+        let bound = |keys: &str| {
+            table
+                .iter()
+                .find(|(bound, _)| bound == keys)
+                .map(|(_, command)| *command)
+        };
+        assert_eq!(
+            (errors, bound("cmd-shift-d"), bound("cmd-k")),
+            (vec![], None, Some(keymap::Command::SplitRight))
+        );
+    }
+
+    #[test]
+    fn update_keymap_should_edit_the_file_that_is_already_there() {
+        let path = scratch("keymap-edit").with_file_name("keymap.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "# mine\n[bindings]\n\"cmd-y\" = \"new_tab\"\n").unwrap();
+        update_keymap_at(&path, |text| {
+            keymap::rebind(text, keymap::Command::SplitRight, "cmd-k")
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# mine\n[bindings]\n\"cmd-y\" = \"new_tab\"\n\"cmd-shift-d\" = \"unbind\"\n\"cmd-k\" = \"split_right\"\n"
         );
     }
 }

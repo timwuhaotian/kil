@@ -201,6 +201,8 @@ impl<T: Clone + PartialEq> PaneTree<T> {
             closing: None,
         };
         *node = Node::Split(Box::new(split));
+        // A tab whose panes changed shares its space evenly again.
+        equalize(&mut self.root, now);
         true
     }
 
@@ -221,6 +223,8 @@ impl<T: Clone + PartialEq> PaneTree<T> {
         split
             .ratio
             .retarget(to, motion::CLOSE_PANE, Ease::InOut, now);
+        // Same as a split: the panes that survive share the tab evenly.
+        equalize(&mut self.root, now);
         Close::Animating
     }
 
@@ -393,6 +397,20 @@ fn find_split_mut<T>(node: &mut Node<T>, id: SplitId) -> Option<&mut Split<T>> {
     find_split_mut(&mut split.second, id)
 }
 
+/// Sends every split to an even share of its axis, so a tab whose panes changed reads as a
+/// grid again. A closing split keeps running its animation to zero, and one already heading
+/// for half is left alone so its tween never restarts.
+fn equalize<T>(node: &mut Node<T>, now: Instant) {
+    let Node::Split(split) = node else { return };
+    if split.closing.is_none() && (split.ratio.target() - 0.5).abs() > EPS {
+        split
+            .ratio
+            .retarget(0.5, motion::SPLIT, Ease::OutQuint, now);
+    }
+    equalize(&mut split.first, now);
+    equalize(&mut split.second, now);
+}
+
 fn collapse<T: Clone>(node: &mut Node<T>, now: Instant, removed: &mut Vec<T>) {
     let Node::Split(split) = node else { return };
     collapse(&mut split.first, now, removed);
@@ -464,9 +482,86 @@ mod tests {
         tree
     }
 
+    /// Every split in the shape, in tree order: `1 | 2` then `2 over 3`.
+    fn ratios<T>(node: &Node<T>, out: &mut Vec<(Axis, f32)>) {
+        let Node::Split(split) = node else { return };
+        out.push((split.axis, split.ratio.target()));
+        ratios(&split.first, out);
+        ratios(&split.second, out);
+    }
+
+    fn ratios_of(tree: &PaneTree<u32>) -> Vec<(Axis, f32)> {
+        let mut out = Vec::new();
+        ratios(tree.root(), &mut out);
+        out
+    }
+
+    /// Every split in the tree shares its axis evenly.
+    fn assert_even(tree: &PaneTree<u32>) {
+        for (_, ratio) in ratios_of(tree) {
+            assert!((ratio - 0.5).abs() < f32::EPSILON, "ratio {ratio}");
+        }
+    }
+
     #[test]
     fn split_should_put_new_leaf_after_target() {
         assert_eq!(three_panes().leaves(), [&1, &2, &3]);
+    }
+
+    #[test]
+    fn split_should_leave_every_split_even() {
+        let now = Instant::now();
+        let mut tree = three_panes();
+        // The user dragged the top divider; a new pane puts it back to an even split.
+        tree.set_ratio(SplitId(0), 0.3);
+        tree.split(&3, Axis::Horizontal, 4, now);
+        assert_eq!(ratios_of(&tree).len(), 3);
+        assert_even(&tree);
+    }
+
+    #[test]
+    fn close_should_leave_the_panes_left_even() {
+        let now = Instant::now();
+        let mut tree = three_panes();
+        tree.set_ratio(SplitId(0), 0.3);
+        tree.set_ratio(SplitId(1), 0.8);
+        tree.close(&3, now);
+        // The closing split is gone from the way the layout is heading, and the split above
+        // it shares evenly.
+        assert_eq!(
+            tree.shape(),
+            Shape::Split {
+                axis: Axis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Shape::Leaf(&1)),
+                second: Box::new(Shape::Leaf(&2)),
+            }
+        );
+    }
+
+    #[test]
+    fn close_should_keep_the_closing_split_animating_to_nothing() {
+        let now = Instant::now();
+        let mut tree = three_panes();
+        tree.set_ratio(SplitId(1), 0.8);
+        tree.close(&2, now);
+        let ratios = ratios_of(&tree);
+        assert_eq!(
+            ratios[1],
+            (Axis::Vertical, 0.),
+            "the closing split keeps its own tween"
+        );
+        assert!(
+            (ratios[0].1 - 0.5).abs() < f32::EPSILON,
+            "the split above it is even"
+        );
+    }
+
+    #[test]
+    fn dragging_a_divider_should_hold_until_a_pane_changes() {
+        let mut tree = three_panes();
+        tree.set_ratio(SplitId(0), 0.3);
+        assert!((ratios_of(&tree)[0].1 - 0.3).abs() < f32::EPSILON);
     }
 
     #[test]

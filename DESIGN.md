@@ -30,12 +30,12 @@ Build status:
 |---|----------|-------|
 | A1 | Launch opens one window: a left sidebar with one tab, and one pane running `$SHELL` as a login shell in `$HOME`. | Manual. Time to first prompt ≤ 200 ms (log timestamp). |
 | A2 | `cmd-t` opens a tab in the focused pane's cwd. Its sidebar row animates in, and focus moves to it. | Manual + `pwd`. |
-| A3 | `cmd-d` splits right and `cmd-shift-d` splits down. The new pane inherits cwd, and the split animates. Each pane gets **one** `SIGWINCH` per layout change, not one per frame. | `trap 'echo WINCH' WINCH` counter. |
-| A4 | `cmd-w` or shell `exit 0` closes the pane with an animation. The last pane closes its tab. The last tab closes the window, which quits the app. | Manual. |
+| A3 | `cmd-shift-d` splits right and `cmd-d` splits down. The new pane inherits cwd, and the split animates. Each pane gets **one** `SIGWINCH` per layout change, not one per frame. | `trap 'echo WINCH' WINCH` counter. |
+| A4 | `cmd-shift-c` or shell `exit 0` closes the pane with an animation. The last pane closes its tab. The last tab closes the window, which quits the app. | Manual. |
 | A5 | A non-zero exit or a signal death keeps the pane open with a banner showing `exited 1` or `killed: SIGKILL`. Any key closes it. | `exit 3`. |
 | A6 | Focus moves between panes with `cmd-alt-arrows` or a click. The focused pane is the bright one, and the others are dimmed to about half. Dividers can be dragged to resize. | Manual + `workspace` GPUI test (click focuses). |
 | A7 | Switch tabs by clicking, `cmd-1…9`, or `cmd-shift-[ / ]`. | Manual. |
-| A8 | `~/.config/kil/keymap.toml` overrides any default, including the split and close keys. Invalid entries appear in a banner with the key and the reason, and valid entries still apply. The file is reloaded when the window regains focus, and the menu bar is set again so its items show the keys now bound. **Kil ▸ Keyboard Shortcuts…** opens the file in the default text editor, first writing a commented template that lists the commands. | Rebind the split keys; `keymap` template test. |
+| A8 | `~/.config/kil/keymap.toml` overrides any default, including the split and close keys. Invalid entries appear in a banner with the key and the reason, and valid entries still apply. The file is reloaded when the window regains focus, and the menu bar is set again so its items show the keys now bound. **Settings ▸ Keyboard** lists every command: clicking its shortcut and pressing a chord binds that command and applies it at once, the old keys stop working, a key another command already has is refused by name, and **Reset** puts the default back. **Kil ▸ Keyboard Shortcuts…** opens the file in the default text editor, first writing a commented template that lists the commands. | Rebind the split keys, in the app and in the file; `keymap` / `config` tests. |
 | A9 | Terminal correctness: vim, htop, less, tmux, 256-color and truecolor, CJK wide characters aligned to the grid, **Chinese IME preedit at the cursor**, selection, copy, bracketed paste, trackpad scrollback. | Manual checklist. |
 | A10 | **Process hygiene.** Child fds are exactly 0, 1, 2 plus whatever the shell opens. Signal mask and ignore set are empty. Closing never blocks the UI thread. The session process is reaped within ≤ 3 s even if it ignores SIGHUP or is blocked writing. There are no zombies. | M1 integration tests (§4.8). |
 | A11 | **Memory.** Per-pane overhead without scrollback is ≤ 2 MB. Scrollback cost matches the formula in §5 within ±10%. A churn of 500 open/close cycles returns threads, fds, child count and live `TerminalPane` count to baseline. | Churn test plus `footprint`. |
@@ -48,6 +48,7 @@ Build status:
 | A18 | However kil ended (`cmd-q`, the window's close button, a logout or restart, a crash or `kill -9`), the next launch reopens what was there: the window frame, the tabs with their names and order, the active tab, each tab's splits, ratios and focused pane, and in each pane the shell's cwd and its old screen and scrollback with colors. A pane that had a foreground job types that job's command line into its new shell again. While kil runs this is saved at most every 2 s, which bounds what a crash can lose. Closing the last tab leaves nothing to reopen. If kil dies within 10 s of reopening, the next launch reopens without re-running the jobs. | `workspace` / `restore` / `transcript` / `lifecycle` tests + manual. |
 | A22 | Five themes (Night, Paper, Fjord, Ember, Dusk), picked from swatches in Settings or with `theme` in `config.toml`. A change restyles the chrome and every pane at once, and programs that ask for the terminal's colors (OSC 10/11/4, e.g. vim choosing light or dark) get the new palette. | `theme` tests, `color_queries_should_follow_the_theme_palette`, contrast checked (§7). |
 | A23 | With a default directory set, new tabs open there (`cmd-t`, `+ New Tab`, a double-click on the sidebar, the first tab of a fresh launch). Splits still open where their pane is. Without one, a new tab follows the focused pane, as before. | `workspace` GPUI test + manual. |
+| A24 | Whenever a tab's panes change — a split (`cmd-shift-d`, `cmd-d`) or a closed pane (`cmd-shift-c`, a shell's `exit 0`) — the tab shares its space evenly again: every split animates to half, so panes side by side share the width and panes stacked share the height. A dragged divider holds until the next pane change, and a restored layout keeps its saved ratios. | `pane_tree` unit tests + `panes_should_share_a_tab_evenly_again_after_a_pane_closes` + manual. |
 
 ### Non-goals (v1)
 These are left out and can be added later:
@@ -405,6 +406,12 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 
 **Panes:** 1 px dividers with a 6 px hit area. When a tab has more than one pane, the others are dimmed by a 50% near-black overlay. Their text drops to about half brightness, and their cursor is hollow while the focused one is solid. That is the focus cue. A lighter dim doesn't work: on the near-black background it moves the background by only ~2/255.
 
+**Even shares.** A tab whose panes change re-splits evenly: every split animates its ratio to
+0.5, so panes side by side share the width and panes stacked share the height. That happens on a
+split and when a pane closes, for the whole tab, not only for the panes that moved. A divider you
+dragged is kept until the next pane change, and a layout restored from the session file keeps the
+ratios it was saved with (A18).
+
 **Motion.** Every animation is a retargetable `Tween { from, to, start, dur, ease }`.
 `retarget(to, now)` restarts from the *current* value, so pressing a key repeatedly never makes the
 UI jump. Animations are driven by `request_animation_frame()` only while a tween is active, so they
@@ -417,6 +424,7 @@ reduce-motion hook.
 | Tab removed | reverse | 140 ms | `ease_in_out` |
 | Tab selected | pill y | 160 ms | `ease_out_quint` |
 | Split | ratio 1.0→0.5 | 200 ms | `ease_out_quint` |
+| Panes changed | every other split's ratio →0.5 | 200 ms | `ease_out_quint` |
 | Pane closed | sibling ratio →1.0, then collapse node | 160 ms | `ease_in_out` |
 | Tab switch | content cross-fade plus 6 px slide | 140 ms | `ease_out_quint` |
 | Focus change | inactive dim | 120 ms | linear |
@@ -428,8 +436,10 @@ enum Node<T> { Leaf(T), Split(Box<Split<T>>) }
 struct Split<T> { axis: Axis, ratio: Tween, first: Node<T>, second: Node<T> }
 ```
 `Split` is boxed so `Node` stays small (clippy `large_enum_variant`). Operations: `split`,
-`remove` (which collapses the parent), `layout(rect) -> impl Iterator<(&T, Rect)>`, and a geometric
-`neighbor(target, dir)`. It is pure and generic, so it is unit-tested with `T = u32`.
+`close` (which collapses the parent in `collapse_finished`), `set_ratio` for a divider drag,
+`layout(rect) -> impl Iterator<(&T, Rect)>`, and a geometric `neighbor(target, dir)`. `split` and
+`close` also `equalize`, sending every other split to an even share. It is pure and generic, so it
+is unit-tested with `T = u32`.
 
 ---
 
@@ -446,9 +456,9 @@ App-level commands (`open_settings`, `hide`, `hide_others`, `quit`) bind with no
 | Key | Command |
 |---|---|
 | `cmd-t` | `new_tab` |
-| `cmd-d` | `split_right` |
-| `cmd-shift-d` | `split_down` |
-| `cmd-w` | `close_pane` |
+| `cmd-d` | `split_down` |
+| `cmd-shift-d` | `split_right` |
+| `cmd-shift-c` | `close_pane` |
 | `cmd-shift-w` | `close_tab` |
 | `cmd-alt-left/right/up/down` | `focus_*` |
 | `cmd-shift-[` / `cmd-shift-]`, `ctrl-shift-tab` / `ctrl-tab` | `prev_tab` / `next_tab` |
@@ -464,11 +474,24 @@ App-level commands (`open_settings`, `hide`, `hide_others`, `quit`) bind with no
 ```toml
 # Entries override defaults; "unbind" removes a default.
 [bindings]
-"cmd-d"       = "split_down"
-"cmd-shift-d" = "split_right"
-"ctrl-a |"    = "split_right"   # multi-stroke; verify GPUI 0.2.2 sequence support in M5
-"cmd-k"       = "unbind"
+"cmd-y"    = "split_right"
+"ctrl-a |" = "split_down"   # multi-stroke; verify GPUI 0.2.2 sequence support in M5
+"cmd-k"    = "unbind"
 ```
+
+**Recording.** Settings has a **KEYBOARD** section listing every command and the keys it runs
+on. Clicking a shortcut puts that row in *Press keys…* and reads the next chord: it is written to
+`keymap.toml` and applied at once, and the menus follow. **Reset** drops the user's entry so the
+default runs again. Two rules keep the file honest:
+
+- **Rebinding moves a command.** Every line naming that command goes, and its default is left in
+  the file as `"keys" = "unbind"`, so the old keys stop working instead of coming back.
+- **A key already taken is refused**, with a message naming the command that has it.
+
+Recording uses an `App::intercept_keystrokes` subscription, armed only while a row is listening.
+It runs before GPUI resolves any binding, so `cmd-w` is read as data instead of closing the
+Settings window, and it only swallows keys in that window, so typing in a terminal still works.
+Only single chords are recorded; multi-stroke keys stay a `keymap.toml` feature.
 
 **Parsing**
 - Commands come from `enum Command` with serde `snake_case`, so an unknown name is a typed error.

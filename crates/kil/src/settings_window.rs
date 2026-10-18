@@ -5,14 +5,15 @@
 use std::fs;
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, Div, Entity, FocusHandle,
-    Focusable, Hsla, KeyBinding, MouseButton, MouseDownEvent, PathPromptOptions, SharedString,
-    Stateful, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    point, prelude::*, px, size,
+    AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, Div, ElementId, Entity,
+    FocusHandle, Focusable, Hsla, KeyBinding, Keystroke, MouseButton, MouseDownEvent,
+    PathPromptOptions, SharedString, Stateful, Subscription, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, point, prelude::*, px, size,
 };
 
 use crate::{
     config,
+    keymap::{self, Command},
     settings::{Settings, abbreviate_home, config_dir, expand_home},
     text_field::{FieldEvent, TextField},
     theme::{Theme, ThemeName, hsla},
@@ -71,6 +72,12 @@ pub struct SettingsWindow {
     font_family: Entity<TextField>,
     scrollback: Entity<TextField>,
     directory: Entity<TextField>,
+    /// `keymap.toml` resolved over the defaults: which keys run which command.
+    keys: Vec<(String, Command)>,
+    /// The command whose next keypress is being recorded.
+    recording: Option<Command>,
+    /// Swallows every keypress while recording, so `cmd-w` is read and not acted on.
+    recorder: Option<Subscription>,
     /// Last problem reading or writing the file.
     error: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
@@ -97,15 +104,20 @@ impl SettingsWindow {
             cx.subscribe_in(&scrollback, window, Self::scrollback_edited),
             cx.subscribe_in(&directory, window, Self::directory_edited),
         ];
-        Self {
+        let mut this = Self {
             focus_handle: cx.focus_handle(),
             file,
             font_family,
             scrollback,
             directory,
+            keys: Vec::new(),
+            recording: None,
+            recorder: None,
             error,
             _subscriptions: subscriptions,
-        }
+        };
+        this.load_keys();
+        this
     }
 
     fn write(&mut self, key: &str, value: &toml::Value, cx: &mut Context<Self>) {
@@ -199,11 +211,89 @@ impl SettingsWindow {
         .detach();
     }
 
-    fn edit_keymap(&mut self, cx: &mut Context<Self>) {
-        if let Err(err) = config::open_keymap(cx) {
-            self.error = Some(err.into());
-            cx.notify();
+    /// The keys `command` runs on now, resolved from `keymap.toml` over the defaults.
+    fn keys_for(&self, command: Command) -> Option<&str> {
+        self.keys
+            .iter()
+            .find(|(_, bound)| *bound == command)
+            .map(|(keys, _)| keys.as_str())
+    }
+
+    /// `keymap.toml` resolved over the defaults.
+    fn load_keys(&mut self) {
+        match config::read_keymap() {
+            Ok(text) => self.keys = keymap::resolve(text.as_deref()).0,
+            Err(err) => self.error = Some(err.into()),
         }
+    }
+
+    /// Rewrites `keymap.toml` with `edit`, then shows and applies what it now holds.
+    fn write_keymap(&mut self, edit: impl FnOnce(&str) -> String, cx: &mut Context<Self>) {
+        match config::update_keymap(edit) {
+            Ok(()) => {
+                self.error = None;
+                self.load_keys();
+                workspace::reload_config(cx);
+            }
+            Err(err) => self.error = Some(err.into()),
+        }
+        cx.notify();
+    }
+
+    /// Waits for a keypress and saves it as `command`'s shortcut. Keys are read, not acted
+    /// on, so `cmd-w` can be recorded without closing the window. Clicking the row that is
+    /// already listening puts it back.
+    fn record(&mut self, command: Command, cx: &mut Context<Self>) {
+        if self.recording == Some(command) {
+            self.recording = None;
+            self.recorder = None;
+            cx.notify();
+            return;
+        }
+        self.recording = Some(command);
+        self.recorder = Some(cx.intercept_keystrokes(|event, window, cx| {
+            if let Some(handle) = window.window_handle().downcast::<SettingsWindow>() {
+                let keystroke = event.keystroke.clone();
+                let _ = handle.update(cx, |this, _, cx| this.recorded(&keystroke, cx));
+            }
+            cx.stop_propagation();
+        }));
+        cx.notify();
+    }
+
+    /// A key arrived while recording.
+    fn recorded(&mut self, event: &Keystroke, cx: &mut Context<Self>) {
+        let Some(command) = self.recording else {
+            return;
+        };
+        // A modifier on its own arrives as a keystroke of its own; the shortcut is the key
+        // pressed with it.
+        let Some(keys) = keymap::keystroke_of(event) else {
+            return;
+        };
+        self.recording = None;
+        self.recorder = None;
+        let taken = self
+            .keys
+            .iter()
+            .find(|(bound, other)| bound == &keys && *other != command)
+            .map(|(_, other)| *other);
+        match taken {
+            Some(taken) => {
+                self.error = Some(
+                    format!("{} is already {}.", keymap::display(&keys), taken.title()).into(),
+                );
+                cx.notify();
+            }
+            None => self.write_keymap(|text| keymap::rebind(text, command, &keys), cx),
+        }
+    }
+
+    /// Drops the user's shortcut, so the default runs again.
+    fn reset_key(&mut self, command: Command, cx: &mut Context<Self>) {
+        self.recording = None;
+        self.recorder = None;
+        self.write_keymap(|text| keymap::clear_command(text, command), cx);
     }
 
     fn step_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -336,15 +426,25 @@ fn row(
         .justify_between()
         .gap_4()
         .child(
-            div().flex().flex_col().child(label).children(
-                hint.map(|hint| div().text_size(px(11.)).text_color(c.muted).child(hint)),
-            ),
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(div().truncate().child(label))
+                .children(hint.map(|hint| {
+                    div()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(c.muted)
+                        .child(hint)
+                })),
         )
-        .child(control)
+        .child(div().flex_none().child(control))
         .into_any_element()
 }
 
-fn button(id: &'static str, label: &'static str, c: Colors) -> Stateful<Div> {
+fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, c: Colors) -> Stateful<Div> {
     div()
         .id(id)
         .h(px(24.))
@@ -358,7 +458,73 @@ fn button(id: &'static str, label: &'static str, c: Colors) -> Stateful<Div> {
         .border_color(c.divider)
         .cursor_pointer()
         .hover(|style| style.bg(c.hover))
-        .child(label)
+        .child(label.into())
+}
+
+/// A command and its shortcut. The key box is a button: press it, then press the keys.
+fn key_row(
+    command: Command,
+    keys: Option<&str>,
+    recording: Option<Command>,
+    c: Colors,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let name = command.key();
+    let listening = recording == Some(command);
+    let changed = keys != command.default_keys();
+    let keys_box = div()
+        .id(ElementId::Name(format!("keys-{name}").into()))
+        .h(px(22.))
+        .min_w(px(58.))
+        .px_2()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .border_color(if listening { c.accent } else { c.divider })
+        .cursor_pointer()
+        .hover(|style| style.bg(c.hover))
+        .text_size(px(12.))
+        .text_color(if changed { c.accent } else { c.text })
+        .child(match (keys, listening) {
+            (_, true) => "Press keys…".to_owned(),
+            (Some(keys), false) => keymap::display(keys),
+            (None, false) => "None".to_owned(),
+        })
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.record(command, cx)));
+    let reset = button(ElementId::Name(format!("reset-{name}").into()), "Reset", c)
+        .text_size(px(11.))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.reset_key(command, cx)));
+    div()
+        .h(px(32.))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .child(command.title()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(keys_box)
+                .child(
+                    div()
+                        .w(px(48.))
+                        .flex()
+                        .justify_end()
+                        .when(changed, |row| row.child(reset)),
+                ),
+        )
+        .into_any_element()
 }
 
 fn toggle(id: &'static str, on: bool, c: Colors) -> Stateful<Div> {
@@ -442,12 +608,20 @@ impl SettingsWindow {
         ]
     }
 
+    /// Every command with the keys it runs on: click a shortcut and press the new one.
+    fn keyboard_rows(&self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        Command::all()
+            .into_iter()
+            .map(|command| key_row(command, self.keys_for(command), self.recording, c, cx))
+            .collect()
+    }
+
     fn terminal_rows(&self, c: Colors, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let file = &self.file;
         vec![
             row(
                 "Default directory",
-                Some("New tabs open here; splits follow their pane"),
+                Some("New tabs and splits start here"),
                 c,
                 div()
                     .flex()
@@ -496,22 +670,14 @@ impl Render for SettingsWindow {
         let font = self.font_rows(c, window, cx);
         let terminal = self.terminal_rows(c, window, cx);
         let appearance = self.appearance_rows(c, cx);
-        let files = vec![
-            row(
-                "Keyboard shortcuts",
-                Some("keymap.toml; the menus follow it"),
-                c,
-                button("edit-keymap", "Edit…", c)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.edit_keymap(cx))),
-            ),
-            row(
-                "Config files",
-                Some("config.toml, keymap.toml"),
-                c,
-                button("open-folder", "Open Folder", c)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_folder(cx))),
-            ),
-        ];
+        let keyboard = self.keyboard_rows(c, cx);
+        let files = vec![row(
+            "Config files",
+            Some("config.toml, keymap.toml"),
+            c,
+            button("open-folder", "Open Folder", c)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_folder(cx))),
+        )];
 
         div()
             .key_context("Settings")
@@ -542,14 +708,18 @@ impl Render for SettingsWindow {
             )
             .child(
                 div()
+                    .id("settings-body")
                     .flex_1()
+                    .min_h_0()
                     .px_5()
                     .pb_4()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_4()
                     .child(section("THEME", c, appearance))
                     .child(section("FONT", c, font))
+                    .child(section("KEYBOARD", c, keyboard))
                     .child(section("TERMINAL", c, terminal))
                     .child(section("FILES", c, files))
                     .child(
@@ -566,9 +736,56 @@ impl Render for SettingsWindow {
 
 #[cfg(test)]
 mod tests {
-    use gpui::TestAppContext;
+    use gpui::{Modifiers, TestAppContext, WindowHandle};
 
     use super::*;
+
+    fn settings_window(cx: &mut TestAppContext) -> WindowHandle<SettingsWindow> {
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.set_global(Settings::default());
+            crate::register_app_actions(cx);
+            cx.dispatch_action(&crate::OpenSettings);
+        });
+        cx.run_until_parked();
+        cx.windows()
+            .iter()
+            .find_map(AnyWindowHandle::downcast::<SettingsWindow>)
+            .expect("the Settings window")
+    }
+
+    #[gpui::test]
+    fn a_modifier_on_its_own_should_not_end_recording(cx: &mut TestAppContext) {
+        let settings = settings_window(cx);
+        let modifier = Keystroke {
+            key: "shift".into(),
+            key_char: None,
+            modifiers: Modifiers::default(),
+        };
+        settings
+            .update(cx, |this, _, cx| {
+                this.record(Command::SplitRight, cx);
+                this.recorded(&modifier, cx);
+                assert_eq!(this.recording, Some(Command::SplitRight));
+            })
+            .unwrap();
+        // Drops the recorder, which is armed and holds a keystroke interceptor.
+        settings
+            .update(cx, |this, _, _| this.recording = None)
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn clicking_the_listening_row_should_stop_recording(cx: &mut TestAppContext) {
+        let settings = settings_window(cx);
+        settings
+            .update(cx, |this, _, cx| {
+                this.record(Command::SplitRight, cx);
+                this.record(Command::SplitRight, cx);
+                assert_eq!(this.recording, None);
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn open_settings_should_open_one_window_and_reuse_it(cx: &mut TestAppContext) {

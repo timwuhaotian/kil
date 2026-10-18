@@ -1978,6 +1978,52 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_default_keys_should_split_and_close_panes(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.update(|_, cx| {
+            let (table, errors) = crate::keymap::resolve(None);
+            assert!(errors.is_empty());
+            cx.bind_keys(crate::keymap::bindings(&table));
+        });
+        let panes = |cx: &mut VisualTestContext| {
+            cx.update(|_, _| {});
+            workspace.read_with(cx, |this, _| this.tabs[this.active].tree.leaves().len())
+        };
+        // cmd-shift-d splits right, cmd-d splits down, cmd-shift-c closes the pane.
+        cx.simulate_keystrokes("cmd-shift-d");
+        assert_eq!(panes(cx), 2);
+        cx.simulate_keystrokes("cmd-d");
+        assert_eq!(panes(cx), 3);
+        cx.simulate_keystrokes("cmd-shift-c");
+        std::thread::sleep(motion::CLOSE_PANE + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(panes(cx), 2);
+    }
+
+    #[gpui::test]
+    fn panes_should_share_a_tab_evenly_again_after_a_pane_closes(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(SplitRight);
+        cx.dispatch_action(SplitDown);
+        // The user drags a divider, leaving the tab lopsided.
+        workspace.update(cx, |this, _| {
+            let id = match this.tabs[this.active].tree.root() {
+                Node::Split(split) => split.id,
+                Node::Leaf(_) => unreachable!(),
+            };
+            this.tabs[this.active].tree.set_ratio(id, 0.3);
+        });
+        cx.dispatch_action(ClosePane);
+        workspace.read_with(cx, |this, _| match this.tabs[this.active].tree.shape() {
+            crate::pane_tree::Shape::Split { ratio, .. } => {
+                assert!((ratio - 0.5).abs() < f32::EPSILON, "ratio {ratio}");
+            }
+            shape @ crate::pane_tree::Shape::Leaf(_) => panic!("{shape:?}"),
+        });
+    }
+
+    #[gpui::test]
     fn clicking_a_pane_should_make_it_the_undimmed_one(cx: &mut TestAppContext) {
         let (workspace, cx) = workspace(cx);
         cx.dispatch_action(SplitRight);
