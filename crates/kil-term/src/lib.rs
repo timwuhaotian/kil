@@ -1,5 +1,9 @@
 //! Terminal sessions for kil: PTY spawn, process lifecycle, VT state and render snapshots.
 //!
+//! A session runs in this process, or in the session server (`kil --server`, [`server`]),
+//! which keeps it running while no app is attached; the app reaches it through a [`Client`]
+//! (DESIGN.md §14).
+//!
 //! Process invariants (DESIGN.md §4):
 //! - A child PID is only signalled through the value that owns the unreaped child.
 //! - Teardown closes the PTY master before anything waits, and never blocks the caller.
@@ -9,20 +13,26 @@
 mod child;
 mod error;
 mod events;
+mod pane_loop;
 mod proc_info;
 mod pty;
 mod reaper;
+mod remote;
+pub mod server;
 mod session;
 mod snapshot;
 mod spawn;
+mod state;
 mod sys;
 mod transcript;
+mod wire;
 
 pub use child::{live_children, wait_for_children};
 pub use error::SpawnError;
-pub use events::{ColorQuery, SessionEvent};
+pub use events::SessionEvent;
 pub use proc_info::{ForegroundProcess, Pid, ProcIdentity, TtyId};
 pub use reaper::expedite_reaping;
+pub use remote::Client;
 pub use session::{
     GridSize, InputMode, MemoryUsage, Program, SelectionKind, Session, SessionConfig, ViewportCell,
 };

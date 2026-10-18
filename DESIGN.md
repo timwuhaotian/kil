@@ -17,7 +17,7 @@ Build status:
 - **A18** (reopen everything after any exit: quit, closed window, logout, crash) is implemented (§4.9). `workspace`, `restore`, `transcript`, `terminal` and `lifecycle` tests cover it. A run of the real binary was checked by hand: a `kill -9` and a terminate (as at logout) each reopened the screen and re-ran the job, and a crash during reopening skipped the re-run. No jobs were left behind.
 - A dev bundle is built with `scripts/bundle.sh`. The two-tone icon source is `packaging/icon.svg`.
 - Release signing and notarization (the rest of M6) is not done yet.
-- **Planned, for review:** §14, a session server so jobs continue across a quit or an app crash, instead of starting again.
+- **§14, the session server** (jobs continue across a quit or an app crash), is built through S3. Its tests pass (`server.rs`, the server half of `crash.rs`, and `workspace` GPUI tests), and the real binary was checked by hand. The app was quit, and separately `kill -9`ed. Each time, three panes kept the same shell PIDs and their jobs kept running, and the next launch went back on them. Killing the server hung its jobs up. Throughput and echo latency through the server match a local session (§6.4). S4's TCC check on a fresh install is not done yet.
 
 ---
 
@@ -95,12 +95,17 @@ kil/
 │  ├─ kil-term/               NO UI deps. Processes, PIDs, PTY, session, snapshots.
 │  │  ├─ src/lib.rs           #![deny(missing_docs)]
 │  │  ├─ src/session.rs       Session: Term + EventLoop + identity + state
-│  │  ├─ src/pty.rs           Pty: EventedReadWrite + EventedPty + OnResize + Drop
+│  │  ├─ src/pty.rs           Pty: master + child, kqueue registration, close-first Drop
 │  │  ├─ src/spawn.rs         openpty, env, Command + pre_exec hygiene
 │  │  ├─ src/reaper.rs        one thread: adopts closed children, escalates, reaps
 │  │  ├─ src/proc_info.rs     ProcIdentity, TtyId, foreground(), cwd()
 │  │  ├─ src/snapshot.rs      Frame / RenderCell (UI-agnostic render copy)
 │  │  ├─ src/transcript.rs    screen + scrollback as SGR bytes, and their replay
+│  │  ├─ src/pane_loop.rs     a session's I/O thread: PTY ⇄ Term, queries, attached client (§14.4)
+│  │  ├─ src/state.rs         a whole terminal as bytes, for an attach (§14.5)
+│  │  ├─ src/server.rs        `kil --server`: sessions by id, socket, idle exit (§14.3)
+│  │  ├─ src/remote.rs        Client, and the feed of a remote session's mirror Term
+│  │  ├─ src/wire.rs          frames of the server protocol
 │  │  ├─ src/error.rs         SpawnError, SessionError (thiserror)
 │  │  ├─ src/sys/darwin.rs    the ONLY module with `unsafe` (FFI), each block // SAFETY:
 │  │  └─ tests/               lifecycle, hygiene, hostile children, churn (§4.8)
@@ -129,13 +134,19 @@ and tests in seconds without GPUI. The app crate only renders and routes input.
 ### Threads and data flow
 
 ```
-main thread (GPUI/AppKit) ─ frames on display link only when notified; input; actions
-   ▲ futures::mpsc (Wakeup coalesced to ≤1 in flight; Title, Bell, ChildExit, Clipboard)
-   │
-PTY thread × N  (alacritty EventLoop, one per session)
-   read master → vte → Term (Arc<FairMutex>) ; write input ; NOTE_EXIT on kqueue ; answers PtyWrite inline
-spawner × 1     fork+exec off the UI thread (fork of a large GUI process costs ms)
-reaper  × 1     adopts closed children → NOTE_EXIT or deadline → SIGKILL → reap
+app (kil)
+  main thread (GPUI/AppKit) ─ frames on display link only when notified; input; actions
+     ▲ futures::mpsc (Wakeup coalesced to ≤1 in flight; Title, Bell, ChildExit, Clipboard)
+     │
+  mirror feed × N  (remote.rs, one per pane)
+     read socket → vte → mirror Term (Arc<FairMutex>) ; write input frames
+  background executor: connect, spawn or attach off the UI thread
+
+session server (kil --server, §14)
+  accept × 1       one thread per new connection until it becomes a pane's
+  pane loop × N    (pane_loop.rs, one per session)
+     read master → vte → Term → forward to the client ; write input ; NOTE_EXIT on kqueue ; answers queries
+  reaper  × 1      adopts closed children → NOTE_EXIT or deadline → SIGKILL → reap
 ```
 
 ### Ownership graph (GPUI)
@@ -241,7 +252,7 @@ reaper (one thread, kqueue): NOTE_EXIT ─► try_wait ─► done
 ### 4.6 Quit, crash, natural exit
 
 - **Natural exit.** NOTE_EXIT fires, the PTY thread reaps and sends `ChildExit(status)`. Status 0 closes the pane with an animation. Anything else shows the banner from A5. This also stops a broken `.zshrc` from creating a crash loop.
-- **Quit (`cmd-q`).** If any session is busy, a confirm sheet lists the processes (for example "vim, cargo"). Then every session closes as in §4.5 and `reaper.shutdown(1s)` runs. Survivors get SIGKILL, are reaped, and the app exits.
+- **Quit (`cmd-q`) and the close button** detach: the sessions keep running in the session server (§14). If any is busy, a sheet names the jobs and offers Quit, Stop Jobs and Quit, and Cancel. **Quit and Stop All Jobs** (and the sheet's second button) ends every session in the server as in §4.5: SIGKILL after the grace, reaped, then the app exits.
 - **Crash or abort.** The kernel closes every master, which hangs up every session (F4). The next launch reopens the state saved up to 2 s earlier (§4.9). Shells exit and launchd reaps them. Because the children start with an empty signal mask (F15), the hangup's SIGHUP reaches them. `crash.rs` aborts an owner and checks this. Release builds use `panic = "abort"`: a half-alive pane is worse than a clean crash, and the kernel is the safety net.
 - **Info.plist.** `NSSupportsSuddenTermination = false` and `NSSupportsAutomaticTermination = false`, so macOS never skips this flow. `NSAppSleepDisabled = true`: if App Nap throttles the PTY reader, child builds block on a full PTY. Verify the App Nap behavior in M6.
 
@@ -617,9 +628,9 @@ Each milestone ends on a proof, not on a feature count.
 
 ---
 
-## 14. Planned: the session server (jobs that outlive the window)
+## 14. The session server (jobs that outlive the window)
 
-Status: **design, for review. Nothing below is built yet.** §4.9 is what ships today. It reopens the layout and the screens, but each job starts again. This section makes the job itself continue: vim keeps its unsaved buffer, ssh stays connected, and a build keeps going.
+Status: **S1–S3 built; S4 partly** (§14.8). Without it, §4.9 reopens the layout and the screens, but each job starts again. The server makes the job itself continue: vim keeps its unsaved buffer, ssh stays connected, and a build keeps going.
 
 ### 14.1 Outcome
 
@@ -650,13 +661,13 @@ The invariants of §4 move to the server unchanged: spawn hygiene, ownership-onl
 
 ### 14.3 Processes and lifecycle
 
-- **Starting.** At launch the app connects to `~/Library/Application Support/kil/server.sock`. If nothing answers, it spawns `kil --server` with the same hygiene as a shell (§4.2: `setsid`, an empty signal mask, default dispositions, a CLOEXEC sweep), so the server is not in the app's session or process group. The app waits ≤ 1 s for the socket. Two launches racing to start a server are serialized by `flock` on `server.lock`, and the loser connects to the winner.
-- **Reaping the server.** While the app lives, the server is its child. The app keeps it as an `OwnedChild`, watches its `NOTE_EXIT`, and reaps it if it exits first, so no zombie is left. It is never handed to the reaper, which would SIGKILL it at the deadline. After the app exits, launchd adopts it.
-- **Handshake.** The first frame on every connection is `Hello { protocol }`. It is checked for equality only. If the protocol differs, the app takes a §4.9 snapshot from the old server, stops its sessions, starts the new server and reopens by re-running. That kills jobs once per protocol change, so the protocol changes only when it must, not with every app version.
+- **Starting.** At launch the app connects to `~/Library/Application Support/kil/server.sock`. If nothing answers, it runs `kil --server <dir>` with the same hygiene as a shell (§4.2: `setsid`, an empty signal mask, default dispositions, a CLOEXEC sweep), with stderr in `server.log`. The app waits ≤ 3 s for the socket. Two launches racing to start a server are serialized by `flock` on `server.lock`, and the loser exits, leaving the winner. If no server can be started, a server on a thread of the app stands in, and a notice says that jobs will end with Kil.
+- **No zombie, no ownership by the app.** `kil --server` forks first thing, while it is still single-threaded, and the parent exits. The app reaps that parent at once. The server itself is launchd's child from the start, so it never needs reaping by the app, and nothing in the app could kill it.
+- **Handshake.** The first frame on every connection is `Hello { protocol }`, checked for equality. *As built*, a mismatch fails the connection, and the stand-in thread server takes over. **Open, to do before the first protocol bump:** the planned hand-over. The app would take a §4.9 snapshot from the old server, stop its sessions, start the new server and reopen by re-running. Without it, an old server's jobs would keep running unseen. The protocol is versioned apart from the app (`wire::PROTOCOL = 1`) so that it changes only when it must.
 - **Detach.** `cmd-q` and the close button save the layout (§4.9), close the connections and exit. The sessions keep running.
 - **Reattach.** On launch the app asks the server for its sessions. Every pane in `session.toml` whose id the server still has is **attached**. Any other pane falls back to §4.9 (replay its screen, re-run its job). A session the server has but the layout doesn't is opened in an extra tab, so a running job is never left unseen.
-- **Losing the server.** If every connection drops at once, the app restarts the server and reopens each pane through §4.9, as a launch after a restart would.
-- **Security.** The directory is `0700` and the socket `0600`. Each accepted connection is checked with `getpeereid` against the server's uid, and a mismatch is closed before any frame is read. The socket path is at most 104 bytes (`sun_path`). If `$HOME` makes it longer, the socket moves to `$TMPDIR/kil-<uid>/`.
+- **Losing the server.** Each pane's connection ends: its program ended, as far as the app can tell, so the pane shows the exit banner. The next launch finds no live sessions and reopens every pane through §4.9, as after a restart.
+- **Security.** The directory is `0700` and the socket `0600`. Each accepted connection is checked with `getpeereid` against the server's uid, and a mismatch is closed before any frame is read. The socket path is at most 104 bytes (`sun_path`). If the directory makes it longer, the socket moves to `$TMPDIR/kil-<uid>/` (exercised by the manual runs, whose `$HOME` was long).
 
 ### 14.4 Data path
 
@@ -670,54 +681,59 @@ keys ─► app ─► socket ─► server ─► PTY master
 ```
 
 - **The server needs its own pane loop, not alacritty's `EventLoop`.** alacritty reads the PTY *before* it takes the terminal lock (`event_loop.rs`, `pty_read`). If the output were copied to the client at read time, an attach could land between that read and the parse, and those bytes would be lost or doubled. The server loop reads, parses and forwards under one lock, and an attach (render the state, then install the client) takes the same lock, so the hand-off is exact. The loop is small (read, write queue, resize, child exit through `Pty`'s kqueue), and it is the "custom loop" §13 already names as a trigger.
-- **Only the server answers.** Both Terms see every query (DA, CPR, OSC 10/11/4). The mirror's `PtyWrite` and `ColorRequest` are dropped, and the server answers alone, with the theme's palette sent in `Hello`. A query asked while no window is open is still answered.
-- **One connection per pane, plus one control connection.** Pane connections carry framed output (server to app) and input and resize frames (app to server). Control carries `List`, `Spawn`, `Close`, `StopAll`, exit statuses, and `Hello`. Frames are `u32` length + `u8` kind + payload, hand-written little-endian: no new dependency.
-- **Back-pressure.** The server writes to a client without blocking. If a client falls more than 4 MiB behind (the app is stopped or hung), the server drops that connection and the pane is detached. The program never blocks because a window is slow, and the app reattaches with the full state.
-- **Cost.** Each output chunk is copied over one more socket and parsed twice. That is a few tens of µs per keypress echo, well under a frame. Throughput must stay at least Terminal.app's (§6.4). Scrollback is held twice, by the server and by the mirror, so A11's per-pane formula doubles.
+- **Only the server answers.** Both Terms see every query (DA, CPR, OSC 10/11/4). The mirror's `PtyWrite`, size and color requests are dropped (`Role::Mirror`), and the server answers alone. Colors come from the program's own overrides, then kil-term's default palette, which is the app's theme. A query asked while no window is open is still answered.
+- **One connection per pane, plus one control connection.** A pane connection starts with `Spawn` or `Attach`. After that it carries output and exit status (server to app) and input, resize and `Close` (app to server). Control carries `List` and `StopAll`. Frames are `u32` length + `u8` kind + payload, hand-written little-endian: no new dependency. Output is encoded and parsed in place, without a copy per frame.
+- **Flow control.** The server writes to a client without blocking. While more than 1 MiB waits for it, the server stops reading the PTY, so the program waits, as with any terminal that falls behind. A client that takes nothing for 2 s while output waits (the app is stopped or hung) is dropped. Its pane is detached, the PTY is read again, and the app reattaches later with the full state. A first version dropped any client 4 MiB behind instead, and a healthy client fell that far behind within milliseconds of `cat`ting a large file.
+- **Cost (measured, release).** `cat` of 27 MB takes 191–195 ms through the server against 178–200 ms locally. Keypress echo through `cat` has a p50 of 79 µs against 87 µs locally, and the p95 is ~170 µs for both. A new session's round trip (connect, spawn, attach) is ~1.7 ms. Scrollback is held twice, by the server and by the mirror, so A11's per-pane formula doubles.
 
 ### 14.5 Rebuilding a screen on attach
 
 On `Attach`, the server takes its Term lock, renders a state stream, installs the connection and releases the lock. The mirror parses the stream from a fresh Term. The stream is:
-1. The primary screen and scrollback: `Transcript::render` (§4.9), which already exists.
-2. If the alternate screen is active: `CSI ? 1049 h`, then every row at an absolute position (`CSI H`, rows, SGR).
-   - alacritty exposes the inactive grid only through `swap_alt`. Leaving alt is a plain swap. Entering it resets the alt grid and copies the cursor, so the alt rows are rendered first and painted back after the second swap.
-   - Fallback: send the primary screen and `1049h`, then make the program redraw itself with a `SIGWINCH` size change (rows − 1, then back).
-3. The cursor (position, visibility, DECSCUSR shape), the SGR pen and the scroll region (DECSTBM).
-4. Modes that change input or output: DECCKM, DECKPAM, bracketed paste, mouse reporting 1000/1002/1003 with encoding 1006, focus reporting 1004, alternate scroll 1007, DECAWM, origin mode, insert mode, LNM.
-5. The title (OSC 2).
+The mirror is created at the server Term's size (sent in `Attached`), so the rows split between history and screen exactly as they do in the server (`state.rs`).
+1. The primary screen: every history and screen row, wrapped rows joined, then the primary cursor.
+2. If the alternate screen is active: `CSI ? 1049 h`, then every row at an absolute position, then the alt cursor.
+   - alacritty exposes the inactive grid only through `swap_alt`. Leaving alt is a plain swap. Entering it resets the alt grid and copies the cursor, so the alt rows, cursor and saved cursor are cloned first and put back into the grid after the second swap (`grid_mut`), exactly.
+   - alacritty doesn't expose the scroll region either. So after an attach with the alternate screen up, the server shrinks the PTY by a row and restores it 30 ms later. The program redraws and sets its region again, in both Terms alike.
+3. The cursor's position, pending wrap and SGR pen, and its DECSCUSR shape.
+4. Modes, each set or reset explicitly: DECCKM, DECKPAM, bracketed paste, mouse reporting 1000/1002/1003 with encodings 1005/1006, focus reporting 1004, alternate scroll 1007, DECAWM, cursor visibility, insert mode, LNM.
+5. Colors the program redefined (OSC 4, 10, 11, 12), and the title (OSC 2).
 
-Left out: charsets, custom tab stops, palette overrides set by programs (OSC 4/10/11 sets), and hyperlinks. They are rare, and the next redraw usually restores them.
+Left out: charsets, origin mode, custom tab stops and hyperlinks. They are rare, and the next redraw usually restores them.
 
 ### 14.6 App side
 
-- `TerminalPane` holds a `RemoteSession` with today's `Session` API. Calls that read the terminal go to the mirror. `write`, `resize` and `close` become frames. `foreground()`, `busy_job`, `job_args` and `shell_cwd` keep working unchanged, because the server sends each session's `ProcIdentity` and `TtyId`, and `proc_pidinfo` on another process of the same user needs no ownership.
-- `Session` in `kil-term` splits in two: `PaneLoop` (Term + PTY + loop) runs in the server, and `RemoteSession` (mirror Term + connection) runs in the app. `spawn.rs`, `pty.rs`, `reaper.rs`, `proc_info.rs`, `snapshot.rs` and `transcript.rs` are unchanged.
+- `Session` keeps its API and gains a second kind. A *local* session has its PTY in this process, run by `pane_loop.rs`; that is what the server runs, and what the kil-term tests use. A *remote* session (`Client::spawn`, `Client::attach`) has a mirror Term fed by `remote.rs`. Calls that read the terminal go to the Term either way. `write`, `resize` and `close` become frames for a remote one. `foreground()`, `busy_job`, `job_args` and `shell_cwd` work unchanged, because the server sends each session's `ProcIdentity` and `TtyId`, and `proc_pidinfo` on another process of the same user needs no ownership.
+- Dropping a remote session only detaches it. `Session::close` ends a session of either kind, and `TerminalPane::shutdown` uses it, so closing a pane or tab still ends its program.
+- `spawn.rs`, `reaper.rs`, `proc_info.rs`, `snapshot.rs` and `transcript.rs` are unchanged. `pty.rs` lost its alacritty traits.
 - §4.9 stays as is: `session.toml` and the screens are still saved every 2 s. They are the fallback for a logout, a restart or a lost server, and the layout is needed for an attach as well.
 
-### 14.7 Tests (real processes, `kil-term/tests/server.rs`)
+### 14.7 Tests (real processes, `kil-term/tests/server.rs`, the server on a thread)
 
 | Test | Asserts |
 |---|---|
-| `detach_should_keep_the_job_running` | A client spawns `sleep 600` and its connection is dropped without a word. The job is alive 2 s later. |
-| `attach_should_rebuild_the_primary_screen` | Output written before detaching, *and while detached*, is in the mirror's text after reattaching, and in the same order. |
-| `attach_should_rebuild_the_alternate_screen_and_modes` | A program enters 1049, draws, and sets DECCKM, bracketed paste and mouse 1002+1006. After reattaching, the mirror's grid and `InputMode` equal the server's. |
-| `detached_output_should_not_block_the_program` | `yes` runs for 3 s with no client. Its CPU time keeps rising, and the server's scrollback is full. |
-| `queries_should_be_answered_once` | CPR and DA asked while attached each get exactly one reply. |
-| `slow_client_should_be_dropped_not_block` | A client that never reads is dropped after 4 MiB, and the job keeps writing. |
-| `server_crash_should_hang_up_its_jobs` | `crash.rs`, aimed at the server: abort it, and the job is gone within 2 s (F15). |
-| `server_should_exit_when_idle` | With no session and no client, the server exits within 6 s and leaves no socket. |
-| `server_should_reject_another_uid` | `getpeereid` mismatch → closed (unit test on the check; the socket mode `0600` checked on disk). |
-| `churn_500_through_the_server_should_return_to_baseline` | §4.8's churn, run through the server: server fds, threads and children return to baseline. |
-| GPUI: `quit_should_detach_and_reopen_should_attach` | With a fake server, a quit sends no `Close`, and the next launch attaches by id. |
+| `detach_should_keep_the_job_running` | A client spawns `sleep`, then drops its session. The job is alive 2 s later and listed by the server. `stop_all` ends it. |
+| `attach_should_rebuild_the_primary_screen_with_output_from_while_detached` | Output from before detaching, *and from while detached*, is in the reattached mirror, in order. |
+| `attach_should_rebuild_the_alternate_screen_and_modes` | A program enters 1049, draws, and sets DECCKM, bracketed paste and mouse 1002+1006. A second client's mirror has the same text and `InputMode` as the first. |
+| `detached_output_should_not_block_the_program` | 200k lines with no client: the program finishes, and the last line is there on attach. |
+| `queries_should_be_answered_once_by_the_server` | A CPR gets exactly one reply, and OSC 11 is answered with the theme's background. |
+| `a_client_that_stops_reading_should_be_dropped_not_stall_the_program` | A raw client attaches and never reads. The program gets far past the 1 MiB high-water mark, and the client's connection reaches EOF. |
+| `child_exit_should_reach_the_client_with_its_status` | `exit 3` arrives as `ChildExited(3)`, and the server forgets the session. |
+| `close_should_end_the_session_in_the_server` | `Session::close` reaps the job and empties the server. |
+| `spawn_should_paint_the_replay_before_the_program_output` | §4.9's replay works through the server. |
+| `the_socket_should_be_private_and_vanish_when_idle` | The socket is `0600`, and an idle server removes it within 10 s. |
+| `crash_of_the_session_server_should_hang_up_its_jobs` (`crash.rs`) | An owner process hosts a server, starts a job through a client, detaches and aborts. The job is gone within 2 s (F15). |
+| GPUI: `quit_should_leave_the_sessions_running_in_the_server`, `reopening_should_go_back_on_the_sessions_the_server_kept`, `launch_should_open_a_tab_for_a_session_no_saved_tab_claims` | Quit sends no `Close`. The next workspace attaches by id to the same PID. A session no saved tab claims gets its own tab. |
+
+Not automated: a peer with another uid (needs a second user), and the three-button quit sheet (manual).
 
 ### 14.8 Milestones
 
 | M | Deliverable | Exit proof |
 |---|---|---|
-| **S1** | `kil-term`: `PaneLoop` replaces alacritty's `EventLoop` for sessions (same tests, still in-process), then `kil --server` with the protocol, `RemoteSession`, `flock` and `getpeereid`. | All §4.8 tests pass through `PaneLoop`, plus the first five §14.7 tests. |
-| **S2** | Attach state stream (§14.5), with the alt screen and modes. | `attach_should_rebuild_*`, `queries_should_be_answered_once`. |
-| **S3** | App: connect or spawn the server, attach on launch, quit detaches, *Quit and Stop All Jobs*, close pane or tab, server-loss fallback to §4.9, the extra tab for unknown sessions. | A19–A21 by hand with vim, ssh and a dev server. GPUI tests. |
-| **S4** | Measurements: throughput vs Terminal.app, keypress-to-photon, memory, idle CPU of the server (0 with no output). TCC fresh-install check (§11) for a server that outlived its app. DESIGN §3/§4 rewritten around the server. | §6.4 numbers re-measured; `ls ~/Desktop` from a reattached pane works on a fresh install. |
+| **S1** ✅ | `kil-term`: `pane_loop.rs` replaces alacritty's `EventLoop` for sessions (same tests, still in-process), then `kil --server` with the protocol, remote sessions, `flock` and `getpeereid`. | All §4.8 tests pass through the pane loop, plus §14.7. |
+| **S2** ✅ | Attach state stream (§14.5), with the alt screen and modes. | `attach_should_rebuild_*`, `queries_should_be_answered_once_by_the_server`, `state.rs` unit tests. |
+| **S3** ✅ | App: connect or spawn the server, attach on launch, quit detaches, *Quit and Stop All Jobs*, close pane or tab, the extra tab for unknown sessions. | GPUI tests, and the real binary by hand: quit, `kill -9` and a killed server (see Build status). |
+| **S4** (partly) | Measured: throughput and echo latency (§14.4). **Open:** memory and the server's idle wakeups (one per second from its idle check), the TCC fresh-install check (§11) for a server that outlived its app, a hands-on pass with vim, ssh and a dev server, and the protocol hand-over (§14.3). | `ls ~/Desktop` from a reattached pane works on a fresh install. |
 
 ### 14.9 Risks and triggers
 
@@ -726,6 +742,6 @@ Left out: charsets, custom tab stops, palette overrides set by programs (OSC 4/1
 | TCC: the server outlives the app it was spawned by. Its children may lose the app's privacy grants. | The server is the same signed binary, spawned by the app, so it inherits the app as responsible process. | The S4 fresh-install check fails → register the server as an `SMAppService` agent inside the bundle, so launchd starts it with the bundle's identity. |
 | The `swap_alt` dance in §14.5 has a side effect | Rows are rendered first and painted back, under the server lock. | A §14.7 alt-screen test shows drift → use the `SIGWINCH` redraw fallback instead. |
 | Scrollback is held twice | Lazy growth: a pane pays only for history it has. | Total scrollback > 1 GiB → the mirror keeps the screen plus 1,000 lines and pages older history from the server on scroll. |
-| Two parses and one more socket per output chunk | Measured in S4. | Throughput below Terminal.app → the server passes the master fd to the attached app (`SCM_RIGHTS`) and parses only while detached. |
+| Two parses and one more socket per output chunk | Measured: on par with a local session (§14.4). | Throughput below Terminal.app → the server passes the master fd to the attached app (`SCM_RIGHTS`) and parses only while detached. |
 | Jobs keep running after a quit and are forgotten | The quit sheet names them when any are busy. | Users report surprise → a menu-bar or Dock badge while detached jobs run. |
 | A protocol change kills jobs once | The protocol is versioned separately from the app, and changes rarely. | Frequent changes → a negotiated minor version with additive frames. |

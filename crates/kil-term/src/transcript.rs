@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use alacritty_terminal::{
     event::EventListener,
-    grid::Dimensions,
+    grid::{Dimensions, Row},
     index::Column,
     sync::FairMutex,
     term::{
@@ -54,14 +54,44 @@ pub(crate) fn encode<T: EventListener>(term: &Term<T>) -> Option<Vec<u8>> {
         return None;
     }
     let grid = term.grid();
-    let columns = grid.columns();
-    let mut out = Vec::with_capacity((grid.history_size() + grid.screen_lines()) * columns);
-    let mut pen = Cell::default();
-    let last = grid.cursor.point.line;
+    let mut paint =
+        Painter::with_capacity((grid.history_size() + grid.screen_lines()) * grid.columns());
     let mut line = grid.topmost_line();
-    while line <= last {
-        let row = &grid[line];
-        let wrapped = row[Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+    while line <= grid.cursor.point.line {
+        if !paint.row(&grid[line]) {
+            // Ends the line before the newline, so a background color doesn't bleed into it.
+            paint.reset();
+            paint.raw(b"\r\n");
+        }
+        line += 1;
+    }
+    paint.reset();
+    Some(paint.out)
+}
+
+/// Writes cells as text plus the SGR changes between them.
+pub(crate) struct Painter {
+    pub(crate) out: Vec<u8>,
+    pen: Cell,
+}
+
+impl Painter {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(capacity),
+            pen: Cell::default(),
+        }
+    }
+
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
+    }
+
+    /// One row: in full if it wraps into the next, else without its trailing blanks. Returns
+    /// whether it wraps.
+    pub(crate) fn row(&mut self, row: &Row<Cell>) -> bool {
+        let columns = row.len();
+        let wrapped = columns > 0 && row[Column(columns - 1)].flags.contains(Flags::WRAPLINE);
         let end = if wrapped {
             columns
         } else {
@@ -71,34 +101,40 @@ pub(crate) fn encode<T: EventListener>(term: &Term<T>) -> Option<Vec<u8>> {
                 .map_or(0, |col| col + 1)
         };
         for col in 0..end {
-            let cell = &row[Column(col)];
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                continue;
-            }
-            if !same_style(cell, &pen) {
-                push_sgr(&mut out, cell);
-                pen.clone_from(cell);
-            }
-            push_char(&mut out, cell.c);
-            for &c in cell.zerowidth().unwrap_or_default() {
-                push_char(&mut out, c);
-            }
+            self.cell(&row[Column(col)]);
         }
-        if !wrapped {
-            // Ends the line before the newline, so a background color doesn't bleed into it.
-            if !same_style(&pen, &Cell::default()) {
-                out.extend_from_slice(b"\x1b[0m");
-                pen = Cell::default();
-            }
-            out.extend_from_slice(b"\r\n");
-        }
-        line += 1;
+        wrapped
     }
-    out.extend_from_slice(b"\x1b[0m");
-    Some(out)
+
+    /// One cell, in its style; spacers behind wide characters print nothing.
+    pub(crate) fn cell(&mut self, cell: &Cell) {
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            return;
+        }
+        self.pen(cell);
+        push_char(&mut self.out, cell.c);
+        for &c in cell.zerowidth().unwrap_or_default() {
+            push_char(&mut self.out, c);
+        }
+    }
+
+    /// Switches the SGR attributes to `cell`'s, if they differ.
+    pub(crate) fn pen(&mut self, cell: &Cell) {
+        if !same_style(cell, &self.pen) {
+            push_sgr(&mut self.out, cell);
+            self.pen.clone_from(cell);
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        if !same_style(&self.pen, &Cell::default()) {
+            self.out.extend_from_slice(b"\x1b[0m");
+            self.pen = Cell::default();
+        }
+    }
 }
 
 fn is_blank(cell: &Cell) -> bool {

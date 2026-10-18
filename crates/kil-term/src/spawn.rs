@@ -69,7 +69,7 @@ pub(crate) fn spawn(config: &SessionConfig) -> Result<Spawned, SpawnError> {
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave));
-    sys::install_child_setup(&mut command, fd_sweep_limit());
+    sys::install_child_setup(&mut command, fd_sweep_limit(), true);
 
     let child = command.spawn().map_err(|source| SpawnError::Spawn {
         program: program.clone(),
@@ -181,7 +181,7 @@ fn locale_candidates(id: &str) -> Vec<String> {
     candidates
 }
 
-fn fd_sweep_limit() -> RawFd {
+pub(crate) fn fd_sweep_limit() -> RawFd {
     let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     sys::open_fds(pid)
         .ok()

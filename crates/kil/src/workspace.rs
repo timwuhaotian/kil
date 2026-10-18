@@ -2,8 +2,9 @@
 //! action (DESIGN.md §4.6, §4.7, §7, §8).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -14,6 +15,7 @@ use gpui::{
     SharedString, Stateful, StyleRefinement, Subscription, Task, WeakEntity, Window, actions,
     anchored, deferred, div, prelude::*, px, relative,
 };
+use kil_term::Client;
 
 use crate::{
     config,
@@ -54,6 +56,7 @@ actions!(
         FontSmaller,
         FontReset,
         Quit,
+        QuitAndStopJobs,
     ]
 );
 
@@ -63,8 +66,6 @@ const ROW_HEIGHT: f32 = 44.;
 /// The row's status mark; the cwd line indents past it to align with the title.
 const STATUS_SLOT: f32 = 10.;
 const TITLE_INSET: f32 = STATUS_SLOT + 6.;
-/// Natural exit before the reaper escalates on quit (DESIGN.md §4.6).
-const QUIT_GRACE: Duration = Duration::from_millis(500);
 /// What closing does to running jobs, for the confirmation.
 const STOPPED: &str = "will be stopped";
 /// While anything changes, the session is saved at most this often: what a crash can lose.
@@ -117,6 +118,15 @@ impl Tab {
             TabStatus::Idle
         }
     }
+}
+
+/// What leaving the window does to the sessions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leave {
+    /// They keep running in the server, for the next launch to go back on.
+    Detach,
+    /// They end, and the next launch runs their jobs again (DESIGN.md §4.9).
+    Stop,
 }
 
 /// One save of the session, taken on the UI thread and writable from any.
@@ -221,10 +231,12 @@ pub struct Workspace {
     config: config::Stamp,
     pane_subscriptions: HashMap<EntityId, Subscription>,
     close_confirmed: bool,
+    /// The session server, which runs every pane's program (DESIGN.md §14).
+    client: Arc<Client>,
     /// Where the session is saved for the next launch; `None` saves nothing (tests).
     store: Option<Store>,
-    /// Every session was shut down; what the next launch reopens is already saved, or (after
-    /// the last tab closed) nothing.
+    /// The window is leaving: what the next launch reopens is saved, or (after the last tab
+    /// closed) cleared, and nothing may overwrite it.
     ended: bool,
     /// The next throttled save; see [`Self::schedule_save`].
     save_task: Option<Task<()>>,
@@ -243,6 +255,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(
         notices: Vec<SharedString>,
+        client: Arc<Client>,
         store: Option<Store>,
         restored: Option<Restored>,
         window: &mut Window,
@@ -286,6 +299,7 @@ impl Workspace {
             config: config::stamp(),
             pane_subscriptions: HashMap::new(),
             close_confirmed: false,
+            client,
             store: None,
             ended: false,
             save_task: None,
@@ -306,16 +320,54 @@ impl Workspace {
             .detach();
         }
         this.store = store;
-        if !restored.is_some_and(|restored| this.restore(restored, window, cx)) {
+        let mut live: HashSet<String> = match this.client.sessions() {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                this.notices
+                    .push(format!("Lost Kil's session server: {err}").into());
+                HashSet::new()
+            }
+        };
+        let reopened =
+            restored.is_some_and(|restored| this.restore(restored, &mut live, window, cx));
+        this.adopt(live, window, cx);
+        if !reopened && this.tabs.is_empty() {
             this.open_tab(None, window, cx);
+        } else if !reopened {
+            this.activate(0, window, cx);
         }
         this.sync_blink(window, cx);
         this
     }
 
-    /// Reopens the tabs of the last launch, each pane showing its old screen and re-running
-    /// its job; false if there were none (DESIGN.md §4.9).
-    fn restore(&mut self, restored: Restored, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Opens a tab for each session the server runs that no saved tab claimed, e.g. after
+    /// the layout was lost: a running job is never left out of sight (DESIGN.md §14.3).
+    fn adopt(&mut self, live: HashSet<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut ids: Vec<_> = live
+            .into_iter()
+            .filter(|id| restore::is_valid_id(id))
+            .collect();
+        ids.sort();
+        for id in ids {
+            let launch = Launch {
+                id,
+                attach: true,
+                ..Launch::default()
+            };
+            self.push_tab(launch, window, cx);
+        }
+    }
+
+    /// Reopens the tabs of the last launch; false if there were none. A pane whose session
+    /// the server still runs (in `live`) goes back on it (DESIGN.md §14); any other shows its
+    /// old screen and runs its job again (§4.9).
+    fn restore(
+        &mut self,
+        restored: Restored,
+        live: &mut HashSet<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Restored { saved, rerun } = restored;
         let store = self.store.clone();
         let mut seen = std::collections::HashSet::new();
@@ -327,15 +379,17 @@ impl Workspace {
                 } else {
                     self.pane_ids.fresh()
                 };
-                held_back |= !rerun && pane.command.is_some();
+                let attach = live.remove(&id);
+                held_back |= !attach && !rerun && pane.command.is_some();
                 let launch = Launch {
                     replay: store
                         .as_ref()
                         .map(|store| store.transcript(&id))
                         .unwrap_or_default(),
                     id,
+                    attach,
                     cwd: pane.cwd.map(PathBuf::from),
-                    rerun: pane.command.filter(|_| rerun),
+                    rerun: pane.command.filter(|_| rerun && !attach),
                 };
                 self.new_pane(launch, window, cx)
             });
@@ -450,7 +504,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalPane> {
-        let pane = cx.new(|cx| TerminalPane::new(launch, cx));
+        let client = Arc::clone(&self.client);
+        let pane = cx.new(|cx| TerminalPane::new(launch, client, cx));
         let subscription = cx.subscribe_in(&pane, window, Self::on_pane_event);
         self.pane_subscriptions
             .insert(pane.entity_id(), subscription);
@@ -472,7 +527,18 @@ impl Workspace {
     }
 
     fn open_tab(&mut self, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = self.fresh_pane(cwd, window, cx);
+        let launch = Launch {
+            id: self.pane_ids.fresh(),
+            cwd,
+            ..Launch::default()
+        };
+        self.push_tab(launch, window, cx);
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    /// Adds a tab of one pane after the others, without selecting it.
+    fn push_tab(&mut self, launch: Launch, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.new_pane(launch, window, cx);
         let id = TabId(self.next_tab);
         self.next_tab += 1;
         self.tabs.push(Tab {
@@ -483,7 +549,6 @@ impl Workspace {
             finished: false,
             animating: false,
         });
-        self.activate(self.tabs.len() - 1, window, cx);
     }
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -571,11 +636,12 @@ impl Workspace {
         .detach();
 
         if self.tabs.is_empty() {
-            // Nothing is left to reopen: the next launch starts fresh.
+            // Nothing is left to reopen: the next launch starts fresh. Every pane's session
+            // was closed with its tab, so the server exits once it is idle.
             if let Some(store) = &self.store {
                 store.clear();
             }
-            self.shutdown_all(cx);
+            self.ended = true;
             cx.quit();
             return;
         }
@@ -825,21 +891,67 @@ impl Workspace {
             .collect()
     }
 
-    /// Hangs up every session, gives shells a moment to exit (and save history), then lets
-    /// the reaper SIGKILL stragglers. Blocks the UI for at most ~1 s, only on quit.
-    fn shutdown_all(&mut self, cx: &mut Context<Self>) {
-        self.ended = true;
+    /// Ends every session in the server; it gives programs a moment to exit (and save
+    /// history), then has the reaper SIGKILL stragglers. Blocks the UI for at most ~1 s, only
+    /// when the user asked for it.
+    fn stop_all(&mut self, cx: &mut Context<Self>) {
         for pane in self.all_panes() {
             pane.update(cx, |pane, _| pane.shutdown());
         }
-        if !kil_term::wait_for_children(QUIT_GRACE) {
-            kil_term::expedite_reaping();
-            if !kil_term::wait_for_children(QUIT_GRACE) {
-                log::warn!(
-                    "{} session children still running at quit",
-                    kil_term::live_children()
-                );
-            }
+        if let Err(err) = self.client.stop_all() {
+            log::error!("stopping the jobs failed: {err}");
+        }
+    }
+
+    /// Asks how to leave if jobs are running: by default they keep running in the server and
+    /// are back when Kil reopens (DESIGN.md A20). With none running, the sessions are left to
+    /// the server without asking.
+    fn leave(
+        &mut self,
+        message: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Leave, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let jobs: Vec<SharedString> = self
+            .all_panes()
+            .iter()
+            .filter_map(|pane| pane.read(cx).busy_job())
+            .collect();
+        if jobs.is_empty() {
+            then(self, Leave::Detach, window, cx);
+            return;
+        }
+        let verb = if jobs.len() == 1 { "keeps" } else { "keep" };
+        let detail = format!(
+            "{} {verb} running, and will be here when Kil reopens.",
+            jobs.join(", ")
+        );
+        let answer = window.prompt(
+            PromptLevel::Info,
+            message,
+            Some(&detail),
+            &["Quit", "Stop Jobs and Quit", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let leave = match answer.await {
+                Ok(0) => Leave::Detach,
+                Ok(1) => Leave::Stop,
+                _ => return,
+            };
+            let _ = this.update_in(cx, |this, window, cx| then(this, leave, window, cx));
+        })
+        .detach();
+    }
+
+    /// Saves what the next launch reopens, then lets go of the sessions or ends them.
+    fn depart(&mut self, leave: Leave, cx: &mut Context<Self>) {
+        self.close_confirmed = true;
+        self.save_now(cx);
+        self.ended = true;
+        if leave == Leave::Stop {
+            self.stop_all(cx);
         }
     }
 
@@ -852,46 +964,32 @@ impl Workspace {
             .iter()
             .any(|pane| pane.read(cx).busy_job().is_some());
         if !jobs_running {
-            self.save_now(cx);
-            self.shutdown_all(cx);
+            self.depart(Leave::Detach, cx);
             return true;
         }
-        self.confirm_close(
-            &self.all_panes(),
-            "Close the window?",
-            self.leaving_outcome(),
-            window,
-            cx,
-            |this, window, cx| {
-                this.close_confirmed = true;
-                this.save_now(cx);
-                this.shutdown_all(cx);
-                window.remove_window();
-            },
-        );
+        self.leave("Close Kil?", window, cx, |this, leave, window, cx| {
+            this.depart(leave, cx);
+            window.remove_window();
+        });
         false
     }
 
-    /// What closing the window or quitting does to running jobs.
-    fn leaving_outcome(&self) -> &'static str {
-        if self.store.is_some() {
-            "will be stopped, then run again when Kil reopens"
-        } else {
-            STOPPED
-        }
+    fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave("Quit Kil?", window, cx, |this, leave, _, cx| {
+            this.depart(leave, cx);
+            cx.quit();
+        });
     }
 
-    fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+    fn quit_and_stop(&mut self, _: &QuitAndStopJobs, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_close(
             &self.all_panes(),
-            "Quit Kil?",
-            self.leaving_outcome(),
+            "Quit Kil and stop all jobs?",
+            "will be stopped, then run again when Kil reopens",
             window,
             cx,
             |this, _, cx| {
-                this.close_confirmed = true;
-                this.save_now(cx);
-                this.shutdown_all(cx);
+                this.depart(Leave::Stop, cx);
                 cx.quit();
             },
         );
@@ -1241,6 +1339,20 @@ impl Workspace {
 
 /// Runs `Quit` in the terminal window, for when another window (Settings) has focus.
 pub fn quit_app(cx: &mut App) {
+    in_terminal_window(cx, |this, window, cx| this.quit(&Quit, window, cx));
+}
+
+/// Runs `QuitAndStopJobs` in the terminal window, for when another window has focus.
+pub fn quit_and_stop_app(cx: &mut App) {
+    in_terminal_window(cx, |this, window, cx| {
+        this.quit_and_stop(&QuitAndStopJobs, window, cx);
+    });
+}
+
+fn in_terminal_window(
+    cx: &mut App,
+    run: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>),
+) {
     match cx
         .windows()
         .iter()
@@ -1249,7 +1361,7 @@ pub fn quit_app(cx: &mut App) {
         Some(workspace) => {
             let _ = workspace.update(cx, |this, window, cx| {
                 window.activate_window();
-                this.quit(&Quit, window, cx);
+                run(this, window, cx);
             });
         }
         None => cx.quit(),
@@ -1535,6 +1647,7 @@ fn bind_actions(root: Stateful<Div>, cx: &mut Context<Workspace>) -> Stateful<Di
         .on_action(cx.listener(Workspace::close_tab))
         .on_action(cx.listener(Workspace::close_pane))
         .on_action(cx.listener(Workspace::quit))
+        .on_action(cx.listener(Workspace::quit_and_stop))
         .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
             this.split(Axis::Horizontal, window, cx);
         }))
@@ -1680,14 +1793,34 @@ mod tests {
         store: Option<Store>,
         cx: &mut TestAppContext,
     ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        workspace_on(test_client(), store, cx)
+    }
+
+    /// A session server of the test's own, on a thread of the test process.
+    fn test_client() -> Arc<Client> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kil-wst-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        kil_term::server::serve_in_thread(&dir).unwrap();
+        Arc::new(Client::connect(&dir).unwrap())
+    }
+
+    /// A workspace whose panes run in `client`'s server, reopening what `store` holds.
+    fn workspace_on(
+        client: Arc<Client>,
+        store: Option<Store>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
         let restored = store.as_ref().and_then(|store| store.load().unwrap());
         cx.update(|cx| {
             cx.set_global(Theme::dark());
             cx.set_global(Settings::default());
             cx.bind_keys(text_field::bindings());
         });
-        let (workspace, cx) = cx
-            .add_window_view(|window, cx| Workspace::new(Vec::new(), store, restored, window, cx));
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(Vec::new(), client, store, restored, window, cx)
+        });
         // Rows grow in over `ROW_IN` of wall time; click them at full height.
         std::thread::sleep(motion::ROW_IN + Duration::from_millis(20));
         cx.update(|window, _| window.refresh());
@@ -1958,6 +2091,70 @@ mod tests {
         // What the app-quit hook that follows does.
         workspace.update(cx, Workspace::save_now);
         assert_eq!(Store::at(dir).load(), Ok(None));
+    }
+
+    fn first_pane(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (String, i32) {
+        workspace.read_with(cx, |this, cx| {
+            let pane = this.tabs[0].focused.read(cx);
+            (pane.saved().id, pane.pid().map_or(0, kil_term::Pid::get))
+        })
+    }
+
+    /// Waits for the first pane's session to be up, in the server.
+    fn started(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (String, i32) {
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let pane = first_pane(workspace, cx);
+            if pane.1 != 0 {
+                return pane;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the pane's session never started");
+    }
+
+    #[gpui::test]
+    fn quit_should_leave_the_sessions_running_in_the_server(cx: &mut TestAppContext) {
+        let client = test_client();
+        let (workspace, cx) = workspace_on(Arc::clone(&client), None, cx);
+        let (id, pid) = started(&workspace, cx);
+        cx.dispatch_action(Quit);
+        cx.run_until_parked();
+        assert_eq!(client.sessions().unwrap(), [id]);
+        assert!(kil_term::diagnostics::exists(
+            kil_term::Pid::new(pid).unwrap()
+        ));
+        client.stop_all().unwrap();
+    }
+
+    #[gpui::test]
+    fn reopening_should_go_back_on_the_sessions_the_server_kept(cx: &mut TestAppContext) {
+        let client = test_client();
+        let dir = scratch_dir("reattach");
+        let (first, cx) = workspace_on(Arc::clone(&client), Some(Store::at(dir.clone())), cx);
+        let before = started(&first, cx);
+        cx.dispatch_action(Quit);
+        cx.run_until_parked();
+        let mut app = cx.cx.clone();
+        let (second, cx) = workspace_on(Arc::clone(&client), Some(Store::at(dir)), &mut app);
+        assert_eq!(started(&second, cx), before);
+        client.stop_all().unwrap();
+    }
+
+    #[gpui::test]
+    fn launch_should_open_a_tab_for_a_session_no_saved_tab_claims(cx: &mut TestAppContext) {
+        let client = test_client();
+        let config = kil_term::SessionConfig::new(kil_term::GridSize {
+            rows: 24,
+            cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        });
+        drop(client.spawn("orphan-1", &config, |_| {}).unwrap());
+        let (workspace, cx) = workspace_on(Arc::clone(&client), None, cx);
+        assert_eq!(started(&workspace, cx).0, "orphan-1");
+        assert_eq!(tab_count(&workspace, cx), 1);
+        client.stop_all().unwrap();
     }
 
     #[gpui::test]

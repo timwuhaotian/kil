@@ -14,10 +14,16 @@ mod text_field;
 mod theme;
 mod workspace;
 
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
 use gpui::{
-    App, Application, Bounds, Menu, MenuItem, SystemMenuType, TitlebarOptions,
+    App, Application, Bounds, Menu, MenuItem, SharedString, SystemMenuType, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point, prelude::*, px, size,
 };
+use kil_term::Client;
 
 use crate::{theme::Theme, workspace::Workspace};
 
@@ -53,6 +59,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
                 MenuItem::action("Quit Kil", w::Quit),
+                MenuItem::action("Quit and Stop All Jobs", w::QuitAndStopJobs),
             ],
         },
         Menu {
@@ -105,10 +112,58 @@ fn register_app_actions(cx: &mut App) {
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &workspace::Quit, cx| workspace::quit_app(cx));
+    cx.on_action(|_: &workspace::QuitAndStopJobs, cx| workspace::quit_and_stop_app(cx));
+}
+
+/// `kil --server <dir>` runs the session server instead of the app (DESIGN.md §14).
+fn server_dir() -> Option<PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != "--server" {
+        return None;
+    }
+    args.next().map(PathBuf::from)
+}
+
+fn serve(dir: &Path) {
+    // Before any thread exists: the process that launched it exits here.
+    if let Err(err) = kil_term::server::daemonize() {
+        eprintln!("kil --server: {err}");
+        std::process::exit(1);
+    }
+    env_logger::init();
+    if let Err(err) = kil_term::server::serve(dir) {
+        log::error!("session server failed: {err}");
+        std::process::exit(1);
+    }
+}
+
+/// The session server that runs every pane's program, started if none runs. If it can't
+/// be, one on a thread of the app stands in, and jobs end when Kil quits.
+fn session_server(dir: &Path, notices: &mut Vec<SharedString>) -> Option<Arc<Client>> {
+    let started = std::env::current_exe().and_then(|exe| Client::start(dir, &exe));
+    let err = match started {
+        Ok(client) => return Some(Arc::new(client)),
+        Err(err) => err,
+    };
+    log::error!("session server didn't start: {err}");
+    notices.push(
+        format!("Kil's session server didn't start ({err}), so jobs will stop when Kil quits.")
+            .into(),
+    );
+    let private = std::env::temp_dir().join(format!("kil-{}", std::process::id()));
+    kil_term::server::serve_in_thread(&private)
+        .and_then(|()| Client::connect(&private))
+        .map(Arc::new)
+        .inspect_err(|err| log::error!("no session server at all: {err}"))
+        .ok()
 }
 
 fn main() {
     forget_launcher_identity();
+    if let Some(dir) = server_dir() {
+        serve(&dir);
+        return;
+    }
     env_logger::init();
     Application::new().run(|cx: &mut App| {
         cx.set_global(Theme::dark());
@@ -121,6 +176,14 @@ fn main() {
                 None
             }
             None => None,
+        };
+        let state_dir = store.as_ref().map_or_else(
+            || std::env::temp_dir().join("kil"),
+            |store| store.dir().to_owned(),
+        );
+        let Some(client) = session_server(&state_dir, &mut notices) else {
+            cx.quit();
+            return;
         };
         cx.set_menus(menus());
         register_app_actions(cx);
@@ -159,7 +222,7 @@ fn main() {
             ..Default::default()
         };
         if let Err(err) = cx.open_window(options, |window, cx| {
-            cx.new(|cx| Workspace::new(notices, store, restored, window, cx))
+            cx.new(|cx| Workspace::new(notices, client, store, restored, window, cx))
         }) {
             log::error!("failed to open window: {err:#}");
             cx.quit();

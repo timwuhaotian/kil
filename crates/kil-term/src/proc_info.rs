@@ -66,6 +66,18 @@ impl ProcIdentity {
         self.pid
     }
 
+    /// An identity captured by another process (the session server).
+    pub(crate) fn from_parts(pid: Pid, sec: u64, usec: u64) -> Self {
+        Self {
+            pid,
+            start: StartTime { sec, usec },
+        }
+    }
+
+    pub(crate) fn start_parts(self) -> (u64, u64) {
+        (self.start.sec, self.start.usec)
+    }
+
     /// Whether this exact process is still running (not exited, not recycled).
     #[must_use]
     pub fn is_alive(self) -> bool {

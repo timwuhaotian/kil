@@ -5,6 +5,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     process::ExitStatus,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -16,8 +17,8 @@ use gpui::{
     Window, actions, div, point, prelude::*,
 };
 use kil_term::{
-    Frame, GridSize, Palette, SelectionKind, Session, SessionConfig, SessionEvent, Transcript,
-    ViewportCell,
+    Client, Frame, GridSize, Palette, SelectionKind, Session, SessionConfig, SessionEvent,
+    Transcript, ViewportCell,
 };
 
 use crate::{
@@ -52,11 +53,15 @@ pub enum PaneEvent {
     Output,
 }
 
-/// How a pane starts: fresh, or reopening one from an earlier launch (DESIGN.md §4.9).
+/// How a pane starts: fresh, back on a session the server kept running (DESIGN.md §14), or
+/// reopened from what an earlier launch saved (§4.9).
 #[derive(Default)]
 pub struct Launch {
-    /// Names the pane's saved screen; kept across launches.
+    /// Names the pane's session in the server and its saved screen; kept across launches.
     pub id: String,
+    /// The server still runs the session: show it instead of starting one. If it ended in
+    /// the meantime, the pane starts afresh from the fields below.
+    pub attach: bool,
     pub cwd: Option<PathBuf>,
     /// A job to type into the shell once it is ready.
     pub rerun: Option<String>,
@@ -137,9 +142,10 @@ impl Focusable for TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(launch: Launch, cx: &mut Context<Self>) -> Self {
+    pub fn new(launch: Launch, client: Arc<Client>, cx: &mut Context<Self>) -> Self {
         let Launch {
             id,
+            attach,
             cwd,
             rerun,
             replay,
@@ -156,11 +162,22 @@ impl TerminalPane {
         config.replay = replay;
 
         let (tx, rx) = mpsc::unbounded();
-        // fork+exec of a large GUI process takes milliseconds: keep it off the UI thread.
+        let sink = move |event| {
+            let _ = tx.unbounded_send(event);
+        };
+        let session_id = id.clone();
+        // Socket round trips, and a fork+exec in the server: keep them off the UI thread.
         let spawn = cx.background_spawn(async move {
-            Session::spawn(&config, move |event| {
-                let _ = tx.unbounded_send(event);
-            })
+            if attach {
+                match client.attach(&session_id, config.scrollback_lines, sink.clone()) {
+                    Ok(Some(session)) => return Ok(session),
+                    Ok(None) => {
+                        log::info!("session {session_id} ended meanwhile; starting it again");
+                    }
+                    Err(err) => return Err(kil_term::SpawnError::Server(err)),
+                }
+            }
+            client.spawn(&session_id, &config, sink)
         });
         let tasks = vec![
             cx.spawn(async move |this, cx| {
@@ -254,6 +271,11 @@ impl TerminalPane {
         }
     }
 
+    #[cfg(test)]
+    pub fn pid(&self) -> Option<kil_term::Pid> {
+        self.session.as_ref().map(Session::pid)
+    }
+
     /// The screen to save, if it changed since last taken.
     pub fn take_screen(&mut self) -> Option<(String, Transcript)> {
         let session = self.session.as_ref().filter(|_| self.screen_changed)?;
@@ -289,7 +311,9 @@ impl TerminalPane {
     /// Ends the session now (hangup + reaper), keeping the last frame on screen for the
     /// close animation.
     pub fn shutdown(&mut self) {
-        self.session = None;
+        if let Some(session) = self.session.take() {
+            session.close();
+        }
         self.status = Status::Closing;
     }
 
@@ -390,11 +414,6 @@ impl TerminalPane {
                 }
                 SessionEvent::ClipboardStore(text) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-                SessionEvent::ColorRequest(query) => {
-                    if let Some(session) = &self.session {
-                        session.answer_color(&query, &cx.global::<Theme>().terminal);
-                    }
                 }
                 SessionEvent::ChildExited(status) => self.exit_status = Some(status),
                 SessionEvent::Ended => self.ended(cx),

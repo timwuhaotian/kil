@@ -166,24 +166,28 @@ pub(crate) fn kill(pid: i32, signal: c_int) -> io::Result<()> {
     Ok(())
 }
 
-/// Installs the post-fork, pre-exec setup that makes `command` a session leader on its PTY.
+/// Installs the post-fork, pre-exec setup that makes `command` a session leader, on its PTY
+/// (fd 0) if `controlling_tty`, and otherwise detached from any terminal (the session
+/// server).
 ///
 /// `max_fd` bounds the close-on-exec sweep; compute it before forking.
-pub(crate) fn install_child_setup(command: &mut Command, max_fd: RawFd) {
+pub(crate) fn install_child_setup(command: &mut Command, max_fd: RawFd, controlling_tty: bool) {
     // SAFETY: the closure only calls async-signal-safe functions (setsid, ioctl, fcntl,
     // signal, sigemptyset, sigprocmask) and allocates nothing, as required between fork and
     // exec in a threaded parent.
     unsafe {
-        command.pre_exec(move || child_setup(max_fd));
+        command.pre_exec(move || child_setup(max_fd, controlling_tty));
     }
 }
 
-fn child_setup(max_fd: RawFd) -> io::Result<()> {
+fn child_setup(max_fd: RawFd, controlling_tty: bool) -> io::Result<()> {
     // SAFETY: async-signal-safe calls on this (child) process only. std has already
     // dup2'ed the PTY slave onto fds 0-2, so fd 0 is the terminal to acquire.
     unsafe {
         cvt(libc::setsid())?;
-        cvt(libc::ioctl(0, libc::TIOCSCTTY.into(), 0))?;
+        if controlling_tty {
+            cvt(libc::ioctl(0, libc::TIOCSCTTY.into(), 0))?;
+        }
         // Mark (not close) inherited descriptors: std's exec-error pipe must stay usable
         // until exec, and it is already close-on-exec itself (DESIGN.md §4.1 F5).
         for fd in 3..=max_fd {
@@ -207,6 +211,37 @@ fn child_setup(max_fd: RawFd) -> io::Result<()> {
         ))?;
     }
     Ok(())
+}
+
+/// The effective uid of the process at the other end of a Unix socket.
+pub(crate) fn peer_uid(socket: BorrowedFd<'_>) -> io::Result<u32> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid writes two integers through valid pointers.
+    cvt(unsafe { libc::getpeereid(socket.as_raw_fd(), &raw mut uid, &raw mut gid) })?;
+    Ok(uid)
+}
+
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Takes an exclusive `flock` on `file` without waiting; `false` if another process has it.
+pub(crate) fn try_lock(file: BorrowedFd<'_>) -> io::Result<bool> {
+    // SAFETY: flock on a live descriptor has no memory-safety preconditions.
+    match cvt(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
+        Ok(_) => Ok(true),
+        Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Forks; `true` in the child. Only sound while the process has a single thread.
+pub(crate) fn fork_single_threaded() -> io::Result<bool> {
+    // SAFETY: called first thing in `kil --server`'s main, before any thread exists, so the
+    // child is a full copy with no lock held by a vanished thread.
+    let pid = cvt(unsafe { libc::fork() })?;
+    Ok(pid == 0)
 }
 
 /// Registers a one-shot kqueue `NOTE_EXIT` for `child` under `key`.

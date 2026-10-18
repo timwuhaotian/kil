@@ -21,4 +21,10 @@ pub enum SpawnError {
     /// The PTY event loop could not be created.
     #[error("failed to start the PTY event loop")]
     EventLoop(#[source] io::Error),
+    /// The session server could not be reached.
+    #[error("lost the session server")]
+    Server(#[source] io::Error),
+    /// The session server could not start the session.
+    #[error("the session server could not start it: {0}")]
+    Refused(String),
 }

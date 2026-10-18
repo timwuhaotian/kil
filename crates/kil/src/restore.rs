@@ -139,6 +139,11 @@ impl Store {
         ))
     }
 
+    /// The directory, which the session server shares (DESIGN.md §14.3).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn at(dir: PathBuf) -> Self {
         Self {
             dir,

@@ -1,11 +1,8 @@
-//! Our PTY behind alacritty's event loop: its parser and I/O loop, our process lifecycle.
+//! A session's PTY master and child: what the pane loop reads, writes and watches.
 
-use std::{fs::File, io, os::fd::AsFd, sync::Arc, time::Duration};
+use std::{fs::File, io, os::fd::AsFd, process::ExitStatus, sync::Arc, time::Duration};
 
-use alacritty_terminal::{
-    event::{OnResize, WindowSize},
-    tty::{ChildEvent, EventedPty, EventedReadWrite},
-};
+use alacritty_terminal::event::WindowSize;
 use polling::{Event, PollMode, Poller};
 
 use crate::{
@@ -15,10 +12,9 @@ use crate::{
     sys,
 };
 
-/// Keys alacritty's event loop dispatches on. They mirror `alacritty_terminal`'s
-/// crate-private `PTY_READ_WRITE_TOKEN` / `PTY_CHILD_EVENT_TOKEN` (pinned at `=0.26.0`).
-const READ_WRITE_TOKEN: usize = 0;
-const CHILD_EVENT_TOKEN: usize = 1;
+/// Poller keys of the master and of the child's exit, in the pane loop.
+pub(crate) const READ_WRITE_TOKEN: usize = 0;
+pub(crate) const CHILD_EVENT_TOKEN: usize = 1;
 /// kqueue timer ident of the exit poll; idents are per filter and per (per-session) poller.
 const EXIT_POLL_TIMER: usize = 0;
 /// How often to look for a child whose exit `NOTE_EXIT` cannot report.
@@ -97,24 +93,17 @@ impl Drop for ChildGuard {
     }
 }
 
-impl EventedReadWrite for Pty {
-    type Reader = File;
-    type Writer = File;
-
+impl Pty {
+    /// Watches the master (with `interest`) and the child's exit on `poll`.
     #[expect(
         unsafe_code,
-        reason = "alacritty's trait method is unsafe: sources must outlive registration; \
-                  both live in `self` and the event loop deregisters before dropping it"
+        reason = "polling requires a source to outlive its registration: the master lives in \
+                  `self`, and the pane loop deregisters before dropping it"
     )]
-    unsafe fn register(
-        &mut self,
-        poll: &Arc<Poller>,
-        mut interest: Event,
-        mode: PollMode,
-    ) -> io::Result<()> {
+    pub(crate) fn register(&mut self, poll: &Arc<Poller>, mut interest: Event) -> io::Result<()> {
         interest.key = READ_WRITE_TOKEN;
         // SAFETY: `self.master` outlives the registration; see the method's `expect`.
-        unsafe { poll.add_with_mode(&self.master, interest, mode)? };
+        unsafe { poll.add_with_mode(&self.master, interest, PollMode::Level)? };
         self.poll = Some(Arc::clone(poll));
         let Some(child) = &self.child.child else {
             return Ok(());
@@ -130,17 +119,12 @@ impl EventedReadWrite for Pty {
         Ok(())
     }
 
-    fn reregister(
-        &mut self,
-        poll: &Arc<Poller>,
-        mut interest: Event,
-        mode: PollMode,
-    ) -> io::Result<()> {
+    pub(crate) fn reregister(&mut self, poll: &Arc<Poller>, mut interest: Event) -> io::Result<()> {
         interest.key = READ_WRITE_TOKEN;
-        poll.modify_with_mode(&self.master, interest, mode)
+        poll.modify_with_mode(&self.master, interest, PollMode::Level)
     }
 
-    fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+    pub(crate) fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
         if let Some(child) = &self.child.child {
             sys::unwatch_exit(poll, child.as_std());
         }
@@ -152,22 +136,16 @@ impl EventedReadWrite for Pty {
         poll.delete(&self.master)
     }
 
-    fn reader(&mut self) -> &mut File {
+    pub(crate) fn master(&mut self) -> &mut File {
         &mut self.master
     }
 
-    fn writer(&mut self) -> &mut File {
-        &mut self.master
-    }
-}
-
-impl EventedPty for Pty {
-    fn next_child_event(&mut self) -> Option<ChildEvent> {
+    /// The child's exit, once it is reapable. `None` if it is still running: the exit poll
+    /// is re-armed then, since nothing else would tell the loop when it is finally reapable.
+    pub(crate) fn next_child_event(&mut self) -> Option<ExitStatus> {
         match self.child.child.take()?.try_reap() {
-            Reap::Exited(status) => Some(ChildEvent::Exited(Some(status))),
+            Reap::Exited(status) => Some(status),
             Reap::Running(child) => {
-                // The one-shot NOTE_EXIT (or the last poll) is spent: nothing else would tell
-                // the loop when the child is finally reapable.
                 let pid = child.pid().get();
                 self.child.child = Some(child);
                 if let Err(err) = self.poll_exit() {
@@ -177,10 +155,8 @@ impl EventedPty for Pty {
             }
         }
     }
-}
 
-impl OnResize for Pty {
-    fn on_resize(&mut self, size: WindowSize) {
+    pub(crate) fn on_resize(&mut self, size: WindowSize) {
         // ENOTTY after hangup is expected; alacritty's own impl exits the process here.
         if let Err(err) = sys::set_window_size(self.master.as_fd(), winsize(size)) {
             log::debug!("TIOCSWINSZ failed: {err}");

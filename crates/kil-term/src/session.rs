@@ -1,10 +1,11 @@
 //! A terminal session: one PTY, one child, one VT state (DESIGN.md §3).
 
-use std::{borrow::Cow, ffi::OsString, mem::size_of, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow, ffi::OsString, mem::size_of, os::unix::net::UnixStream, path::PathBuf, sync::Arc,
+};
 
 use alacritty_terminal::{
     event::WindowSize,
-    event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll},
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
@@ -14,12 +15,15 @@ use alacritty_terminal::{
 
 use crate::{
     error::SpawnError,
-    events::{ColorQuery, EventProxy, SessionEvent},
+    events::{EventProxy, Role, SessionEvent},
+    pane_loop::{self, Channel, Command, LoopSender},
     proc_info::{self, ForegroundProcess, Pid, ProcIdentity, TtyId},
     pty::Pty,
-    snapshot::{Frame, Palette, Rgba},
+    remote::Remote,
+    snapshot::{Frame, Palette},
     spawn::{self, Spawned},
     transcript::{self, Transcript},
+    wire::{self, Identity},
 };
 
 /// Grid size in cells plus one cell's pixel size (reported to programs via `TIOCSWINSZ`).
@@ -36,7 +40,7 @@ pub struct GridSize {
 }
 
 impl GridSize {
-    fn clamped(self) -> Self {
+    pub(crate) fn clamped(self) -> Self {
         Self {
             rows: self.rows.max(1),
             cols: self.cols.max(1),
@@ -86,7 +90,7 @@ pub enum Program {
 }
 
 /// How to start a session.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
     /// What to run.
     pub program: Program,
@@ -195,15 +199,34 @@ pub struct MemoryUsage {
 
 /// A running terminal: a child on a PTY, parsed by alacritty's VT state machine.
 ///
-/// Dropping it closes the session without blocking: the PTY thread hangs up the child and
-/// the reaper finishes it (DESIGN.md §4.5).
+/// The PTY is either in this process ([`Session::spawn`]) or in the session server
+/// ([`crate::Client`]), with a mirror of its terminal here (DESIGN.md §14.4). Either way the
+/// terminal is read the same.
+///
+/// Dropping a local session closes it without blocking: its thread hangs up the child and
+/// the reaper finishes it (DESIGN.md §4.5). Dropping a remote one only detaches from it: the
+/// program keeps running in the server. [`Session::close`] ends either.
 pub struct Session {
     term: Arc<FairMutex<Term<EventProxy>>>,
-    io: EventLoopSender,
+    link: Link,
     events: EventProxy,
     pid: Pid,
     shell: Option<ProcIdentity>,
     tty: TtyId,
+}
+
+enum Link {
+    Local(LoopSender),
+    Remote(Remote),
+}
+
+pub(crate) fn term_config(scrollback_lines: usize) -> TermConfig {
+    TermConfig {
+        scrolling_history: scrollback_lines,
+        osc52: Osc52::OnlyCopy,
+        kitty_keyboard: false,
+        ..TermConfig::default()
+    }
 }
 
 impl Session {
@@ -216,36 +239,78 @@ impl Session {
         sink: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> Result<Self, SpawnError> {
         let size = config.size.clamped();
+        let channel = Channel::new().map_err(SpawnError::EventLoop)?;
         let Spawned { master, child, tty } = spawn::spawn(config)?;
         let pid = child.pid();
         let shell = ProcIdentity::capture(pid);
-        let events = EventProxy::new(Box::new(sink), size);
-        let term_config = TermConfig {
-            scrolling_history: config.scrollback_lines,
-            osc52: Osc52::OnlyCopy,
-            kitty_keyboard: false,
-            ..TermConfig::default()
-        };
-        let mut term = Term::new(term_config, &size, events.clone());
+        let events = EventProxy::new(Box::new(sink), size, Role::Local);
+        events.attach(channel.sender());
+        let mut term = Term::new(term_config(config.scrollback_lines), &size, events.clone());
         // Before the PTY thread starts, so the program's first output lands after it.
         transcript::replay(&mut term, &config.replay);
         let term = Arc::new(FairMutex::new(term));
         let pty = Pty::new(master, child, events.clone());
-        let event_loop = EventLoop::new(Arc::clone(&term), events.clone(), pty, true, false)
-            .map_err(SpawnError::EventLoop)?;
-        let io = event_loop.channel();
-        events.attach(io.clone());
+        let io = channel.sender();
         // Detached on purpose: the thread ends on Shutdown or child exit and drops the PTY
         // itself, so nothing ever joins (and blocks on) it.
-        let _detached = event_loop.spawn();
+        pane_loop::spawn(channel, Arc::clone(&term), events.clone(), pty)
+            .map_err(SpawnError::EventLoop)?;
         Ok(Self {
             term,
-            io,
+            link: Link::Local(io),
             events,
             pid,
             shell,
             tty,
         })
+    }
+
+    /// A mirror of a session in the server: `remote` feeds `term` from the connection.
+    pub(crate) fn mirror(
+        identity: Identity,
+        term: Arc<FairMutex<Term<EventProxy>>>,
+        events: EventProxy,
+        remote: Remote,
+    ) -> Option<Self> {
+        let pid = Pid::new(identity.pid)?;
+        Some(Self {
+            term,
+            link: Link::Remote(remote),
+            events,
+            pid,
+            shell: Some(ProcIdentity::from_parts(
+                pid,
+                identity.start_sec,
+                identity.start_usec,
+            )),
+            tty: TtyId(identity.tty),
+        })
+    }
+
+    /// Ends the session: hangs the program up, wherever it runs.
+    pub fn close(self) {
+        if let Link::Remote(remote) = &self.link {
+            remote.send(wire::Frame::Close);
+        }
+    }
+
+    /// Where the session's process is, for a client attaching to it.
+    pub(crate) fn identity(&self) -> Identity {
+        let (sec, usec) = self.shell.map_or((0, 0), ProcIdentity::start_parts);
+        Identity {
+            pid: self.pid.get(),
+            start_sec: sec,
+            start_usec: usec,
+            tty: self.tty.0,
+            size: self.events.size(),
+        }
+    }
+
+    /// Gives `stream` this session: its whole state, then its output (DESIGN.md §14.5).
+    pub(crate) fn attach(&self, stream: UnixStream) {
+        if let Link::Local(io) = &self.link {
+            io.send(Command::Attach(stream));
+        }
     }
 
     /// PID of the child (the shell).
@@ -256,7 +321,10 @@ impl Session {
 
     /// Sends input bytes to the program.
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.io.send(Msg::Input(bytes.into()));
+        match &self.link {
+            Link::Local(io) => io.input(bytes.into()),
+            Link::Remote(remote) => remote.send(wire::Frame::Input(bytes.into().into_owned())),
+        }
     }
 
     /// Resizes the grid and the PTY; the program receives one `SIGWINCH`.
@@ -265,7 +333,10 @@ impl Session {
         self.events.set_size(size);
         self.term.lock().resize(size);
         self.events.mark_dirty();
-        let _ = self.io.send(Msg::Resize(size.into()));
+        match &self.link {
+            Link::Local(io) => io.send(Command::Resize(size.into())),
+            Link::Remote(remote) => remote.send(wire::Frame::Resize(size)),
+        }
     }
 
     /// Whether the viewport changed since the last snapshot: new output, or a resize, scroll
@@ -313,13 +384,6 @@ impl Session {
     pub fn clear_history(&self) {
         self.term.lock().grid_mut().clear_history();
         self.events.mark_dirty();
-    }
-
-    /// Answers a [`SessionEvent::ColorRequest`]: runtime overrides first, then `palette`.
-    pub fn answer_color(&self, query: &ColorQuery, palette: &Palette) {
-        let color = self.term.lock().colors()[query.index]
-            .map_or_else(|| palette.slot(query.index), Rgba::from);
-        self.write((query.reply)(color.into()).into_bytes());
     }
 
     /// Starts a selection at `cell`, replacing any previous one.
@@ -420,6 +484,8 @@ fn grid_point(term: &Term<EventProxy>, cell: ViewportCell) -> (Point, Side) {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.io.send(Msg::Shutdown);
+        if let Link::Local(io) = &self.link {
+            io.send(Command::Shutdown);
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! Events from the PTY thread to the UI, coalesced (DESIGN.md §6.1).
 
 use std::{
-    fmt,
+    mem,
     process::ExitStatus,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
@@ -11,11 +11,10 @@ use std::{
 
 use alacritty_terminal::{
     event::{Event, EventListener},
-    event_loop::{EventLoopSender, Msg},
     vte::ansi::Rgb,
 };
 
-use crate::session::GridSize;
+use crate::{pane_loop::LoopSender, session::GridSize};
 
 /// Something a session reports. Delivered on the session's PTY thread, so sinks must only
 /// hand it off (e.g. push to a channel).
@@ -29,8 +28,6 @@ pub enum SessionEvent {
     Bell,
     /// The program asked to copy text (OSC 52). Reading the clipboard is never allowed.
     ClipboardStore(String),
-    /// The program asked for a color; answer with [`crate::Session::answer_color`].
-    ColorRequest(ColorQuery),
     /// The program toggled cursor blinking.
     CursorBlinkingChange,
     /// The child exited with this status.
@@ -39,18 +36,21 @@ pub enum SessionEvent {
     Ended,
 }
 
-/// A pending OSC 4/10/11 color query.
-pub struct ColorQuery {
+/// A pending OSC 4/10/11 color query, answered by the pane loop once the parse that raised
+/// it has released the terminal.
+pub(crate) struct ColorQuery {
     pub(crate) index: usize,
     pub(crate) reply: Arc<dyn Fn(Rgb) -> String + Send + Sync>,
 }
 
-impl fmt::Debug for ColorQuery {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ColorQuery")
-            .field("index", &self.index)
-            .finish_non_exhaustive()
-    }
+/// Whose terminal this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// Fed by the program's PTY: answers its queries.
+    Local,
+    /// A copy of a session that runs in the server, which answers instead: replies from
+    /// here would reach the program twice (DESIGN.md §14.4).
+    Mirror,
 }
 
 type Sink = Box<dyn Fn(SessionEvent) + Send + Sync>;
@@ -64,23 +64,35 @@ struct Shared {
     /// Set by the PTY thread on output (and by the UI when it scrolls, selects or resizes),
     /// cleared by the UI when it snapshots.
     dirty: AtomicBool,
-    io: OnceLock<EventLoopSender>,
+    io: OnceLock<LoopSender>,
     size: Mutex<GridSize>,
+    role: Role,
+    colors: Mutex<Vec<ColorQuery>>,
+    /// The last title the program set, for a client that attaches later.
+    title: Mutex<Option<String>>,
 }
 
 impl EventProxy {
-    pub(crate) fn new(sink: Sink, size: GridSize) -> Self {
+    pub(crate) fn new(sink: Sink, size: GridSize, role: Role) -> Self {
         Self(Arc::new(Shared {
             sink,
             dirty: AtomicBool::new(false),
             io: OnceLock::new(),
             size: Mutex::new(size),
+            role,
+            colors: Mutex::new(Vec::new()),
+            title: Mutex::new(None),
         }))
     }
 
-    /// Connects replies to the PTY; must happen before the event loop starts.
-    pub(crate) fn attach(&self, io: EventLoopSender) {
+    /// Connects replies to the PTY; must happen before the pane loop starts.
+    pub(crate) fn attach(&self, io: LoopSender) {
         let _ = self.0.io.set(io);
+    }
+
+    /// Color queries raised since the last call.
+    pub(crate) fn take_color_queries(&self) -> Vec<ColorQuery> {
+        mem::take(&mut *self.0.colors.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     pub(crate) fn emit(&self, event: SessionEvent) {
@@ -108,11 +120,28 @@ impl EventProxy {
         *self.0.size.lock().unwrap_or_else(PoisonError::into_inner) = size;
     }
 
+    pub(crate) fn size(&self) -> GridSize {
+        *self.0.size.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn title(&self) -> Option<String> {
+        self.0
+            .title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_title(&self, title: Option<String>) {
+        (*self.0.title.lock().unwrap_or_else(PoisonError::into_inner)).clone_from(&title);
+        self.emit(SessionEvent::Title(title));
+    }
+
     /// Answers the program directly from the PTY thread: no UI round trip, so programs that
     /// query the terminal at startup (vim, fzf) never wait for a frame.
     fn reply(&self, text: String) {
         if let Some(io) = self.0.io.get() {
-            let _ = io.send(Msg::Input(text.into_bytes().into()));
+            io.input(text.into_bytes().into());
         }
     }
 }
@@ -125,18 +154,20 @@ impl EventListener for EventProxy {
                     self.emit(SessionEvent::Wakeup);
                 }
             }
+            Event::PtyWrite(_) | Event::TextAreaSizeRequest(_) | Event::ColorRequest(..)
+                if self.0.role == Role::Mirror => {}
             Event::PtyWrite(text) => self.reply(text),
-            Event::TextAreaSizeRequest(format) => {
-                let size = *self.0.size.lock().unwrap_or_else(PoisonError::into_inner);
-                self.reply(format(size.into()));
-            }
-            Event::Title(title) => self.emit(SessionEvent::Title(Some(title))),
-            Event::ResetTitle => self.emit(SessionEvent::Title(None)),
+            Event::TextAreaSizeRequest(format) => self.reply(format(self.size().into())),
+            Event::ColorRequest(index, reply) => self
+                .0
+                .colors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(ColorQuery { index, reply }),
+            Event::Title(title) => self.set_title(Some(title)),
+            Event::ResetTitle => self.set_title(None),
             Event::Bell => self.emit(SessionEvent::Bell),
             Event::ClipboardStore(_, text) => self.emit(SessionEvent::ClipboardStore(text)),
-            Event::ColorRequest(index, reply) => {
-                self.emit(SessionEvent::ColorRequest(ColorQuery { index, reply }));
-            }
             Event::CursorBlinkingChange => self.emit(SessionEvent::CursorBlinkingChange),
             Event::ChildExit(status) => self.emit(SessionEvent::ChildExited(status)),
             // `Ended` comes from the PTY's drop, which also covers loops that stop on I/O

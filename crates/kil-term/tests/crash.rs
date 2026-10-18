@@ -19,8 +19,11 @@ use common::{sh, start, wait_until};
 use kil_term::{Pid, diagnostics};
 
 const TEST: &str = "crash_of_the_owner_should_hang_up_its_jobs";
+const SERVER_TEST: &str = "crash_of_the_session_server_should_hang_up_its_jobs";
 /// Set in the re-run binary: where the owner writes its job's PID before aborting.
 const OWNER: &str = "KIL_TEST_CRASH_OWNER";
+/// Like `OWNER`, for an owner that runs the job through a session server it hosts.
+const SERVER_OWNER: &str = "KIL_TEST_CRASH_SERVER_OWNER";
 
 fn read_pid(path: &Path) -> Option<Pid> {
     std::fs::read_to_string(path)
@@ -51,16 +54,34 @@ fn crash_as_owner(marker: &Path) -> ! {
     std::process::abort();
 }
 
-#[test]
-fn crash_of_the_owner_should_hang_up_its_jobs() {
-    if let Some(marker) = std::env::var_os(OWNER) {
-        crash_as_owner(Path::new(&marker));
-    }
-    let marker: PathBuf = std::env::temp_dir().join(format!("kil-crash-{}", std::process::id()));
+/// Hosts a session server, starts a job through it as the app would, then aborts.
+#[expect(clippy::unwrap_used, reason = "test helper: a failure fails the test")]
+fn crash_as_server(marker: &Path) -> ! {
+    let dir = marker.with_extension("server");
+    let _ = std::fs::remove_dir_all(&dir);
+    kil_term::server::serve_in_thread(&dir).unwrap();
+    let client = kil_term::Client::connect(&dir).unwrap();
+    let script = format!("echo $$ > '{}'; exec /bin/sleep 600", marker.display());
+    // Detached at once: only the server holds the job.
+    drop(client.spawn("a-1", &sh(&script), |_| {}).unwrap());
+    assert!(wait_until(Duration::from_secs(5), || read_pid(marker).is_some()));
+    std::process::abort();
+}
+
+/// Re-runs this binary as `test`, with `owner` naming where its job's PID goes, and checks
+/// that the job died with it.
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helper: a failure fails the test"
+)]
+fn crash_and_check(test: &str, owner: &str) {
+    let marker: PathBuf =
+        std::env::temp_dir().join(format!("kil-crash-{}-{}", std::process::id(), owner.len()));
     let _ = std::fs::remove_file(&marker);
     let status = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", TEST, "--nocapture"])
-        .env(OWNER, &marker)
+        .args(["--exact", test, "--nocapture"])
+        .env(owner, &marker)
         .status()
         .unwrap();
     let job = read_pid(&marker);
@@ -74,4 +95,20 @@ fn crash_of_the_owner_should_hang_up_its_jobs() {
             .status();
     }
     assert!(gone, "job {} outlived its crashed owner", job.get());
+}
+
+#[test]
+fn crash_of_the_owner_should_hang_up_its_jobs() {
+    if let Some(marker) = std::env::var_os(OWNER) {
+        crash_as_owner(Path::new(&marker));
+    }
+    crash_and_check(TEST, OWNER);
+}
+
+#[test]
+fn crash_of_the_session_server_should_hang_up_its_jobs() {
+    if let Some(marker) = std::env::var_os(SERVER_OWNER) {
+        crash_as_server(Path::new(&marker));
+    }
+    crash_and_check(SERVER_TEST, SERVER_OWNER);
 }
