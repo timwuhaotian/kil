@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{screen, sh, start, wait_for_text, wait_until};
-use kil_term::{Frame, GridSize, Palette, Rgba, SessionEvent};
+use kil_term::{CursorShape, CursorSnapshot, Frame, GridSize, Palette, Rgba, SessionEvent};
 
 #[test]
 fn cursor_position_query_should_be_answered_without_ui() {
@@ -13,6 +13,28 @@ fn cursor_position_query_should_be_answered_without_ui() {
                   stty sane; printf 'GOT:%s' \"$r\" | tr -d '\\033'; exec /bin/sleep 600";
     let probe = start(&sh(script));
     assert!(wait_for_text(&probe.session, "GOT:[1;1R"));
+}
+
+#[test]
+fn hidden_cursor_should_keep_its_place_for_ime_text() {
+    // Like a TUI that hides the cursor, draws its own, and leaves the real one at its input.
+    let probe = start(&sh(
+        "printf '\\033[?25l> abc\\033[3;6H'; exec /bin/sleep 600",
+    ));
+    assert!(wait_for_text(&probe.session, "> abc"));
+    let mut frame = Frame::default();
+    assert!(wait_until(Duration::from_secs(5), || {
+        probe.session.snapshot_into(&mut frame, &Palette::default());
+        frame.cursor.is_some_and(|cursor| cursor.row == 2)
+    }));
+    assert_eq!(
+        frame.cursor,
+        Some(CursorSnapshot {
+            row: 2,
+            col: 5,
+            shape: CursorShape::Hidden,
+        })
+    );
 }
 
 #[test]

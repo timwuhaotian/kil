@@ -350,7 +350,9 @@ fn cursor(
     focused: bool,
     visible: bool,
 ) -> Option<PaintQuad> {
-    let cursor = frame.cursor?;
+    let cursor = frame
+        .cursor
+        .filter(|cursor| cursor.shape != CursorShape::Hidden)?;
     let Geometry { origin, cell } = geometry;
     let wide = frame
         .row(cursor.row)
@@ -377,6 +379,7 @@ fn cursor(
         ),
         // Translucent so the glyph underneath stays readable without a second text pass.
         CursorShape::Block | CursorShape::HollowBlock => fill(block, colors.cursor.opacity(0.7)),
+        CursorShape::Hidden => return None,
     })
 }
 

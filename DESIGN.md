@@ -506,7 +506,7 @@ Only single chords are recorded; multi-stroke keys stay a `keymap.toml` feature.
 - `option_as_meta` (default `true`) sends ESC + key. The tradeoff: Option-composed characters such as `é` need the setting off.
 - Paste uses bracketed paste when that mode is set, and strips ESC from the pasted text.
 
-**IME:** `TerminalPane` implements `EntityInputHandler`. Marked text is drawn at the cursor. Committed text goes to the PTY. `bounds_for_range` returns the cursor rect so the candidate window sits next to the cursor. The acceptance test is Pinyin input.
+**IME:** `TerminalPane` implements `EntityInputHandler`. Marked text is drawn at the cursor. Committed text goes to the PTY. `bounds_for_range` returns the cursor rect so the candidate window sits next to the cursor. A cursor the program hid (DECTCEM, e.g. a TUI such as `kimi` that draws its own) is not drawn but keeps its place in the snapshot (`CursorShape::Hidden`), because such programs leave it at their input; without it the candidate window fell back to the screen's bottom-left corner. The acceptance test is Pinyin input.
 
 ## 9. Config (`~/.config/kil/config.toml`)
 

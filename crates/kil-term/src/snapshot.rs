@@ -117,6 +117,9 @@ pub enum CursorShape {
     Beam,
     /// Outlined block (unfocused).
     HollowBlock,
+    /// Not drawn: the program hid it (DECTCEM), often to draw its own. It still marks where
+    /// the program reads input, so IME text goes there.
+    Hidden,
 }
 
 /// Where and how to draw the cursor.
@@ -223,7 +226,7 @@ pub struct Frame {
     pub rows: usize,
     /// `rows × cols` cells, row-major.
     pub cells: Vec<RenderCell>,
-    /// Cursor, if visible in the viewport.
+    /// Cursor, if in the viewport; also when hidden ([`CursorShape::Hidden`]).
     pub cursor: Option<CursorSnapshot>,
     /// Lines scrolled back from the bottom.
     pub display_offset: usize,
@@ -315,19 +318,16 @@ impl Frame {
         self.cursor = usize::try_from(row)
             .ok()
             .filter(|&row| row < rows)
-            .and_then(|row| {
-                let shape = match cursor.shape {
-                    VteCursorShape::Hidden => return None,
+            .map(|row| CursorSnapshot {
+                row,
+                col: cursor.point.column.0,
+                shape: match cursor.shape {
+                    VteCursorShape::Hidden => CursorShape::Hidden,
                     VteCursorShape::Block => CursorShape::Block,
                     VteCursorShape::Underline => CursorShape::Underline,
                     VteCursorShape::Beam => CursorShape::Beam,
                     VteCursorShape::HollowBlock => CursorShape::HollowBlock,
-                };
-                Some(CursorSnapshot {
-                    row,
-                    col: cursor.point.column.0,
-                    shape,
-                })
+                },
             });
     }
 }
