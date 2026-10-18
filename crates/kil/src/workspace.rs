@@ -2003,7 +2003,7 @@ mod tests {
         let (workspace, cx) = workspace(cx);
         cx.update(|_, cx| {
             let (table, errors) = crate::keymap::resolve(None);
-            assert!(errors.is_empty());
+            assert_eq!(errors, []);
             cx.bind_keys(crate::keymap::bindings(&table));
         });
         let panes = |cx: &mut VisualTestContext| {

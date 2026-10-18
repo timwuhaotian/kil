@@ -645,7 +645,7 @@ mod tests {
         let mut tree = three_panes();
         let now = Instant::now();
         tree.close(&2, now);
-        assert!(tree.collapse_finished(now).is_empty());
+        assert_eq!(tree.collapse_finished(now), Vec::<u32>::new());
     }
 
     #[test]

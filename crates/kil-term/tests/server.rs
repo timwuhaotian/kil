@@ -153,7 +153,7 @@ fn close_should_end_the_session_in_the_server() {
     assert!(wait_until(Duration::from_secs(5), || !diagnostics::exists(
         pid
     )));
-    assert!(client.sessions().unwrap().is_empty());
+    assert_eq!(client.sessions().unwrap(), Vec::<String>::new());
 }
 
 /// Hand-written frames: the wire module is the crate's own.
@@ -282,5 +282,5 @@ fn client_should_speak_down_to_a_protocol_1_server() {
     let dir = std::env::temp_dir().join(format!("kil-srv-{}-v1", std::process::id()));
     protocol_1_server(&dir);
     let client = Client::connect(&dir).unwrap();
-    assert!(client.sessions().unwrap().is_empty());
+    assert_eq!(client.sessions().unwrap(), Vec::<String>::new());
 }
