@@ -1,5 +1,5 @@
 #!/bin/sh
-# Assembles Kil.app around the cargo binary, with the icon rendered from packaging/icon.svg.
+# Assembles Kil.app around the cargo binary, with the icon from packaging/app-icon.png.
 # Usage: scripts/bundle.sh [debug|release]   → prints the .app path
 set -eu
 
@@ -7,7 +7,6 @@ profile="${1:-debug}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-command -v rsvg-convert >/dev/null || { echo "needs rsvg-convert: brew install librsvg" >&2; exit 1; }
 case "$profile" in
   debug) cargo build -p kil ;;
   release) cargo build --release -p kil ;;
@@ -27,9 +26,9 @@ iconset="$out/AppIcon.iconset"
 rm -rf "$iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-  rsvg-convert -w "$size" -h "$size" packaging/icon.svg -o "$iconset/icon_${size}x${size}.png"
+  sips -z "$size" "$size" packaging/app-icon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
   double=$((size * 2))
-  rsvg-convert -w "$double" -h "$double" packaging/icon.svg -o "$iconset/icon_${size}x${size}@2x.png"
+  sips -z "$double" "$double" packaging/app-icon.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 
