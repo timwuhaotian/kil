@@ -6,7 +6,12 @@ members = ["crates/kil-term", "crates/kil"]
 version = "0.0.4"
 edition = "2024"
 license = "MIT"
+authors = ["timwuhaotian"]
 repository = "https://github.com/timwuhaotian/kil"
+homepage = "https://github.com/timwuhaotian/kil"
+readme = "README.md"
+keywords = ["terminal", "macos", "gpui", "pty", "terminal-emulator"]
+categories = ["command-line-utilities"]
 rust-version = "1.94"
 publish = false
 

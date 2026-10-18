@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+description = "Kil's terminal core: PTY spawn, process lifecycle, terminal snapshots and the session server."
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 alacritty_terminal.workspace = true

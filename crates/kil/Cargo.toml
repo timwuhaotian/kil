@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+description = "A native macOS terminal with vertical tabs, animated split panes and jobs that outlive the window."
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 kil-term.workspace = true

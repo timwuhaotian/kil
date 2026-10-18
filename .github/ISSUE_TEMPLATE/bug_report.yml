@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in Kil doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Screenshots help.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a new tab
+        2. Run `...`
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 27.0
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Kil build
+      description: When you downloaded the DMG, or the commit you built from (`git rev-parse --short HEAD`).
+  - type: input
+    id: shell
+    attributes:
+      label: Shell and the program involved
+      placeholder: zsh 5.9, running vim / ssh / a TUI ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        The session server's log is in `~/Library/Application Support/kil/`. For the app's own
+        log, run `RUST_LOG=debug /Applications/Kil.app/Contents/MacOS/kil` from another terminal.
+      render: text

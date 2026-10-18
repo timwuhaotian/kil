@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds Kil, signs it with Developer ID, notarizes and staples it, and packs it in a DMG under
-# releases/, which git tracks (DESIGN.md §11). Run locally; there is no CI.
+# releases/, which git tracks (DESIGN.md §11). Run locally; CI never builds releases.
 # Usage: scripts/release.sh   → releases/Kil-arm64.dmg (+ .sha256), replacing the last release:
 # downloads are always the latest, and the version is only for us (Info.plist, git history).
 #

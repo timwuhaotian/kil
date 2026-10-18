@@ -1,5 +1,9 @@
 # Kil
 
+[![CI](https://github.com/timwuhaotian/kil/actions/workflows/ci.yml/badge.svg)](https://github.com/timwuhaotian/kil/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![macOS 14+ · Apple silicon](https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20silicon-lightgrey)
+
 A native macOS terminal written in Rust. It has vertical tabs, animated split panes and
 shortcuts you can rebind. Your jobs keep running after Kil quits or crashes: reopen it and
 every pane is back on its live process, with vim's unsaved buffer, the ssh connection and the
@@ -9,7 +13,7 @@ Kil is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gp
 rendering) and [`alacritty_terminal`](https://github.com/alacritty/alacritty) (VT parsing). It
 owns every process, PID and file descriptor it creates.
 
-> **Status: 0.0.2, early.** macOS only for now: Apple silicon, macOS 14 or later. It is tested
+> **Status: early.** macOS only for now: Apple silicon, macOS 14 or later. It is tested
 > on macOS 27.
 
 ## Features
@@ -72,7 +76,8 @@ fine on the machine that built it.
 
 ### Making a release (maintainers)
 
-Releases are built locally and committed under `releases/`; there is no CI. With a
+Releases are built locally and committed under `releases/`; CI only checks pull requests and
+`main`. With a
 Developer ID identity in the login keychain:
 
 ```sh
@@ -85,7 +90,8 @@ The script signs with the hardened runtime, notarizes and staples the app, then 
 fails unless Apple accepts both. Instead of the API key variables, it can use a
 `notarytool store-credentials` profile (`KIL_NOTARY_PROFILE`), or the key stored by the
 [`asc`](https://asccli.sh) CLI when that is installed. The
-version comes from `Cargo.toml`.
+version comes from `Cargo.toml`; it is for us, so add the release to
+[`CHANGELOG.md`](CHANGELOG.md) when you bump it.
 
 ## Using Kil
 
@@ -160,16 +166,17 @@ crates/
 ## Development
 
 ```sh
-cargo test --workspace                                       # unit, GPUI and real-process tests
+cargo test --workspace --locked                              # unit, GPUI and real-process tests
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo +nightly fmt                                           # rustfmt.toml uses nightly options
+cargo +nightly fmt --all                                     # rustfmt.toml uses nightly options
 ```
 
 The process tests in `crates/kil-term/tests/` spawn real shells and check fds, signals,
 reaping, crashes and leaks. They should leave no process behind; if one does, that's a bug.
 
-Contributions are welcome. Please keep `cargo clippy -D warnings` and the tests green. Explain
-*why* in comments, not *what*. Don't copy code from Zed's `terminal` crates: they are GPL.
+Contributions are welcome: see [`CONTRIBUTING.md`](CONTRIBUTING.md) and the
+[code of conduct](CODE_OF_CONDUCT.md). Report security issues privately, as
+[`SECURITY.md`](SECURITY.md) describes. Changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 

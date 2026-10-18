@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The process tests start a login shell from $SHELL, and the zsh integration test needs zsh.
+  SHELL: /bin/zsh
+
+jobs:
+  check:
+    # Apple silicon, like every Kil build.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # GPUI compiles its Metal shaders at build time; newer Xcodes ship the compiler apart.
+      - name: Metal toolchain
+        run: xcrun -f metal || xcodebuild -downloadComponent MetalToolchain
+      # rustfmt.toml uses nightly-only import options.
+      - run: cargo +nightly fmt --all --check
+      - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo +stable test --workspace --locked

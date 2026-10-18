@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Pinned exactly on purpose: both are pre-1.0 and Kil implements alacritty's PTY traits
+    # (DESIGN.md §2, §13). They are upgraded by hand.
+    ignore:
+      - dependency-name: gpui
+      - dependency-name: alacritty_terminal
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
