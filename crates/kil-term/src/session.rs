@@ -260,13 +260,24 @@ impl Session {
         let size = size.clamped();
         self.events.set_size(size);
         self.term.lock().resize(size);
+        self.events.mark_dirty();
         let _ = self.io.send(Msg::Resize(size.into()));
     }
 
-    /// Whether output arrived since the last snapshot.
+    /// Whether the viewport changed since the last snapshot: new output, or a resize, scroll
+    /// or selection made through this session. A clean session's last snapshot is current.
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.events.is_dirty()
+    }
+
+    /// Clears [`Self::is_dirty`] without a snapshot and returns what it was.
+    ///
+    /// For a session nobody is drawing (a background tab): a dirty session sends no further
+    /// [`SessionEvent::Wakeup`], so without this its later output would go unnoticed.
+    #[must_use]
+    pub fn take_dirty(&self) -> bool {
+        self.events.take_dirty()
     }
 
     /// Copies the viewport into `frame`, reusing its allocation.
@@ -285,16 +296,19 @@ impl Session {
     /// Scrolls the viewport by `lines` (positive = back in history).
     pub fn scroll(&self, lines: i32) {
         self.term.lock().scroll_display(Scroll::Delta(lines));
+        self.events.mark_dirty();
     }
 
     /// Returns the viewport to the live screen.
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);
+        self.events.mark_dirty();
     }
 
     /// Drops all scrollback. The allocator keeps the pages for reuse (DESIGN.md §5.1).
     pub fn clear_history(&self) {
         self.term.lock().grid_mut().clear_history();
+        self.events.mark_dirty();
     }
 
     /// Answers a [`SessionEvent::ColorRequest`]: runtime overrides first, then `palette`.
@@ -314,6 +328,7 @@ impl Session {
         let mut term = self.term.lock();
         let (point, side) = grid_point(&term, cell);
         term.selection = Some(Selection::new(ty, point, side));
+        self.events.mark_dirty();
     }
 
     /// Extends the current selection to `cell`.
@@ -323,11 +338,13 @@ impl Session {
         if let Some(selection) = term.selection.as_mut() {
             selection.update(point, side);
         }
+        self.events.mark_dirty();
     }
 
     /// Removes the selection.
     pub fn clear_selection(&self) {
         self.term.lock().selection = None;
+        self.events.mark_dirty();
     }
 
     /// Selected text, if any.

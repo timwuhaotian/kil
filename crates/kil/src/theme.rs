@@ -14,6 +14,7 @@ pub struct Theme {
     pub sidebar_hover: Hsla,
     pub sidebar_selected: Hsla,
     pub accent: Hsla,
+    pub failure: Hsla,
     pub divider: Hsla,
     pub inactive_dim: Hsla,
     pub banner_bg: Hsla,
@@ -34,6 +35,7 @@ impl Theme {
             sidebar_hover: rgba(0xff_ff_ff_0f).into(),
             sidebar_selected: rgba(0xff_ff_ff_1f).into(),
             accent: rgb(0x6c_a8_ff).into(),
+            failure: rgb(0xf0_6c_6c).into(),
             divider: rgb(0x26_29_30).into(),
             // Half: on a near-black background a lighter dim moves the background by ~2/255
             // and leaves only the text to show which pane has focus.

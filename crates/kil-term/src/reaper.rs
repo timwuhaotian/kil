@@ -160,9 +160,14 @@ fn receive(
 fn reap_or_escalate(ward: Ward, poller: Option<&Poller>, now: Instant) -> Option<Ward> {
     let Ward {
         child,
-        deadline,
-        killed,
+        mut deadline,
+        mut killed,
     } = ward;
+    if let Some(poller) = poller {
+        // Unwatch before reaping, while the PID is still ours: a fired one-shot stays
+        // registered in polling and would refuse the watch of a recycled PID.
+        sys::unwatch_exit(poller, child.as_std());
+    }
     let child = match child.try_reap() {
         Reap::Exited(status) => {
             log::debug!("reaper: child exited with {status}");
@@ -170,30 +175,25 @@ fn reap_or_escalate(ward: Ward, poller: Option<&Poller>, now: Instant) -> Option
         }
         Reap::Running(child) => child,
     };
-    if now < deadline {
-        return Some(Ward {
-            child,
-            deadline,
-            killed,
-        });
-    }
-    if killed {
-        log::error!(
-            "reaper: pid {} survived SIGKILL; still waiting",
-            child.pid().get()
-        );
-    } else if let Err(err) = child.signal(libc::SIGKILL) {
-        log::error!("reaper: SIGKILL pid {} failed: {err}", child.pid().get());
+    if now >= deadline {
+        if killed {
+            log::error!(
+                "reaper: pid {} survived SIGKILL; still waiting",
+                child.pid().get()
+            );
+        } else if let Err(err) = child.signal(libc::SIGKILL) {
+            log::error!("reaper: SIGKILL pid {} failed: {err}", child.pid().get());
+        }
+        deadline = now + KILL_WAIT;
+        killed = true;
     }
     if let Some(poller) = poller {
-        // Re-arm: a one-shot filter consumed by an earlier wakeup would otherwise leave
-        // only the sweep to notice the exit.
-        sys::unwatch_exit(poller, child.as_std());
+        // Failure means the child already began exiting; the sweep reaps it.
         let _ = sys::watch_exit(poller, child.as_std(), key(&child));
     }
     Some(Ward {
         child,
-        deadline: now + KILL_WAIT,
-        killed: true,
+        deadline,
+        killed,
     })
 }

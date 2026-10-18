@@ -15,11 +15,12 @@ use std::{
     path::PathBuf,
     process::{Child, Command},
     ptr,
+    time::Duration,
 };
 
 use polling::{
     PollMode, Poller,
-    os::kqueue::{PollerKqueueExt, Process, ProcessOps},
+    os::kqueue::{PollerKqueueExt, Process, ProcessOps, Timer},
 };
 
 /// `SZOMB` from `<sys/proc.h>`: exited but not yet reaped.
@@ -170,7 +171,8 @@ pub(crate) fn kill(pid: i32, signal: c_int) -> io::Result<()> {
 /// `max_fd` bounds the close-on-exec sweep; compute it before forking.
 pub(crate) fn install_child_setup(command: &mut Command, max_fd: RawFd) {
     // SAFETY: the closure only calls async-signal-safe functions (setsid, ioctl, fcntl,
-    // signal) and allocates nothing, as required between fork and exec in a threaded parent.
+    // signal, sigemptyset, sigprocmask) and allocates nothing, as required between fork and
+    // exec in a threaded parent.
     unsafe {
         command.pre_exec(move || child_setup(max_fd));
     }
@@ -193,24 +195,69 @@ fn child_setup(max_fd: RawFd) -> io::Result<()> {
         for signal in RESET_SIGNALS {
             libc::signal(signal, libc::SIG_DFL);
         }
+        // The child inherits the forking thread's mask, and GPUI forks on GCD worker threads,
+        // which block most signals (F15). A blocked SIGHUP survives every hangup: a crashed or
+        // killed kil would leave its jobs running forever.
+        let mut empty = MaybeUninit::<libc::sigset_t>::uninit();
+        cvt(libc::sigemptyset(empty.as_mut_ptr()))?;
+        cvt(libc::sigprocmask(
+            libc::SIG_SETMASK,
+            empty.as_ptr(),
+            ptr::null_mut(),
+        ))?;
     }
     Ok(())
 }
 
 /// Registers a one-shot kqueue `NOTE_EXIT` for `child` under `key`.
+///
+/// Fails with `ESRCH` once the child has begun exiting (it can do so before anyone watches).
+/// A failed watch is fully undone, so the same child can be watched again later.
 pub(crate) fn watch_exit(poller: &Poller, child: &Child, key: usize) -> io::Result<()> {
     // SAFETY: polling requires the child to stay unreaped while registered. Children are
     // only ever reaped by their owner (`OwnedChild`), after which the one-shot filter has
     // either fired or been deleted by `unwatch_exit`.
     let filter = unsafe { Process::new(child, ProcessOps::Exit) };
-    poller.add_filter(filter, key, PollMode::Oneshot)
+    poller
+        .add_filter(filter, key, PollMode::Oneshot)
+        .inspect_err(|err| {
+            // polling records the source before the kernel refuses it; forget it again.
+            if err.kind() != io::ErrorKind::AlreadyExists {
+                unwatch_exit(poller, child);
+            }
+        })
 }
 
-/// Removes a `watch_exit` registration; a filter that already fired is not an error.
+/// Removes a `watch_exit` registration, including one that already fired: polling keeps a
+/// fired one-shot's source, which would refuse the next watch of a recycled PID.
 pub(crate) fn unwatch_exit(poller: &Poller, child: &Child) {
     // SAFETY: see `watch_exit`; deleting needs the same (still unreaped) child.
     let filter = unsafe { Process::new(child, ProcessOps::Exit) };
     let _ = poller.delete_filter(filter);
+}
+
+/// Arms (or, with `rearm`, re-arms) one-shot timer `id` to fire under `key` after `after`.
+pub(crate) fn arm_timer(
+    poller: &Poller,
+    id: usize,
+    after: Duration,
+    key: usize,
+    rearm: bool,
+) -> io::Result<()> {
+    let timer = Timer { id, timeout: after };
+    if rearm {
+        poller.modify_filter(timer, key, PollMode::Oneshot)
+    } else {
+        poller.add_filter(timer, key, PollMode::Oneshot)
+    }
+}
+
+/// Removes timer `id`; one that already fired is not an error.
+pub(crate) fn disarm_timer(poller: &Poller, id: usize) {
+    let _ = poller.delete_filter(Timer {
+        id,
+        timeout: Duration::ZERO,
+    });
 }
 
 /// Process facts from `PROC_PIDTBSDINFO`.

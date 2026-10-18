@@ -3,7 +3,11 @@
 use alacritty_terminal::{
     event::EventListener,
     grid::Dimensions,
-    term::{Term, cell::Flags, color::Colors},
+    term::{
+        Term,
+        cell::Flags,
+        color::{COUNT, Colors},
+    },
     vte::ansi::{Color, CursorShape as VteCursorShape, NamedColor, Rgb},
 };
 
@@ -264,7 +268,9 @@ impl Frame {
         self.history = term.history_size();
 
         let offset = i32::try_from(content.display_offset).unwrap_or(i32::MAX);
-        let colors = content.colors;
+        // Resolved once per frame, so each cell's colors are one index instead of an
+        // override check plus a palette match (measured ~6% of the UI thread while streaming).
+        let table = ColorTable::new(content.colors, palette);
         for indexed in content.display_iter {
             let cell = indexed.cell;
             let mut flags = CellFlags::default();
@@ -285,8 +291,8 @@ impl Frame {
                 .is_some_and(|range| range.contains(indexed.point));
             flags.set(CellFlags::SELECTED, selected);
 
-            let mut fg = resolve(cell.fg, colors, palette);
-            let mut bg = resolve(cell.bg, colors, palette);
+            let mut fg = table.resolve(cell.fg);
+            let mut bg = table.resolve(cell.bg);
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
@@ -326,16 +332,23 @@ impl Frame {
     }
 }
 
-fn resolve(color: Color, colors: &Colors, palette: &Palette) -> Rgba {
-    match color {
-        Color::Spec(rgb) => rgb.into(),
-        Color::Named(name) => slot(name as usize, colors, palette),
-        Color::Indexed(index) => slot(usize::from(index), colors, palette),
-    }
-}
+/// alacritty's color slots with runtime overrides (OSC 4/10/11) applied over `Palette`.
+struct ColorTable([Rgba; COUNT]);
 
-fn slot(slot: usize, colors: &Colors, palette: &Palette) -> Rgba {
-    colors[slot].map_or_else(|| palette.slot(slot), Rgba::from)
+impl ColorTable {
+    fn new(colors: &Colors, palette: &Palette) -> Self {
+        Self(std::array::from_fn(|slot| {
+            colors[slot].map_or_else(|| palette.slot(slot), Rgba::from)
+        }))
+    }
+
+    fn resolve(&self, color: Color) -> Rgba {
+        match color {
+            Color::Spec(rgb) => rgb.into(),
+            Color::Named(name) => self.0[name as usize],
+            Color::Indexed(index) => self.0[usize::from(index)],
+        }
+    }
 }
 
 #[cfg(test)]

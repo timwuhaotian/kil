@@ -1,6 +1,6 @@
 //! Our PTY behind alacritty's event loop: its parser and I/O loop, our process lifecycle.
 
-use std::{fs::File, io, os::fd::AsFd, sync::Arc};
+use std::{fs::File, io, os::fd::AsFd, sync::Arc, time::Duration};
 
 use alacritty_terminal::{
     event::{OnResize, WindowSize},
@@ -19,6 +19,10 @@ use crate::{
 /// crate-private `PTY_READ_WRITE_TOKEN` / `PTY_CHILD_EVENT_TOKEN` (pinned at `=0.26.0`).
 const READ_WRITE_TOKEN: usize = 0;
 const CHILD_EVENT_TOKEN: usize = 1;
+/// kqueue timer ident of the exit poll; idents are per filter and per (per-session) poller.
+const EXIT_POLL_TIMER: usize = 0;
+/// How often to look for a child whose exit `NOTE_EXIT` cannot report.
+const EXIT_POLL: Duration = Duration::from_millis(5);
 
 /// The master side of a session's terminal plus the child it runs.
 ///
@@ -28,6 +32,10 @@ const CHILD_EVENT_TOKEN: usize = 1;
 pub(crate) struct Pty {
     master: File,
     child: ChildGuard,
+    /// The event loop's poller while registered, for the exit poll.
+    poll: Option<Arc<Poller>>,
+    /// The exit-poll timer is registered with `poll`.
+    exit_poll_armed: bool,
 }
 
 impl Pty {
@@ -38,7 +46,30 @@ impl Pty {
                 child: Some(child),
                 events,
             },
+            poll: None,
+            exit_poll_armed: false,
         }
+    }
+
+    /// Looks for the child's exit again in [`EXIT_POLL`], under the child-event token.
+    ///
+    /// For a child that began exiting before the loop could watch it (`NOTE_EXIT` refused
+    /// with `ESRCH`, measured in ~5% of programs that exit at startup), or whose `NOTE_EXIT`
+    /// arrived before it was reapable. The loop keeps reading meanwhile, so the child's last
+    /// output is shown and an exit stalled on draining the terminal can finish (F3).
+    fn poll_exit(&mut self) -> io::Result<()> {
+        let Some(poll) = &self.poll else {
+            return Ok(());
+        };
+        sys::arm_timer(
+            poll,
+            EXIT_POLL_TIMER,
+            EXIT_POLL,
+            CHILD_EVENT_TOKEN,
+            self.exit_poll_armed,
+        )?;
+        self.exit_poll_armed = true;
+        Ok(())
     }
 }
 
@@ -84,8 +115,17 @@ impl EventedReadWrite for Pty {
         interest.key = READ_WRITE_TOKEN;
         // SAFETY: `self.master` outlives the registration; see the method's `expect`.
         unsafe { poll.add_with_mode(&self.master, interest, mode)? };
-        if let Some(child) = &self.child.child {
-            sys::watch_exit(poll, child.as_std(), CHILD_EVENT_TOKEN)?;
+        self.poll = Some(Arc::clone(poll));
+        let Some(child) = &self.child.child else {
+            return Ok(());
+        };
+        if let Err(err) = sys::watch_exit(poll, child.as_std(), CHILD_EVENT_TOKEN) {
+            // Failing here would end the loop unread, losing the output and the status.
+            log::debug!(
+                "NOTE_EXIT for pid {} refused ({err}); polling",
+                child.pid().get()
+            );
+            self.poll_exit()?;
         }
         Ok(())
     }
@@ -104,6 +144,11 @@ impl EventedReadWrite for Pty {
         if let Some(child) = &self.child.child {
             sys::unwatch_exit(poll, child.as_std());
         }
+        if self.exit_poll_armed {
+            sys::disarm_timer(poll, EXIT_POLL_TIMER);
+            self.exit_poll_armed = false;
+        }
+        self.poll = None;
         poll.delete(&self.master)
     }
 
@@ -121,7 +166,13 @@ impl EventedPty for Pty {
         match self.child.child.take()?.try_reap() {
             Reap::Exited(status) => Some(ChildEvent::Exited(Some(status))),
             Reap::Running(child) => {
+                // The one-shot NOTE_EXIT (or the last poll) is spent: nothing else would tell
+                // the loop when the child is finally reapable.
+                let pid = child.pid().get();
                 self.child.child = Some(child);
+                if let Err(err) = self.poll_exit() {
+                    log::error!("exit poll for pid {pid} failed: {err}");
+                }
                 None
             }
         }

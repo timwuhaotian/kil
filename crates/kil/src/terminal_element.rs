@@ -3,9 +3,9 @@
 
 use gpui::{
     App, BorderStyle, Bounds, Element, ElementId, Entity, Focusable, Font, FontStyle, FontWeight,
-    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill,
-    outline, point, px, relative, size,
+    Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
+    Point, ShapedLine, SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window,
+    fill, outline, point, px, relative, size,
 };
 use kil_term::{CellFlags, CursorShape, Frame, GridSize, RenderCell, Rgba};
 
@@ -161,11 +161,7 @@ impl Element for TerminalElement {
             selection: theme.selection_bg,
         };
 
-        let text_system = window.text_system();
-        let font_id = text_system.resolve_font(&font);
-        let cell_width = text_system
-            .advance(font_id, font_size, 'm')
-            .map_or(font_size * 0.6, |advance| advance.width);
+        let cell_width = cell_width(&font, font_size, window, cx);
         let line_height = (font_size * LINE_HEIGHT).round();
         let geometry = Geometry {
             origin: point(bounds.origin.x + PADDING_X, bounds.origin.y + PADDING_Y),
@@ -229,6 +225,36 @@ impl Element for TerminalElement {
             cx,
         );
     }
+}
+
+/// Width of one cell for `font` at `size`, remembered across frames.
+#[derive(Default)]
+struct CellWidth {
+    key: Option<(SharedString, Pixels)>,
+    width: Pixels,
+}
+
+impl Global for CellWidth {}
+
+/// Asking the text system costs a CoreText glyph lookup (measured at ~15% of the UI thread
+/// while output streams), so it runs only when the font or size changes.
+fn cell_width(font: &Font, size: Pixels, window: &Window, cx: &mut App) -> Pixels {
+    let cached = cx.default_global::<CellWidth>();
+    if let Some((family, at)) = &cached.key
+        && *family == font.family
+        && *at == size
+    {
+        return cached.width;
+    }
+    let text_system = window.text_system();
+    let width = text_system
+        .advance(text_system.resolve_font(font), size, 'm')
+        .map_or(size * 0.6, |advance| advance.width);
+    cx.set_global(CellWidth {
+        key: Some((font.family.clone(), size)),
+        width,
+    });
+    width
 }
 
 fn build(

@@ -346,7 +346,7 @@ impl SettingsWindow {
             ),
             row(
                 "Cursor blink",
-                Some("Applies to new tabs and panes"),
+                None,
                 c,
                 toggle("cursor-blink", file.cursor_blink, c).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {

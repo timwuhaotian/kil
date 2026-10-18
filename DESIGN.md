@@ -11,8 +11,9 @@ integration tests.
 
 Build status:
 - **M1 is done.** All §4.8 tests pass, and the churn test runs 500 cycles.
-- **M2–M5 are implemented and lint/test-clean** (66 tests). They still need hands-on UI verification: the A9 checklist, IME, and animation smoothness.
+- **M2–M5 are implemented and lint/test-clean** (93 tests). They still need hands-on UI verification: the A9 checklist, IME, and animation smoothness.
 - **A14–A16** (row menu and rename, Settings window, double-click for a new tab) are implemented. Headless GPUI tests drive the clicks, input and keys. They still need a hands-on pass with a real IME.
+- **A17** (sidebar status marks: running, done, failed) is implemented, with the background-tab wakeup fix it needed (§4.3). F13/F14 (children that exit before they are watched) are fixed and covered by `self_exit.rs`. F15 (children inherited a blocked signal mask, so jobs outlived a crashed kil) is fixed and covered by `crash.rs` and `hygiene.rs`. The §6.4 numbers were re-measured after a profiling pass.
 - A dev bundle is built with `scripts/bundle.sh`. The two-tone icon source is `packaging/icon.svg`.
 - Release signing and notarization (the rest of M6) is not done yet.
 
@@ -40,6 +41,7 @@ Build status:
 | A14 | Right-clicking a sidebar row opens a menu with **Rename Tab…**, **Reset Name** (shown only when the tab has a name) and **Close Tab**. Rename edits the title in place, and IME input works. Enter or a click elsewhere keeps the edit, and Escape cancels it. An empty name goes back to the pane's title. The name also becomes the window title. | `workspace` GPUI tests + manual Pinyin. |
 | A15 | **Kil ▸ Settings…** (`cmd-,`) opens a separate Settings window, or brings the open one forward. It edits font family and size, scrollback, Option as Meta and cursor blink. Each change is written to `config.toml` and applied to the open window at once. The Kil menu also has Services, Hide, Hide Others and Show All. | `settings_window` / `config` tests + manual. |
 | A16 | Double-clicking empty space in the sidebar opens a tab, the same as `cmd-t`. Double-clicking a row does not. | `workspace` GPUI tests. |
+| A17 | A sidebar row shows a **ring** while any of its panes runs a foreground job, a **dot** when a job ended while the tab was not in view (a background tab, or the window inactive) until the tab is viewed, and a red **!** while a pane shows its exit banner. The marks are static: nothing animates while a job runs. | `workspace` GPUI tests + `take_dirty` test. |
 
 ### Non-goals (v1)
 These are left out and can be added later:
@@ -154,11 +156,14 @@ Each `TerminalPane` owns a `Session`, which owns the event-loop sender and a `Pr
 | F5 | The std `Command` fork path, which any `pre_exec` forces, **leaks non-CLOEXEC fds**: a planted fd 3 showed up in the child. With a CLOEXEC sweep in `pre_exec`, the child had only `[0,1,2,10]`, where 10 is zsh's own tty fd. | We add a CLOEXEC sweep. |
 | F6 | `posix_spawn` with `SETSID` and then opening the slave does **not** acquire a controlling tty on macOS (`e_tdev = NODEV`, `tcgetpgrp = 0`). | Pure posix_spawn can't be used without a helper binary. See the trigger in §13. |
 | F7 | With a direct shell, the shell's `e_tdev` equals `stat(ptsname).st_rdev`. `tcgetpgrp(master)` and the shell's `e_tpgid` both track the foreground job (`sleep`, `busy=true`). | Tty-identity verification and busy detection are feasible. |
-| F8 | Child signal ignore set and mask are empty, because std resets the mask and SIGPIPE. Spawn took 1.3–3.9 ms in a small process. | |
+| F8 | Child signal ignore set and mask are empty, because std resets the mask and SIGPIPE. Spawn took 1.3–3.9 ms in a small process. | **Superseded by F15** for the mask. The ignore-set check was `ps -o sigignore=`, a keyword macOS `ps` doesn't have, so it passed without checking anything. |
 | F9 | A churn of 40 login sessions took 2.1 s. The worst drop was 3.9 ms. fds, threads and children returned to baseline, and 0 session processes survived. | |
 | F10 | libc's `openpty(3)` resolves the slave through `ptsname(3)`'s static buffer, so concurrent spawns can race and even open each other's slave. | kil uses `posix_openpt` + `TIOCPTYGNAME` + `open(O_CLOEXEC)`, which is thread-safe, and the slave is close-on-exec atomically. |
 | F11 | Under concurrent spawns on macOS 27, `posix_openpt` occasionally fails with errno −6, XNU's internal `EREDRIVEOPEN` leaking to user space (reproduced in about 1 of 3 test runs). | Bounded retry (16 attempts) on −6 and `EINTR`. 15 consecutive full test runs then passed. |
 | F12 | An unbundled binary started from another terminal inherits that terminal's `__CFBundleIdentifier`, and AppKit then names and badges the process as that app (it showed up as "Otty"). | `main` clears the variable when not running inside a `.app`, and child shells no longer inherit `OTTY_*` or `CW_TERM`. |
+| F13 | A child that exits before its PTY thread registers `NOTE_EXIT` makes the registration fail with `ESRCH` (2–11 of 64 concurrent `true`/`exit 3` sessions per run). alacritty then ends the loop **without reading the PTY**, and the child is still mid-exit (not yet reapable) when the `Pty` drops. The reaper still reaped it, so no zombie, but the program's output and exit status were lost: `exit 3` showed "Process ended", and a clean exit didn't close the pane. Otty leaks a zombie on this same "died during launch" path. | `Pty::register` falls back to a 5 ms kqueue timer under the child-event token, re-armed until `try_wait` succeeds. The same poll covers a `NOTE_EXIT` that arrives before the child is reapable. The loop keeps draining output meanwhile (F3). |
+| F15 | **The child inherits the forking thread's signal mask, and std does not reset it.** The app spawns on GPUI's executor threads (GCD workers), which block most signals: a pane's process had mask `0xfbfee027`, with HUP, INT and QUIT blocked. A blocked SIGHUP survives every hangup. A program that doesn't reset its own mask (`sleep`, a build, a server) ignored the close-time SIGHUP, so only the 3 s SIGKILL ended it. When kil was killed or crashed, **it kept running forever, reparented to launchd**. That is the live-process leak the Otty report checked for. The main-thread measurement in F8 couldn't show this. | `pre_exec` empties the mask with `sigprocmask` (async-signal-safe) after resetting dispositions. Tests spawn from a thread that blocks signals: one checks that SIGHUP ends the child, and one aborts an owner process and checks that its job dies. |
+| F14 | `polling` records a filter's source before the kernel accepts it, and keeps it after a one-shot fires. A failed watch left a stale source, and so did every reaped ward. The reaper's source set grew by one per closed session, and a recycled PID could never be watched again, which left only the 250 ms sweep. | `watch_exit` undoes a failed registration. The reaper unwatches each ward before reaping it and re-watches the ones still running. |
 
 ### 4.2 Spawn (`spawn.rs`, runs on the spawner thread)
 
@@ -197,12 +202,15 @@ Queries:
 - **Busy** means `tpgid != shell pgid` (F7).
 - **Cwd for a new tab or pane** is a fresh synchronous query on the focused pane: the foreground leader's cwd, falling back to the shell's cwd.
 - **Tab title:** the OSC 0/2 title if set. Otherwise the foreground name when busy. Otherwise the shell cwd with `~` abbreviation. Refreshed at most every 250 ms after a `Wakeup`, and on focus. Never per frame.
+- **Background tabs.** A session stays dirty until it is snapshotted and sends no `Wakeup` while dirty, and a pane in a background tab is never drawn. Its title and busy state therefore froze after its first output, so a finished job kept its ring and never got its dot. The info refresh now calls `Session::take_dirty`, which re-arms wakeups at most once per 250 ms per undrawn pane, and marks the pane's frame stale so its next draw snapshots.
+- A busy → idle transition emits `PaneEvent::JobFinished`. The tab records it as *done* unless it is the active tab of an active window, and selecting the tab or reactivating the window clears it (A17).
 
 ### 4.4 Exit detection and reaping: no signal handlers anywhere
 
 - `Pty::register` adds the master fd and a kqueue `Process(child, Exit)` filter to alacritty's own `Poller`, under `PTY_CHILD_EVENT_TOKEN`.
 - `next_child_event` calls `try_wait()` (reap) and returns `ChildEvent::Exited(status)`.
 - There is no process-wide SIGCHLD handler. With N panes, alacritty's signal-pipe design wakes all N loops on every child exit, and this design avoids that.
+- If `NOTE_EXIT` can't be registered because the child already began exiting (F13), or it fires before the child is reapable, the loop polls with a one-shot kqueue timer under the same token until `try_wait` reaps.
 
 **Ownership is the PID-safety mechanism.** `OwnedChild` wraps `std::process::Child`, is not
 `Clone`, and is the **only** way to signal or wait on our child. Reaping consumes it. An unreaped
@@ -230,7 +238,7 @@ reaper (one thread, kqueue): NOTE_EXIT ─► try_wait ─► done
 
 - **Natural exit.** NOTE_EXIT fires, the PTY thread reaps and sends `ChildExit(status)`. Status 0 closes the pane with an animation. Anything else shows the banner from A5. This also stops a broken `.zshrc` from creating a crash loop.
 - **Quit (`cmd-q`).** If any session is busy, a confirm sheet lists the processes (for example "vim, cargo"). Then every session closes as in §4.5 and `reaper.shutdown(1s)` runs. Survivors get SIGKILL, are reaped, and the app exits.
-- **Crash or abort.** The kernel closes every master, which hangs up every session (F4). Shells exit and launchd reaps them. Release builds use `panic = "abort"`: a half-alive pane is worse than a clean crash, and the kernel is the safety net.
+- **Crash or abort.** The kernel closes every master, which hangs up every session (F4). Shells exit and launchd reaps them. Because the children start with an empty signal mask (F15), the hangup's SIGHUP reaches them. `crash.rs` aborts an owner and checks this. Release builds use `panic = "abort"`: a half-alive pane is worse than a clean crash, and the kernel is the safety net.
 - **Info.plist.** `NSSupportsSuddenTermination = false` and `NSSupportsAutomaticTermination = false`, so macOS never skips this flow. `NSAppSleepDisabled = true`: if App Nap throttles the PTY reader, child builds block on a full PTY. Verify the App Nap behavior in M6.
 
 ### 4.7 Close confirmation
@@ -243,7 +251,9 @@ sheet lists the foreground process names. Idle shells close without asking.
 | Test (name says the claim) | Asserts |
 |---|---|
 | `spawn_should_give_child_only_stdio_fds_when_parent_has_leaky_fd` | Child fd set is ⊆ {0,1,2} ∪ the shell's own fds (F5). |
-| `spawn_should_reset_signal_mask_and_ignores` | `ps -o sigignore=,sigmask=` of `sh -c` is `0` (F8). |
+| `spawn_should_reset_signals_ignored_by_parent` | With SIGTERM ignored in the parent, SIGTERM still ends the child. This is a behavioral check, because macOS `ps` has no `sigignore` (F8). |
+| `spawn_should_unblock_signals_blocked_by_the_spawning_thread` | Spawned from a thread that blocks SIGHUP, the child still dies of SIGHUP (F15). |
+| `crash_of_the_owner_should_hang_up_its_jobs` | An owner process blocks every signal on its spawning thread, starts `exec sleep 600` and aborts. The job is gone within 2 s (F15). Red without the mask reset. |
 | `close_should_reap_within_grace_when_child_ignores_sighup` | Reaped ≤ 3.5 s with a SIGKILL status, and the calling thread isn't blocked (F2, F4). |
 | `close_should_not_deadlock_when_child_blocks_on_undrained_output` | Reaped ≤ 100 ms (F3). |
 | `close_should_leave_nohup_job_running_reparented` | Semantics are preserved. |
@@ -252,6 +262,7 @@ sheet lists the foreground process names. Idle shells close without asking.
 | `identity_should_reject_recycled_pid` | Start-time mismatch returns `None`. |
 | `churn_500_should_return_to_baseline` | Own fds, threads (`PROC_PIDTASKINFO`) and children (`proc_listchildpids`) are unchanged, and there are no zombies (F9). |
 | `no_signal_handlers_installed` | `sigaction(SIGCHLD)` is still `SIG_DFL` after N sessions. |
+| `sessions_that_exit_at_startup_should_be_reaped_and_keep_status_and_output` | 64 concurrent sessions that exit at once, none of them closed: each reports its exact status and its last output, and no child is left unreaped (F13). Red before the fix. |
 
 ---
 
@@ -281,7 +292,8 @@ high-water mark** and making it visible.
 
 - Each pane keeps one reusable `Frame { cells: Vec<RenderCell>, … }`, where `RenderCell` is a 16-byte `Copy` value (`char`, rgba fg, rgba bg, `u16` flags). Under the **fair** lock it is `clear()`ed and refilled, colors are resolved in the same pass, and the lock is released. The lock is held for about 50 µs on a 200×50 viewport. Shaping happens outside the lock.
 - After a resize, if `capacity > 2 × needed`, call `shrink_to(needed)` so a window that was briefly huge doesn't pin its peak memory.
-- Row text is built in one reused `String`. Allocations per frame are **O(changed rows)**, because GPUI needs a `SharedString` per shaped line. A per-row `(hash, ShapedLine)` cache is added **only if** samply shows shaping or allocation above 10% of frame time (M5).
+- Row text is built in one reused `String`. *As built*, every run on screen is re-shaped each frame through GPUI's content-keyed line cache, so allocations are one `SharedString` per run, not O(changed rows). A per-row `(hash, ShapedLine)` cache is the next lever (see §6.4).
+- *As built:* the snapshot is skipped when the session is clean (`Session::is_dirty` also covers this side's scrolls, selections and resizes), so a cursor blink doesn't take the terminal lock. Colors are resolved through a 269-slot table built once per frame, not per cell.
 
 ### 5.4 Lifetimes and leaks
 
@@ -302,7 +314,7 @@ high-water mark** and making it visible.
 
 ### 6.2 `TerminalElement`
 
-- **prepaint:** compute the cell size from font metrics (cached per font config), then snapshot.
+- **prepaint:** compute the cell size from font metrics (cached per font family and size in a GPUI global; asking CoreText every frame cost ~15% of the UI thread while streaming), then snapshot.
 - **paint:**
   1. Background quads, merging contiguous equal bg per row.
   2. Glyph runs. A run breaks on a style change **and never spans a `WIDE_CHAR`**. Each run is placed at `col × cell_w`, so fallback CJK fonts can't drift the grid.
@@ -326,6 +338,12 @@ high-water mark** and making it visible.
 | Footprint | idle pane ≤ 2 MB plus scrollback formula | `footprint <pid>`, `vmmap --summary` |
 | CPU and allocation profile | No measurable allocation in kil code beyond O(changed rows) per frame | `samply record`, Instruments Allocations |
 
+**Measured** (release, one pane, M4 Pro, macOS 27.0):
+- **Throughput.** `seq 1 3000000` takes 3.5–4.0 s, and 300k colored lines with CJK take 0.5 s. That's the macOS PTY limit: BSD `script` relaying the same `seq` through a PTY takes 4.6 s. The PTY thread spends ~70% of its time in `read`/`kevent` and ~22% in the VT parser. The UI thread uses ~0.25 s over the whole run, about 0.5 ms per frame.
+- **Idle.** 0.35% with blink off and 0.7% with blink on. The floor is GPUI 0.2.2's `CVDisplayLink`, which runs at every vsync while the window is visible, even with nothing to draw (it stops only when the window is occluded). A12's 0.0% is not reachable without changing GPUI (§13).
+- **Blink.** One timer per window, running only while the window is active, for the focused pane only. Before, there was one 530 ms timer per pane, focused or not.
+- **Zombies.** 0 after every run.
+
 Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `codegen-units=1`,
 `panic="abort"`, `debug="line-tables-only"` (keeps samply symbols).
 
@@ -339,7 +357,7 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 
 **Sidebar** (220 px)
 - 44 px rows with a title (13 pt medium) and the cwd (11 pt, middle-truncated).
-- An accent dot when the tab is **busy**, a dim dot for unseen output in a background tab, and an `×` on hover.
+- A 10 px status slot before the title (A17): an accent **ring** while a pane runs a job, an accent **dot** for a job that ended out of view, and a red **!** for an exit banner. The marks differ in shape as well as color. They are static, because a spinner would redraw the window every frame for as long as a dev server runs. There is an `×` on hover.
 - A footer `+ New Tab` button. Double-clicking empty sidebar space also opens a tab.
 - Right-click on a row opens a menu: Rename Tab…, Reset Name, Close Tab. A rename edits the title in place in a `TextField`. The user's name overrides the pane's title in the row, in the closing ghost and in the window title.
 - The selection highlight is a rounded 8 px pill that **slides** between rows.
@@ -435,7 +453,7 @@ option_as_meta = true
 cursor_blink = true
 ```
 
-The Settings window writes one key per change (`config::write_setting`). It replaces the line that assigns the key, or appends one, and keeps every other line, comments included. If the result would not parse, nothing is written. The file is written in place, not renamed over, so a symlinked dotfile stays a symlink. The terminal window then reloads through the same mtime path. Scrollback and cursor blink apply to new tabs and panes, because a blink timer for existing panes would break idle CPU (A12).
+The Settings window writes one key per change (`config::write_setting`). It replaces the line that assigns the key, or appends one, and keeps every other line, comments included. If the result would not parse, nothing is written. The file is written in place, not renamed over, so a symlinked dotfile stays a symlink. The terminal window then reloads through the same mtime path. Scrollback applies to new tabs and panes. Cursor blink applies at once: the window has one blink timer, which runs only while blink is on and the window is active (A12).
 
 Both files are re-read when the window gains focus and the file's mtime has changed. There is no
 watcher thread and no extra dependency.
@@ -566,6 +584,8 @@ Each milestone ends on a proof, not on a feature count.
 | Allocator retains freed scrollback | Line budget, ledger, HUD (§5). | Total scrollback > 1 GiB in real use → add a global cap that trims the least-recently-viewed panes' history. |
 | One thread per session | Documented cost. | Regularly > 100 panes → a shared kqueue I/O thread with a custom loop. |
 | `AnyView::cached` doesn't isolate panes | Count prepaints in M4. | Siblings re-prepaint → per-row shaped-line cache (§5.3). |
+| GPUI's display link runs whenever the window is visible | Measured floor: 0.35% idle CPU (§6.4). | Idle CPU matters more than the GPUI pin → patch GPUI to stop the link when no frame is requested, and restart it on `request_frame`. |
+| Re-shaping every run each frame (§5.3) | UI thread ~0.5 ms per frame while streaming. | Frame drops with 4 streaming panes at 120 fps → per-row shaped-line cache keyed by row content. |
 | Residual TOCTOU on `killpg` of a non-child group | Identity re-check right before the signal. | None needed: by default we never kill non-child groups. |
 | TCC and App Nap behavior on macOS 27 | Info.plist keys and entitlements. | Fails the M6 fresh-install check → adjust the keys and entitlements. |
 | Zed GPL code contamination | Write from specs; never paste from `zed/crates/terminal*`. | |

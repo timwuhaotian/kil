@@ -10,10 +10,10 @@ use std::{
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    App, AsyncApp, AsyncWindowContext, Bounds, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size,
-    Task, UTF16Selection, WeakEntity, Window, actions, div, point, prelude::*,
+    App, AsyncApp, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, Task, UTF16Selection, WeakEntity,
+    Window, actions, div, point, prelude::*,
 };
 use kil_term::{
     Frame, GridSize, Palette, SelectionKind, Session, SessionConfig, SessionEvent, ViewportCell,
@@ -28,15 +28,17 @@ use crate::{
 
 actions!(terminal, [Copy, Paste, ClearScrollback]);
 
-const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+pub const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// Process info (title, cwd, busy) refreshes at most this often, trailing the last output.
 const INFO_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// What a pane tells its tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneEvent {
-    /// [`TerminalPane::info`] changed.
+    /// [`TerminalPane::info`] or [`TerminalPane::ended_badly`] changed.
     InfoChanged,
+    /// A foreground job ended; the shell is back in the foreground.
+    JobFinished,
     /// The user clicked into the pane.
     Focused,
     /// The pane should be removed (clean exit, or the user dismissed the exit banner).
@@ -60,6 +62,8 @@ enum Status {
     /// Ended with a non-zero status, a signal, or unknown; shown in a banner.
     Exited(Option<ExitStatus>),
     Failed(SharedString),
+    /// Closed by the user; shown without a banner while it animates out.
+    Closing,
 }
 
 /// Where the grid was last laid out, for mouse hit-testing and IME placement.
@@ -69,6 +73,10 @@ pub struct Geometry {
     pub cell: Size<Pixels>,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent view flags (cursor, drag, layout freeze, frame staleness), not states"
+)]
 pub struct TerminalPane {
     focus_handle: FocusHandle,
     session: Option<Session>,
@@ -76,6 +84,9 @@ pub struct TerminalPane {
     exit_status: Option<ExitStatus>,
     title: Option<SharedString>,
     pub(crate) frame: Frame,
+    /// `frame` is behind the session even though the session reads clean (see
+    /// [`Self::refresh_info`]).
+    stale: bool,
     grid: Option<GridSize>,
     pub(crate) geometry: Option<Geometry>,
     pub(crate) marked_text: Option<String>,
@@ -100,7 +111,7 @@ impl Focusable for TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let settings = cx.global::<Settings>();
         let mut config = SessionConfig::new(GridSize {
             rows: 24,
@@ -110,7 +121,6 @@ impl TerminalPane {
         });
         config.cwd = cwd;
         config.scrollback_lines = settings.scrollback_lines;
-        let blink = settings.cursor_blink;
 
         let (tx, rx) = mpsc::unbounded();
         // fork+exec of a large GUI process takes milliseconds: keep it off the UI thread.
@@ -119,16 +129,13 @@ impl TerminalPane {
                 let _ = tx.unbounded_send(event);
             })
         });
-        let mut tasks = vec![
+        let tasks = vec![
             cx.spawn(async move |this, cx| {
                 let result = spawn.await;
                 let _ = this.update(cx, |pane, cx| pane.attach(result, cx));
             }),
             cx.spawn(async move |this, cx| pump(this, rx, cx).await),
         ];
-        if blink {
-            tasks.push(cx.spawn_in(window, async move |this, cx| blink_loop(this, cx).await));
-        }
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -137,6 +144,7 @@ impl TerminalPane {
             exit_status: None,
             title: None,
             frame: Frame::default(),
+            stale: true,
             grid: None,
             geometry: None,
             marked_text: None,
@@ -156,6 +164,11 @@ impl TerminalPane {
 
     pub fn info(&self) -> &PaneInfo {
         &self.info
+    }
+
+    /// The program ended on its own with a failure (or never started): the banner is up.
+    pub fn ended_badly(&self) -> bool {
+        matches!(self.status, Status::Exited(_) | Status::Failed(_))
     }
 
     /// Working directory of the foreground job (else the shell), queried fresh: new tabs and
@@ -189,7 +202,7 @@ impl TerminalPane {
     /// close animation.
     pub fn shutdown(&mut self) {
         self.session = None;
-        self.status = Status::Exited(self.exit_status);
+        self.status = Status::Closing;
     }
 
     fn schedule_info_refresh(&mut self, cx: &mut Context<Self>) {
@@ -206,6 +219,12 @@ impl TerminalPane {
     }
 
     fn refresh_info(&mut self, cx: &mut Context<Self>) {
+        // A pane in a background tab is never drawn, so its session would stay dirty and stop
+        // sending wakeups: later output, and the end of its job, would go unseen. Re-arm them
+        // here (at most once per debounce) and snapshot on the next draw instead.
+        if self.session.as_ref().is_some_and(Session::take_dirty) {
+            self.stale = true;
+        }
         let foreground = self.session.as_ref().and_then(Session::foreground);
         let cwd = foreground.as_ref().and_then(|fg| fg.cwd.clone());
         let job = foreground
@@ -225,8 +244,12 @@ impl TerminalPane {
             job,
         };
         if info != self.info {
+            let finished = self.info.busy && !info.busy;
             self.info = info;
             cx.emit(PaneEvent::InfoChanged);
+            if finished {
+                cx.emit(PaneEvent::JobFinished);
+            }
         }
     }
 
@@ -237,6 +260,7 @@ impl TerminalPane {
                     session.resize(grid);
                 }
                 self.session = Some(session);
+                self.stale = true;
                 self.status = Status::Running;
                 self.schedule_info_refresh(cx);
             }
@@ -247,6 +271,7 @@ impl TerminalPane {
                     message = format!("{message}: {source}");
                 }
                 self.status = Status::Failed(message.into());
+                cx.emit(PaneEvent::InfoChanged);
             }
         }
         cx.notify();
@@ -281,10 +306,14 @@ impl TerminalPane {
     }
 
     fn ended(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.status, Status::Closing) {
+            return;
+        }
         if self.exit_status.is_some_and(|status| status.success()) {
             cx.emit(PaneEvent::Closed);
         } else {
             self.status = Status::Exited(self.exit_status);
+            cx.emit(PaneEvent::InfoChanged);
             cx.notify();
         }
     }
@@ -298,8 +327,13 @@ impl TerminalPane {
                 session.resize(grid);
             }
         }
-        if let Some(session) = &self.session {
+        // Skipped when nothing changed, e.g. for a cursor blink: the copy holds the terminal
+        // lock that the PTY thread parses under.
+        if let Some(session) = &self.session
+            && (self.stale || session.is_dirty())
+        {
             session.snapshot_into(&mut self.frame, palette);
+            self.stale = false;
         }
     }
 
@@ -416,7 +450,8 @@ impl TerminalPane {
         }
     }
 
-    fn blink(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// One blink step; the window's cursor timer calls it on the focused pane only.
+    pub fn blink(&mut self, window: &Window, cx: &mut Context<Self>) {
         let active = self.focus_handle.is_focused(window) && window.is_window_active();
         // Keep the cursor solid while typing.
         let visible = !active || self.last_input.elapsed() < BLINK_INTERVAL || !self.cursor_visible;
@@ -426,9 +461,17 @@ impl TerminalPane {
         }
     }
 
+    /// Leaves the cursor drawn, for when blinking stops or moves to another pane.
+    pub fn show_cursor(&mut self, cx: &mut Context<Self>) {
+        if !self.cursor_visible {
+            self.cursor_visible = true;
+            cx.notify();
+        }
+    }
+
     fn banner(&self) -> Option<SharedString> {
         match &self.status {
-            Status::Starting | Status::Running => None,
+            Status::Starting | Status::Running | Status::Closing => None,
             Status::Failed(message) => Some(format!("{message} — press any key to close").into()),
             Status::Exited(status) => {
                 let how = match status {
@@ -519,18 +562,6 @@ async fn pump(
         }
         if this
             .update(cx, |pane, cx| pane.handle_events(&mut batch, cx))
-            .is_err()
-        {
-            return;
-        }
-    }
-}
-
-async fn blink_loop(this: WeakEntity<TerminalPane>, cx: &mut AsyncWindowContext) {
-    loop {
-        cx.background_executor().timer(BLINK_INTERVAL).await;
-        if this
-            .update_in(cx, |pane, window, cx| pane.blink(window, cx))
             .is_err()
         {
             return;

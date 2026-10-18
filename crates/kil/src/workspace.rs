@@ -8,10 +8,10 @@ use std::{
 
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, AnyWindowHandle, App, ClickEvent, Context,
-    CursorStyle, Div, DragMoveEvent, ElementId, Entity, EntityId, FocusHandle, Focusable, Hsla,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, SharedString, Stateful,
-    StyleRefinement, Subscription, Window, actions, anchored, deferred, div, prelude::*, px,
-    relative,
+    CursorStyle, Div, DragMoveEvent, ElementId, Entity, EntityId, FocusHandle, Focusable,
+    FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
+    SharedString, Stateful, StyleRefinement, Subscription, Task, WeakEntity, Window, actions,
+    anchored, deferred, div, prelude::*, px, relative,
 };
 
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
     pane_tree::{Axis, Close, Direction, Node, PaneTree, Split, SplitId},
     settings::Settings,
     terminal_element::cells,
-    terminal_pane::{PaneEvent, TerminalPane},
+    terminal_pane::{BLINK_INTERVAL, PaneEvent, TerminalPane},
     text_field::{FieldEvent, TextField},
     theme::Theme,
 };
@@ -58,6 +58,9 @@ actions!(
 const SIDEBAR_WIDTH: f32 = 220.;
 const SIDEBAR_TOP: f32 = 52.;
 const ROW_HEIGHT: f32 = 44.;
+/// The row's status mark; the cwd line indents past it to align with the title.
+const STATUS_SLOT: f32 = 10.;
+const TITLE_INSET: f32 = STATUS_SLOT + 6.;
 /// Natural exit before the reaper escalates on quit (DESIGN.md §4.6).
 const QUIT_GRACE: Duration = Duration::from_millis(500);
 
@@ -70,7 +73,21 @@ struct Tab {
     focused: Entity<TerminalPane>,
     /// Set by the user (Rename Tab); otherwise the row follows the focused pane.
     name: Option<SharedString>,
+    /// A job ended here while the tab was not in view; cleared when it is.
+    finished: bool,
     animating: bool,
+}
+
+/// What a sidebar row's status mark shows, most urgent first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabStatus {
+    /// A pane's program ended badly and its banner is up.
+    Failed,
+    /// A pane has a foreground job.
+    Running,
+    /// A job ended while the tab was not in view.
+    Done,
+    Idle,
 }
 
 impl Tab {
@@ -78,6 +95,19 @@ impl Tab {
         self.name
             .clone()
             .unwrap_or_else(|| self.focused.read(cx).info().title.clone())
+    }
+
+    fn status(&self, cx: &App) -> TabStatus {
+        let panes = self.tree.leaves();
+        if panes.iter().any(|pane| pane.read(cx).ended_badly()) {
+            TabStatus::Failed
+        } else if panes.iter().any(|pane| pane.read(cx).info().busy) {
+            TabStatus::Running
+        } else if self.finished {
+            TabStatus::Done
+        } else {
+            TabStatus::Idle
+        }
     }
 }
 
@@ -126,6 +156,7 @@ struct Chrome {
     hover: Hsla,
     selected: Hsla,
     accent: Hsla,
+    failure: Hsla,
     divider: Hsla,
     dim: Hsla,
     banner: Hsla,
@@ -141,6 +172,7 @@ impl Chrome {
             hover: theme.sidebar_hover,
             selected: theme.sidebar_selected,
             accent: theme.accent,
+            failure: theme.failure,
             divider: theme.divider,
             dim: theme.inactive_dim,
             banner: theme.banner_bg,
@@ -168,6 +200,10 @@ pub struct Workspace {
     window_title: SharedString,
     /// Font size from the config file, for `font_reset`.
     base_font_size: f32,
+    /// The window's one cursor-blink timer; see [`Self::sync_blink`].
+    blink: Option<Task<()>>,
+    /// The pane it last blinked, so a pane that loses focus is left with its cursor drawn.
+    blinking: Option<WeakEntity<TerminalPane>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -175,8 +211,13 @@ impl Workspace {
     pub fn new(notices: Vec<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
-                this.reload_config_if_changed(cx);
+                this.reload_config_if_changed(window, cx);
+                if let Some(tab) = this.tabs.get_mut(this.active) {
+                    tab.finished = false;
+                    cx.notify();
+                }
             }
+            this.sync_blink(window, cx);
         });
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -199,9 +240,12 @@ impl Workspace {
             close_confirmed: false,
             window_title: SharedString::default(),
             base_font_size: f32::from(cx.global::<Settings>().font_size),
+            blink: None,
+            blinking: None,
             _subscriptions: vec![activation],
         };
         this.open_tab(None, window, cx);
+        this.sync_blink(window, cx);
         this
     }
 
@@ -213,7 +257,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalPane> {
-        let pane = cx.new(|cx| TerminalPane::new(cwd, window, cx));
+        let pane = cx.new(|cx| TerminalPane::new(cwd, cx));
         let subscription = cx.subscribe_in(&pane, window, Self::on_pane_event);
         self.pane_subscriptions
             .insert(pane.entity_id(), subscription);
@@ -234,15 +278,17 @@ impl Workspace {
             tree: PaneTree::new(pane.clone()),
             focused: pane,
             name: None,
+            finished: false,
             animating: false,
         });
         self.activate(self.tabs.len() - 1, window, cx);
     }
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        tab.finished = false;
         if index != self.active {
             let now = Instant::now();
             let offset = self.pill.value(now) + cells(self.active) - cells(index);
@@ -341,7 +387,9 @@ impl Workspace {
             self.pill
                 .retarget(0., motion::ROW_OUT, Ease::InOut, Instant::now());
         }
-        let focused = self.tabs[self.active].focused.focus_handle(cx);
+        let next = &mut self.tabs[self.active];
+        next.finished = false;
+        let focused = next.focused.focus_handle(cx);
         window.focus(&focused);
         cx.notify();
     }
@@ -435,6 +483,20 @@ impl Workspace {
     ) {
         match event {
             PaneEvent::InfoChanged => cx.notify(),
+            PaneEvent::JobFinished => {
+                let watching = window.is_window_active();
+                let active = self.active;
+                if let Some((index, tab)) = self
+                    .tabs
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, tab)| tab.tree.contains(pane))
+                    && !(watching && index == active)
+                {
+                    tab.finished = true;
+                    cx.notify();
+                }
+            }
             PaneEvent::Focused => {
                 if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.tree.contains(pane)) {
                     tab.focused = pane.clone();
@@ -611,14 +673,58 @@ impl Workspace {
     // ── settings ──────────────────────────────────────────────────────────────────────
 
     /// Also called by the Settings window right after it writes `config.toml`.
-    fn reload_config_if_changed(&mut self, cx: &mut Context<Self>) {
+    fn reload_config_if_changed(&mut self, window: &Window, cx: &mut Context<Self>) {
         let stamp = config::stamp();
         if stamp != self.config {
             self.config = stamp;
             self.notices = config::apply(cx);
             self.base_font_size = f32::from(cx.global::<Settings>().font_size);
+            self.sync_blink(window, cx);
             self.refresh_panes(cx);
         }
+    }
+
+    /// Runs one cursor timer, only while blinking is on and the window is active: a timer per
+    /// pane woke the app twice a second for every pane, focused or not, and an inactive window
+    /// needs none (DESIGN.md A12).
+    fn sync_blink(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let wanted = cx.global::<Settings>().cursor_blink && window.is_window_active();
+        if wanted == self.blink.is_some() {
+            return;
+        }
+        if wanted {
+            self.blink = Some(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(BLINK_INTERVAL).await;
+                    if this
+                        .update_in(cx, |this, window, cx| this.blink_cursor(window, cx))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }));
+        } else {
+            self.blink = None;
+            if let Some(pane) = self.blinking.take().and_then(|pane| pane.upgrade()) {
+                pane.update(cx, TerminalPane::show_cursor);
+            }
+        }
+    }
+
+    fn blink_cursor(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.tabs.get(self.active).map(|tab| tab.focused.clone()) else {
+            return;
+        };
+        if let Some(previous) = self
+            .blinking
+            .replace(pane.downgrade())
+            .and_then(|previous| previous.upgrade())
+            && previous != pane
+        {
+            previous.update(cx, TerminalPane::show_cursor);
+        }
+        pane.update(cx, |pane, cx| pane.blink(window, cx));
     }
 
     fn set_font_size(&mut self, change: impl FnOnce(f32) -> f32, cx: &mut Context<Self>) {
@@ -743,11 +849,7 @@ impl Workspace {
             .as_ref()
             .filter(|rename| rename.tab == id)
             .map(|rename| rename.field.clone());
-        let busy = tab
-            .tree
-            .leaves()
-            .iter()
-            .any(|pane| pane.read(cx).info().busy);
+        let status = tab.status(cx);
         let active = index == self.active;
         let pill = active.then(|| {
             div()
@@ -789,12 +891,8 @@ impl Workspace {
                     .relative()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(div().flex_none().size(px(6.)).rounded_full().bg(if busy {
-                        chrome.accent
-                    } else {
-                        gpui::transparent_black()
-                    }))
+                    .gap(px(TITLE_INSET - STATUS_SLOT))
+                    .child(status_mark(status, chrome))
                     .child(row_title(title, editing, active, chrome))
                     .child(
                         div()
@@ -820,7 +918,7 @@ impl Workspace {
             .child(
                 div()
                     .relative()
-                    .pl(px(14.))
+                    .pl(px(TITLE_INSET))
                     .truncate()
                     .text_size(px(11.))
                     .text_color(chrome.muted)
@@ -938,7 +1036,9 @@ pub fn reload_config(cx: &mut App) {
         .iter()
         .filter_map(AnyWindowHandle::downcast::<Workspace>)
     {
-        let _ = workspace.update(cx, |this, _, cx| this.reload_config_if_changed(cx));
+        let _ = workspace.update(cx, |this, window, cx| {
+            this.reload_config_if_changed(window, cx);
+        });
     }
 }
 
@@ -1125,6 +1225,35 @@ fn split_id_bits(tab: TabId, split: SplitId) -> u64 {
     (tab.0 << 32) ^ split.bits()
 }
 
+/// Static on purpose: a spinner would redraw the window every frame for as long as a job
+/// (say, a dev server) runs, and idle CPU must stay at zero (DESIGN.md A12).
+fn status_mark(status: TabStatus, chrome: Chrome) -> Div {
+    let slot = div()
+        .flex_none()
+        .size(px(STATUS_SLOT))
+        .flex()
+        .items_center()
+        .justify_center();
+    match status {
+        TabStatus::Idle => slot,
+        // A ring: still going.
+        TabStatus::Running => slot.child(
+            div()
+                .size(px(STATUS_SLOT))
+                .rounded_full()
+                .border_2()
+                .border_color(chrome.accent),
+        ),
+        // A solid dot: something new to look at.
+        TabStatus::Done => slot.child(div().size(px(7.)).rounded_full().bg(chrome.accent)),
+        TabStatus::Failed => slot
+            .text_size(px(12.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(chrome.failure)
+            .child("!"),
+    }
+}
+
 /// The row's title, or the field editing it.
 fn row_title(
     title: SharedString,
@@ -1153,7 +1282,7 @@ fn render_ghost(ghost: &Ghost, chrome: Chrome) -> AnyElement {
         .overflow_hidden()
         .child(
             div()
-                .pl(px(14.))
+                .pl(px(TITLE_INSET))
                 .truncate()
                 .text_size(px(13.))
                 .text_color(chrome.muted)
@@ -1425,6 +1554,49 @@ mod tests {
             1,
         );
         assert!(focused_is_first(cx));
+    }
+
+    fn first_status(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> TabStatus {
+        workspace.read_with(cx, |this, cx| this.tabs[0].status(cx))
+    }
+
+    fn finish_job_in_first_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        pane.update(cx, |_, cx| cx.emit(PaneEvent::JobFinished));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn job_finishing_in_a_background_tab_should_mark_it_done_until_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(NewTab);
+        finish_job_in_first_tab(&workspace, cx);
+        assert_eq!(first_status(&workspace, cx), TabStatus::Done);
+        cx.dispatch_action(SelectTab1);
+        assert_eq!(first_status(&workspace, cx), TabStatus::Idle);
+    }
+
+    #[gpui::test]
+    fn job_finishing_in_the_tab_in_view_should_not_mark_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        finish_job_in_first_tab(&workspace, cx);
+        assert_eq!(first_status(&workspace, cx), TabStatus::Idle);
+    }
+
+    #[gpui::test]
+    fn blink_timer_should_run_only_while_the_window_is_active(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let blinking =
+            |cx: &mut VisualTestContext| workspace.read_with(cx, |this, _| this.blink.is_some());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(blinking(cx));
+        cx.deactivate_window();
+        assert!(!blinking(cx));
     }
 
     #[gpui::test]

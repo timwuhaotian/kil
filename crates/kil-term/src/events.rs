@@ -61,7 +61,8 @@ pub(crate) struct EventProxy(Arc<Shared>);
 
 struct Shared {
     sink: Sink,
-    /// Set by the PTY thread on output, cleared by the UI when it snapshots.
+    /// Set by the PTY thread on output (and by the UI when it scrolls, selects or resizes),
+    /// cleared by the UI when it snapshots.
     dirty: AtomicBool,
     io: OnceLock<EventLoopSender>,
     size: Mutex<GridSize>,
@@ -88,6 +89,15 @@ impl EventProxy {
 
     pub(crate) fn clear_dirty(&self) {
         self.0.dirty.store(false, Ordering::Release);
+    }
+
+    /// The UI changed the viewport itself; its next snapshot must not be skipped.
+    pub(crate) fn mark_dirty(&self) {
+        self.0.dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_dirty(&self) -> bool {
+        self.0.dirty.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn is_dirty(&self) -> bool {

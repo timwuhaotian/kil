@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{screen, sh, start, wait_for_text, wait_until};
-use kil_term::GridSize;
+use kil_term::{Frame, GridSize, Palette, Rgba, SessionEvent};
 
 #[test]
 fn cursor_position_query_should_be_answered_without_ui() {
@@ -69,4 +69,33 @@ fn selection_text_should_return_selected_word() {
         .session
         .start_selection(kil_term::SelectionKind::Words, cell);
     assert_eq!(probe.session.selection_text().as_deref(), Some("beta"));
+}
+
+#[test]
+fn snapshot_should_use_colors_the_program_redefined() {
+    let probe = start(&sh(
+        "printf '\\033]4;1;rgb:12/34/56\\007\\033[31mR\\033[0m'; exec /bin/sleep 600",
+    ));
+    assert!(wait_for_text(&probe.session, "R"));
+    let fg = || {
+        let mut frame = Frame::default();
+        probe.session.snapshot_into(&mut frame, &Palette::default());
+        frame.row(0)[0].fg
+    };
+    assert!(wait_until(Duration::from_secs(5), || fg() == Rgba::hex(0x12_34_56)));
+}
+
+#[test]
+fn take_dirty_should_rearm_wakeups_for_a_session_nobody_draws() {
+    let probe = start(&sh(
+        "printf first; read _; printf second; exec /bin/sleep 600",
+    ));
+    let wakeup = |probe: &common::Probe| {
+        std::iter::from_fn(|| probe.events.recv_timeout(Duration::from_secs(2)).ok())
+            .any(|event| matches!(event, SessionEvent::Wakeup))
+    };
+    assert!(wakeup(&probe));
+    assert!(probe.session.take_dirty());
+    probe.session.write(b"\n".as_slice());
+    assert!(wakeup(&probe));
 }
