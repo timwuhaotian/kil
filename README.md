@@ -39,7 +39,7 @@ owns every process, PID and file descriptor it creates.
 
 ## Install
 
-Download [`releases/Kil-arm64.dmg`](releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
+Download [`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
 `releases/` also holds its `.sha256`:
 

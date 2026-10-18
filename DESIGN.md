@@ -593,7 +593,7 @@ With neither set, the script uses the `asc` CLI's key from the keychain when `as
 
 **Why Developer ID and not the Mac App Store:** a terminal has to exec arbitrary binaries anywhere on disk, and the App Sandbox (which the App Store requires) forbids that. Distribution is a notarized Developer ID DMG.
 
-**Releases are built locally and committed; there is no CI.** `scripts/release.sh` builds arm64 only. It writes `releases/Kil-arm64.dmg` and its `.sha256`, both tracked by git. Each release replaces the last, so the download link always gives the latest; the version is internal (Info.plist, commit messages):
+**Releases are built locally and committed; there is no CI.** `scripts/release.sh` builds arm64 only. It writes `releases/Kil-arm64.dmg` and its `.sha256`, both tracked by git. Each release replaces the last, so the download link always gives the latest; the version is internal (Info.plist, commit messages). README links the file directly (`github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg`), and the script stops before building if that link is missing:
 1. `bundle.sh release`, then `codesign --options runtime --timestamp --entitlements packaging/kil.entitlements` with the Developer ID identity, then `codesign --verify --strict`.
 2. The app is zipped, notarized and stapled first, so a copy dragged out of the DMG carries its own ticket and opens offline.
 3. A DMG of the stapled app plus an `Applications` link is created, signed, notarized and stapled.

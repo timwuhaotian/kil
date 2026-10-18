@@ -37,12 +37,19 @@ notarize() {
   esac
 }
 
+dmg="releases/Kil-arm64.dmg"
+# README's download link must give this file, checked before the long build and notarization.
+link="https://github.com/timwuhaotian/kil/raw/main/$dmg"
+if ! grep -qF "($link)" README.md; then
+  echo "README.md must link the release as $link" >&2
+  exit 1
+fi
+
 app="$(sh scripts/bundle.sh release | tail -n 1)"
 # After the build: before it, `cargo pkgid` still reports the version in Cargo.lock, and a
 # bumped Cargo.toml only reaches the lock there. Read it late, or the last line reports the
 # version it replaces.
 version="$(cargo pkgid -p kil | sed 's/.*[#@]//')"
-dmg="releases/Kil-arm64.dmg"
 codesign --force --timestamp --options runtime \
   --entitlements packaging/kil.entitlements \
   --sign "$identity" "$app"
