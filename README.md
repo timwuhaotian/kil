@@ -1,4 +1,8 @@
-# Kil
+<p align="center">
+  <img src="docs/icon.png" width="128" height="128" alt="Kil app icon">
+</p>
+
+<h1 align="center">Kil</h1>
 
 [![CI](https://github.com/timwuhaotian/kil/actions/workflows/ci.yml/badge.svg)](https://github.com/timwuhaotian/kil/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -8,6 +12,10 @@ A native macOS terminal written in Rust. It has vertical tabs, animated split pa
 shortcuts you can rebind. Your jobs keep running after Kil quits or crashes: reopen it and
 every pane is back on its live process, with vim's unsaved buffer, the ssh connection and the
 half-finished build where you left them.
+
+<p align="center">
+  <img src="docs/screenshot.png" width="1000" alt="Kil: vertical tabs in the sidebar; a tab split into git log, vim and htop">
+</p>
 
 Kil is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (Metal
 rendering) and [`alacritty_terminal`](https://github.com/alacritty/alacritty) (VT parsing). It
