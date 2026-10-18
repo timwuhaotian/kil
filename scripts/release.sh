@@ -16,9 +16,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 identity="${KIL_SIGN_IDENTITY:-Developer ID Application}"
-version="$(cargo pkgid -p kil | sed 's/.*[#@]//')"
 work="target/release/dist"
-dmg="releases/Kil-$version-arm64.dmg"
 
 # Submits $1 and waits; fails unless Apple accepts it.
 notarize() {
@@ -39,6 +37,11 @@ notarize() {
 }
 
 app="$(sh scripts/bundle.sh release | tail -n 1)"
+# After the build: before it, `cargo pkgid` still reports the version in Cargo.lock, and a
+# bumped Cargo.toml only reaches the lock there. Read it late, or the DMG is named for the
+# version it replaces.
+version="$(cargo pkgid -p kil | sed 's/.*[#@]//')"
+dmg="releases/Kil-$version-arm64.dmg"
 codesign --force --timestamp --options runtime \
   --entitlements packaging/kil.entitlements \
   --sign "$identity" "$app"
