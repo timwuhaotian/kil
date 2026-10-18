@@ -840,6 +840,14 @@ impl Workspace {
         }
     }
 
+    /// A divider was double-clicked: every pane in its tab gets an equal share again.
+    fn equalize(&mut self, tab: TabId, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            tab.tree.equalize(Instant::now());
+            cx.notify();
+        }
+    }
+
     fn set_ratio(&mut self, tab: TabId, split: SplitId, ratio: f32, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab) {
             tab.tree.set_ratio(split, ratio);
@@ -1484,12 +1492,19 @@ fn render_split(
         )
         .child(first)
         .child(second)
-        .child(divider(drag, horizontal, ratio, chrome))
+        .child(divider(drag, horizontal, ratio, chrome, cx))
         .into_any_element()
 }
 
 /// The 1px line plus a 7px grab area. Drawn last so the grab area sits above both panes.
-fn divider(drag: DividerDrag, horizontal: bool, ratio: f32, chrome: Chrome) -> impl IntoElement {
+/// Dragging it moves the divider; double-clicking it shares the tab equally again.
+fn divider(
+    drag: DividerDrag,
+    horizontal: bool,
+    ratio: f32,
+    chrome: Chrome,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     let handle = div()
         .id(ElementId::NamedInteger(
             "divider".into(),
@@ -1511,7 +1526,13 @@ fn divider(drag: DividerDrag, horizontal: bool, ratio: f32, chrome: Chrome) -> i
                     .cursor(CursorStyle::ResizeUpDown)
             }
         })
-        .on_drag(drag, |_, _, _, cx| cx.new(|_| EmptyDrag));
+        .debug_selector(|| "divider".to_owned())
+        .on_drag(drag, |_, _, _, cx| cx.new(|_| EmptyDrag))
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            if event.click_count() == 2 {
+                this.equalize(drag.tab, cx);
+            }
+        }));
     div()
         .absolute()
         .bg(chrome.divider)
@@ -2015,6 +2036,30 @@ mod tests {
             this.tabs[this.active].tree.set_ratio(id, 0.3);
         });
         cx.dispatch_action(ClosePane);
+        workspace.read_with(cx, |this, _| match this.tabs[this.active].tree.shape() {
+            crate::pane_tree::Shape::Split { ratio, .. } => {
+                assert!((ratio - 0.5).abs() < f32::EPSILON, "ratio {ratio}");
+            }
+            shape @ crate::pane_tree::Shape::Leaf(_) => panic!("{shape:?}"),
+        });
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_divider_should_share_the_tab_equally_again(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(SplitRight);
+        std::thread::sleep(motion::SPLIT + Duration::from_millis(20));
+        workspace.update(cx, |this, _| {
+            let id = match this.tabs[this.active].tree.root() {
+                Node::Split(split) => split.id,
+                Node::Leaf(_) => unreachable!(),
+            };
+            this.tabs[this.active].tree.set_ratio(id, 0.3);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let divider = cx.debug_bounds("divider").expect("divider drawn");
+        click(cx, divider.center(), MouseButton::Left, 2);
         workspace.read_with(cx, |this, _| match this.tabs[this.active].tree.shape() {
             crate::pane_tree::Shape::Split { ratio, .. } => {
                 assert!((ratio - 0.5).abs() < f32::EPSILON, "ratio {ratio}");

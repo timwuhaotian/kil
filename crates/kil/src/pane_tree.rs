@@ -235,6 +235,12 @@ impl<T: Clone + PartialEq> PaneTree<T> {
         removed
     }
 
+    /// Gives every pane an equal share of the tab: panes side by side share the width, and
+    /// panes stacked share the height (divider double-click; also after any pane change).
+    pub fn equalize(&mut self, now: Instant) {
+        equalize(&mut self.root, now);
+    }
+
     /// Sets a split's ratio directly (divider drag), clamped away from the edges.
     pub fn set_ratio(&mut self, id: SplitId, ratio: f32) {
         if let Some(split) = find_split_mut(&mut self.root, id) {
@@ -397,18 +403,38 @@ fn find_split_mut<T>(node: &mut Node<T>, id: SplitId) -> Option<&mut Split<T>> {
     find_split_mut(&mut split.second, id)
 }
 
-/// Sends every split to an even share of its axis, so a tab whose panes changed reads as a
-/// grid again. A closing split keeps running its animation to zero, and one already heading
-/// for half is left alone so its tween never restarts.
+/// Sends every split to its children's share of the panes along its axis, so `1 | 2 | 3`
+/// gets thirds however it was split. A closing split keeps running its animation to zero,
+/// and one already heading for its share is left alone so its tween never restarts.
 fn equalize<T>(node: &mut Node<T>, now: Instant) {
     let Node::Split(split) = node else { return };
-    if split.closing.is_none() && (split.ratio.target() - 0.5).abs() > EPS {
-        split
-            .ratio
-            .retarget(0.5, motion::SPLIT, Ease::OutQuint, now);
+    if split.closing.is_none() {
+        let first = panes_along(&split.first, split.axis);
+        let share = first / (first + panes_along(&split.second, split.axis));
+        if (split.ratio.target() - share).abs() > EPS {
+            split
+                .ratio
+                .retarget(share, motion::SPLIT, Ease::OutQuint, now);
+        }
     }
     equalize(&mut split.first, now);
     equalize(&mut split.second, now);
+}
+
+/// How many panes `node` lines up along `axis`: panes beside each other add up, and panes
+/// stacked across it count as their longest line. A closing pane counts for none.
+fn panes_along<T>(node: &Node<T>, axis: Axis) -> f32 {
+    let Node::Split(split) = node else { return 1. };
+    let (first, second) = (
+        panes_along(&split.first, axis),
+        panes_along(&split.second, axis),
+    );
+    match split.closing {
+        Some(Side::First) => second,
+        Some(Side::Second) => first,
+        None if split.axis == axis => first + second,
+        None => first.max(second),
+    }
 }
 
 fn collapse<T: Clone>(node: &mut Node<T>, now: Instant, removed: &mut Vec<T>) {
@@ -496,10 +522,14 @@ mod tests {
         out
     }
 
-    /// Every split in the tree shares its axis evenly.
-    fn assert_even(tree: &PaneTree<u32>) {
-        for (_, ratio) in ratios_of(tree) {
-            assert!((ratio - 0.5).abs() < f32::EPSILON, "ratio {ratio}");
+    fn assert_ratios(tree: &PaneTree<u32>, expected: &[f32]) {
+        let actual: Vec<f32> = ratios_of(tree)
+            .into_iter()
+            .map(|(_, ratio)| ratio)
+            .collect();
+        assert_eq!(actual.len(), expected.len(), "{actual:?}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
     }
 
@@ -509,14 +539,46 @@ mod tests {
     }
 
     #[test]
-    fn split_should_leave_every_split_even() {
+    fn split_should_give_every_pane_in_a_row_an_equal_share() {
+        let now = Instant::now();
+        let mut tree = PaneTree::new(1);
+        tree.split(&1, Axis::Horizontal, 2, now);
+        // Splitting the new pane, not the first: 1 | 2 | 3 still gets thirds.
+        tree.split(&2, Axis::Horizontal, 3, now);
+        assert_ratios(&tree, &[1. / 3., 0.5]);
+    }
+
+    #[test]
+    fn split_should_count_the_panes_across_a_stack() {
         let now = Instant::now();
         let mut tree = three_panes();
-        // The user dragged the top divider; a new pane puts it back to an even split.
+        // The user dragged the top divider; a new pane puts it back to equal shares.
         tree.set_ratio(SplitId(0), 0.3);
         tree.split(&3, Axis::Horizontal, 4, now);
-        assert_eq!(ratios_of(&tree).len(), 3);
-        assert_even(&tree);
+        // 1 | (2 over (3 | 4)): 1, 3 and 4 each get a third of the width; 2 spans two.
+        assert_ratios(&tree, &[1. / 3., 0.5, 0.5]);
+    }
+
+    #[test]
+    fn equalize_should_undo_dragged_dividers() {
+        let now = Instant::now();
+        let mut tree = three_panes();
+        tree.set_ratio(SplitId(0), 0.3);
+        tree.set_ratio(SplitId(1), 0.8);
+        tree.equalize(now);
+        assert_ratios(&tree, &[0.5, 0.5]);
+    }
+
+    #[test]
+    fn close_should_give_the_row_left_equal_shares() {
+        let now = Instant::now();
+        let mut tree = PaneTree::new(1);
+        tree.split(&1, Axis::Horizontal, 2, now);
+        tree.split(&2, Axis::Horizontal, 3, now);
+        tree.split(&3, Axis::Horizontal, 4, now);
+        tree.close(&4, now);
+        // 1 | (2 | (3 | closing 4)): the closing pane counts for none, so three thirds.
+        assert_ratios(&tree, &[1. / 3., 0.5, 1.]);
     }
 
     #[test]
