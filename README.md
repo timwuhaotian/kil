@@ -39,12 +39,12 @@ owns every process, PID and file descriptor it creates.
 
 ## Install
 
-Download [`releases/Kil-0.0.2-arm64.dmg`](releases/Kil-0.0.2-arm64.dmg), open it, and drag
+Download [`releases/Kil-arm64.dmg`](releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
-`releases/` also holds a `.sha256` for each DMG:
+`releases/` also holds its `.sha256`:
 
 ```sh
-shasum -a 256 -c Kil-0.0.2-arm64.dmg.sha256
+shasum -a 256 -c Kil-arm64.dmg.sha256
 ```
 
 ## Build from source
@@ -78,7 +78,7 @@ Developer ID identity in the login keychain:
 ```sh
 KIL_NOTARY_KEY=~/.appstoreconnect/private_keys/AuthKey_XXXX.p8 \
 KIL_NOTARY_KEY_ID=XXXX KIL_NOTARY_ISSUER=<issuer-id> \
-  scripts/release.sh                 # → releases/Kil-<version>-arm64.dmg + .sha256
+  scripts/release.sh                 # → releases/Kil-arm64.dmg + .sha256
 ```
 
 The script signs with the hardened runtime, notarizes and staples the app, then the DMG. It

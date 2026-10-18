@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds Kil, signs it with Developer ID, notarizes and staples it, and packs it in a DMG under
 # releases/, which git tracks (DESIGN.md §11). Run locally; there is no CI.
-# Usage: scripts/release.sh   → releases/Kil-<version>-arm64.dmg (+ .sha256)
+# Usage: scripts/release.sh   → releases/Kil-arm64.dmg (+ .sha256), replacing the last release:
+# downloads are always the latest, and the version is only for us (Info.plist, git history).
 #
 # Signing: KIL_SIGN_IDENTITY, default "Developer ID Application" (the one such identity in the
 # login keychain).
@@ -38,10 +39,10 @@ notarize() {
 
 app="$(sh scripts/bundle.sh release | tail -n 1)"
 # After the build: before it, `cargo pkgid` still reports the version in Cargo.lock, and a
-# bumped Cargo.toml only reaches the lock there. Read it late, or the DMG is named for the
+# bumped Cargo.toml only reaches the lock there. Read it late, or the last line reports the
 # version it replaces.
 version="$(cargo pkgid -p kil | sed 's/.*[#@]//')"
-dmg="releases/Kil-$version-arm64.dmg"
+dmg="releases/Kil-arm64.dmg"
 codesign --force --timestamp --options runtime \
   --entitlements packaging/kil.entitlements \
   --sign "$identity" "$app"
@@ -57,7 +58,7 @@ xcrun stapler staple "$app"
 ditto "$app" "$work/dmg/Kil.app"
 ln -s /Applications "$work/dmg/Applications"
 rm -f "$dmg"
-hdiutil create -volname "Kil $version" -srcfolder "$work/dmg" -fs HFS+ -format UDZO "$dmg"
+hdiutil create -volname "Kil" -srcfolder "$work/dmg" -fs HFS+ -format UDZO "$dmg"
 codesign --force --timestamp --sign "$identity" "$dmg"
 notarize "$dmg"
 xcrun stapler staple "$dmg"
@@ -65,4 +66,4 @@ xcrun stapler staple "$dmg"
 spctl --assess --type execute --verbose=2 "$app"
 spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
 (cd releases && shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256")
-echo "$dmg"
+echo "$dmg ($version)"
