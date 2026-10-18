@@ -14,7 +14,7 @@ Build status:
 - **M2–M5 are implemented and lint/test-clean** (93 tests). They still need hands-on UI verification: the A9 checklist, IME, and animation smoothness.
 - **A14–A16** (row menu and rename, Settings window, double-click for a new tab) are implemented. Headless GPUI tests drive the clicks, input and keys. They still need a hands-on pass with a real IME.
 - **A17** (sidebar status marks: running, done, failed) is implemented, with the background-tab wakeup fix it needed (§4.3). F13/F14 (children that exit before they are watched) are fixed and covered by `self_exit.rs`. F15 (children inherited a blocked signal mask, so jobs outlived a crashed kil) is fixed and covered by `crash.rs` and `hygiene.rs`. The §6.4 numbers were re-measured after a profiling pass.
-- **A18** (restore tabs, splits and running jobs at the next launch) is implemented (§4.9). `workspace`, `restore` and `lifecycle` tests cover it, and a run of the real binary was checked by hand: a terminate (as at logout) saved a running job, and the next launch ran it again.
+- **A18** (reopen everything after any exit: quit, closed window, logout, crash) is implemented (§4.9). `workspace`, `restore`, `transcript`, `terminal` and `lifecycle` tests cover it. A run of the real binary was checked by hand: a `kill -9` and a terminate (as at logout) each reopened the screen and re-ran the job, and a crash during reopening skipped the re-run. No jobs were left behind.
 - A dev bundle is built with `scripts/bundle.sh`. The two-tone icon source is `packaging/icon.svg`.
 - Release signing and notarization (the rest of M6) is not done yet.
 
@@ -42,12 +42,12 @@ Build status:
 | A14 | Right-clicking a sidebar row opens a menu with **Rename Tab…**, **Reset Name** (shown only when the tab has a name) and **Close Tab**. Rename edits the title in place, and IME input works. Enter or a click elsewhere keeps the edit, and Escape cancels it. An empty name goes back to the pane's title. The name also becomes the window title. | `workspace` GPUI tests + manual Pinyin. |
 | A15 | **Kil ▸ Settings…** (`cmd-,`) opens a separate Settings window, or brings the open one forward. It edits font family and size, scrollback, Option as Meta and cursor blink. Each change is written to `config.toml` and applied to the open window at once. The Kil menu also has Services, Hide, Hide Others and Show All. | `settings_window` / `config` tests + manual. |
 | A16 | Double-clicking empty space in the sidebar opens a tab, the same as `cmd-t`. Double-clicking a row does not. | `workspace` GPUI tests. |
-| A18 | Quitting (`cmd-q`, or a logout or restart) saves the tabs, their names and order, the active tab, each tab's splits, ratios and focused pane, and each shell's cwd. The next launch reopens them, and a pane that had a foreground job types that job's command line into its new shell again. The quit sheet says so. Closing the window or its last tab saves nothing, so the next launch starts fresh. | `workspace` / `restore` / `lifecycle` tests + manual. |
 | A17 | A sidebar row shows a **ring** while any of its panes runs a foreground job, a **dot** when a job ended while the tab was not in view (a background tab, or the window inactive) until the tab is viewed, and a red **!** while a pane shows its exit banner. The marks are static: nothing animates while a job runs. | `workspace` GPUI tests + `take_dirty` test. |
+| A18 | However kil ended (`cmd-q`, the window's close button, a logout or restart, a crash or `kill -9`), the next launch reopens what was there: the window frame, the tabs with their names and order, the active tab, each tab's splits, ratios and focused pane, and in each pane the shell's cwd and its old screen and scrollback with colors. A pane that had a foreground job types that job's command line into its new shell again. While kil runs this is saved at most every 2 s, which bounds what a crash can lose. Closing the last tab leaves nothing to reopen. If kil dies within 10 s of reopening, the next launch reopens without re-running the jobs. | `workspace` / `restore` / `transcript` / `lifecycle` tests + manual. |
 
 ### Non-goals (v1)
 These are left out and can be added later:
-- Multiple windows. Restoring scrollback, or a running process itself: a job is started again, not resumed (§4.9).
+- Multiple windows. Keeping a running process itself across launches: a job is started again, not resumed (§4.9). That would need a session server outliving the app, which is the opposite of F15.
 - SSH and tmux control mode.
 - Ligatures, image protocols (sixel, kitty) and the kitty keyboard protocol.
 - OSC 133 shell integration, OSC 8 hyperlinks, URL click.
@@ -99,6 +99,7 @@ kil/
 │  │  ├─ src/reaper.rs        one thread: adopts closed children, escalates, reaps
 │  │  ├─ src/proc_info.rs     ProcIdentity, TtyId, foreground(), cwd()
 │  │  ├─ src/snapshot.rs      Frame / RenderCell (UI-agnostic render copy)
+│  │  ├─ src/transcript.rs    screen + scrollback as SGR bytes, and their replay
 │  │  ├─ src/error.rs         SpawnError, SessionError (thiserror)
 │  │  ├─ src/sys/darwin.rs    the ONLY module with `unsafe` (FFI), each block // SAFETY:
 │  │  └─ tests/               lifecycle, hygiene, hostile children, churn (§4.8)
@@ -106,7 +107,7 @@ kil/
 │     ├─ src/main.rs          anyhow at the edge only
 │     ├─ src/workspace.rs     window root: tabs, active tab, quit/close-confirm flow
 │     ├─ src/pane_tree.rs     PURE generic PaneTree<T> (no GPUI types) + unit tests
-│     ├─ src/restore.rs       session.toml: tabs, splits, jobs saved at quit, reopened at launch
+│     ├─ src/restore.rs       session.toml + panes/*.ansi: saved while running, reopened at launch
 │     ├─ src/terminal_pane.rs Entity owning a Session; event pump; title/cwd cache
 │     ├─ src/terminal_element.rs  gpui::Element: snapshot → quads + glyph runs
 │     ├─ src/sidebar.rs       vertical tab list
@@ -240,7 +241,7 @@ reaper (one thread, kqueue): NOTE_EXIT ─► try_wait ─► done
 
 - **Natural exit.** NOTE_EXIT fires, the PTY thread reaps and sends `ChildExit(status)`. Status 0 closes the pane with an animation. Anything else shows the banner from A5. This also stops a broken `.zshrc` from creating a crash loop.
 - **Quit (`cmd-q`).** If any session is busy, a confirm sheet lists the processes (for example "vim, cargo"). Then every session closes as in §4.5 and `reaper.shutdown(1s)` runs. Survivors get SIGKILL, are reaped, and the app exits.
-- **Crash or abort.** The kernel closes every master, which hangs up every session (F4). Shells exit and launchd reaps them. Because the children start with an empty signal mask (F15), the hangup's SIGHUP reaches them. `crash.rs` aborts an owner and checks this. Release builds use `panic = "abort"`: a half-alive pane is worse than a clean crash, and the kernel is the safety net.
+- **Crash or abort.** The kernel closes every master, which hangs up every session (F4). The next launch reopens the state saved up to 2 s earlier (§4.9). Shells exit and launchd reaps them. Because the children start with an empty signal mask (F15), the hangup's SIGHUP reaches them. `crash.rs` aborts an owner and checks this. Release builds use `panic = "abort"`: a half-alive pane is worse than a clean crash, and the kernel is the safety net.
 - **Info.plist.** `NSSupportsSuddenTermination = false` and `NSSupportsAutomaticTermination = false`, so macOS never skips this flow. `NSAppSleepDisabled = true`: if App Nap throttles the PTY reader, child builds block on a full PTY. Verify the App Nap behavior in M6.
 
 ### 4.7 Close confirmation
@@ -266,12 +267,26 @@ sheet lists the foreground process names. Idle shells close without asking.
 | `no_signal_handlers_installed` | `sigaction(SIGCHLD)` is still `SIG_DFL` after N sessions. |
 | `sessions_that_exit_at_startup_should_be_reaped_and_keep_status_and_output` | 64 concurrent sessions that exit at once, none of them closed: each reports its exact status and its last output, and no child is left unreaped (F13). Red before the fix. |
 
-### 4.9 Restore at the next launch (`restore.rs`)
+### 4.9 Restore at the next launch (`restore.rs`, `kil-term/src/transcript.rs`)
 
-- **What is saved.** The tabs in order with their names, the active tab, each tab's split tree (axis, target ratio, focused pane; closing panes are left out), and for each pane the shell's own cwd plus the foreground job's arguments. The arguments come from `KERN_PROCARGS2` for the foreground group's leader, verified like `foreground()` (§4.3). They are quoted into one command line. Only the running job is captured: in `make && ./run` or `cat log | grep x`, it is the part that was running. A job owned by another user (`sudo`) can't be read, so only its cwd is saved.
-- **When.** `Quit` saves just before `shutdown_all`, while the jobs still run. GPUI's app-quit hook saves too, because a logout or restart terminates the app without our Quit flow. `shutdown_all` marks the window ended, so closing the window or its last tab saves nothing.
-- **Where.** `~/Library/Application Support/kil/session.toml`, written whole and then renamed. Launch reads it and removes it, so a crash later never replays an old session. A file that doesn't parse becomes a notice, and the launch starts fresh.
-- **Re-running.** Each pane starts a normal login shell in its cwd. Its job is typed into the shell when the line editor first waits: zsh, bash 5.1+ and fish turn on bracketed paste at that moment. The line is sent as a bracketed paste plus Enter, so its characters can't trigger completion or other widgets. A shell that never turns on bracketed paste gets the line as plain typeahead after 3 s. Anything the user types first cancels the re-run. A job still waiting to run is saved as is, so a quick quit doesn't lose it.
+- **What is saved.**
+  - The window frame and state (windowed, maximized, full screen). A frame that no longer meets any display is dropped.
+  - The tabs in order with their names, and the active tab.
+  - Each tab's split tree: axis, target ratio and focused pane. Closing panes are left out.
+  - For each pane, a stable id, the shell's own cwd and the foreground job's arguments. The arguments come from `KERN_PROCARGS2` for the foreground group's leader, verified like `foreground()` (§4.3), and are quoted into one command line. Only the running job is captured: in `make && ./run` or `cat log | grep x`, it is the part that was running. A job owned by another user (`sudo`) can't be read, so only its cwd is saved.
+  - Each pane's screen, in `panes/<id>.ansi`: the primary screen's scrollback up to the cursor line, as text with SGR attributes. Wrapped lines stay joined, so they re-wrap at any width. While a full-screen program has the alternate screen, the primary screen can't change, so the last file stands (alacritty only exposes it by swapping screens, which resets the alternate one). Rendering 10,000 lines × 200 columns takes ~4.5 ms in release, under the terminal lock, off the UI thread.
+- **When.**
+  - While kil runs, a change (layout, title, cwd or job, window frame, or new output) schedules a save `SAVE_INTERVAL` (2 s) later, at most one at a time. So a crash loses at most ~2 s, and an idle kil never wakes for it.
+  - The state is taken on the UI thread and written on a background thread. Saves are numbered, and an older one never overwrites a newer `session.toml`. Screens are rendered at write time from the live terminals, so a late write is never older.
+  - `Quit`, the window's close button and GPUI's app-quit hook (a logout or restart terminates the app without our Quit flow) save synchronously, just before `shutdown_all`, while the jobs still run. `shutdown_all` marks the window ended, and nothing is saved after that.
+  - Closing the last tab clears the store, so the next launch starts fresh.
+- **Where.** `~/Library/Application Support/kil/`: `session.toml` and `panes/`. Every file is written whole and then renamed. Screens of panes that are gone are removed after each save. Pane ids from the file are checked to be `[A-Za-z0-9-]` before they name a file.
+- **Crash loop.** Reopening writes a `restoring` marker, removed 10 s later or at a clean exit. If the marker is still there at launch, the last launch died while reopening, perhaps because of a re-run job. The tabs and screens then reopen, but the jobs don't run, and a notice says so.
+- **Re-running.**
+  - Each pane starts a normal login shell in its cwd, with the old screen painted into the terminal before the PTY thread starts.
+  - Its job is typed into the shell when the line editor first waits: zsh, bash 5.1+ and fish turn on bracketed paste at that moment. The line is sent as a bracketed paste plus Enter, so its characters can't trigger completion or other widgets.
+  - A shell that never turns on bracketed paste gets the line as plain typeahead after 3 s.
+  - Anything the user types first cancels the re-run. A job still waiting to run is saved as is.
 
 ---
 

@@ -19,6 +19,7 @@ use crate::{
     pty::Pty,
     snapshot::{Frame, Palette, Rgba},
     spawn::{self, Spawned},
+    transcript::{self, Transcript},
 };
 
 /// Grid size in cells plus one cell's pixel size (reported to programs via `TIOCSWINSZ`).
@@ -97,6 +98,9 @@ pub struct SessionConfig {
     pub scrollback_lines: usize,
     /// Extra environment, applied last.
     pub env: Vec<(OsString, OsString)>,
+    /// Painted into the terminal before the program starts, e.g. a [`Transcript`] of an
+    /// earlier launch.
+    pub replay: Vec<u8>,
 }
 
 impl SessionConfig {
@@ -109,6 +113,7 @@ impl SessionConfig {
             size,
             scrollback_lines: 10_000,
             env: Vec::new(),
+            replay: Vec::new(),
         }
     }
 }
@@ -221,11 +226,10 @@ impl Session {
             kitty_keyboard: false,
             ..TermConfig::default()
         };
-        let term = Arc::new(FairMutex::new(Term::new(
-            term_config,
-            &size,
-            events.clone(),
-        )));
+        let mut term = Term::new(term_config, &size, events.clone());
+        // Before the PTY thread starts, so the program's first output lands after it.
+        transcript::replay(&mut term, &config.replay);
+        let term = Arc::new(FairMutex::new(term));
         let pty = Pty::new(master, child, events.clone());
         let event_loop = EventLoop::new(Arc::clone(&term), events.clone(), pty, true, false)
             .map_err(SpawnError::EventLoop)?;
@@ -373,6 +377,12 @@ impl Session {
     #[must_use]
     pub fn foreground(&self) -> Option<ForegroundProcess> {
         proc_info::foreground(self.shell?, self.tty)
+    }
+
+    /// The terminal's content, to save for a later launch.
+    #[must_use]
+    pub fn transcript(&self) -> Transcript {
+        Transcript::new(Arc::clone(&self.term))
     }
 
     /// Working directory of the shell itself, even while its job runs elsewhere.

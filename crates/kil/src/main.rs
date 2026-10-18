@@ -112,7 +112,16 @@ fn main() {
     env_logger::init();
     Application::new().run(|cx: &mut App| {
         cx.set_global(Theme::dark());
-        let notices = config::apply(cx);
+        let mut notices = config::apply(cx);
+        let store = restore::Store::standard();
+        let restored = match store.as_ref().map(restore::Store::load) {
+            Some(Ok(restored)) => restored,
+            Some(Err(err)) => {
+                notices.push(err.into());
+                None
+            }
+            None => None,
+        };
         cx.set_menus(menus());
         register_app_actions(cx);
         // Settings alone doesn't keep the app alive.
@@ -127,9 +136,19 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
+        let displays: Vec<_> = cx
+            .displays()
+            .iter()
+            .map(|display| display.bounds())
+            .collect();
+        let bounds = restored
+            .as_ref()
+            .and_then(|restored| restored.saved.window?.on_screen(&displays))
+            .unwrap_or_else(|| {
+                WindowBounds::Windowed(Bounds::centered(None, size(px(1100.), px(700.)), cx))
+            });
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(bounds),
             titlebar: Some(TitlebarOptions {
                 title: Some("Kil".into()),
                 appears_transparent: true,
@@ -140,7 +159,7 @@ fn main() {
             ..Default::default()
         };
         if let Err(err) = cx.open_window(options, |window, cx| {
-            cx.new(|cx| Workspace::new(notices, restore::Store::standard(), window, cx))
+            cx.new(|cx| Workspace::new(notices, store, restored, window, cx))
         }) {
             log::error!("failed to open window: {err:#}");
             cx.quit();

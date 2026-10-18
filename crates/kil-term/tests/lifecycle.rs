@@ -11,6 +11,7 @@ use kil_term::{Pid, SessionEvent, diagnostics};
 fn drop_should_not_block_when_child_ignores_sighup() {
     let probe = start(&sh("trap '' HUP; exec /bin/sleep 600"));
     assert!(wait_for_foreground(&probe.session, "sleep"));
+    let pid = probe.session.pid();
     let started = Instant::now();
     drop(probe.session);
     assert!(
@@ -18,6 +19,11 @@ fn drop_should_not_block_when_child_ignores_sighup() {
         "drop took {:?}",
         started.elapsed()
     );
+    // Outlive the reaper's deadline: exiting first would leave the child running for good.
+    // (`expedite_reaping` would also cut short the grace another test measures.)
+    assert!(wait_until(Duration::from_secs(6), || !diagnostics::exists(
+        pid
+    )));
 }
 
 #[test]

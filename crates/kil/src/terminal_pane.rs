@@ -16,7 +16,8 @@ use gpui::{
     Window, actions, div, point, prelude::*,
 };
 use kil_term::{
-    Frame, GridSize, Palette, SelectionKind, Session, SessionConfig, SessionEvent, ViewportCell,
+    Frame, GridSize, Palette, SelectionKind, Session, SessionConfig, SessionEvent, Transcript,
+    ViewportCell,
 };
 
 use crate::{
@@ -47,6 +48,20 @@ pub enum PaneEvent {
     Focused,
     /// The pane should be removed (clean exit, or the user dismissed the exit banner).
     Closed,
+    /// The screen changed since it was last taken for saving ([`TerminalPane::take_screen`]).
+    Output,
+}
+
+/// How a pane starts: fresh, or reopening one from an earlier launch (DESIGN.md §4.9).
+#[derive(Default)]
+pub struct Launch {
+    /// Names the pane's saved screen; kept across launches.
+    pub id: String,
+    pub cwd: Option<PathBuf>,
+    /// A job to type into the shell once it is ready.
+    pub rerun: Option<String>,
+    /// The saved screen, painted before the shell starts.
+    pub replay: Vec<u8>,
 }
 
 /// What the sidebar shows for a pane.
@@ -103,10 +118,13 @@ pub struct TerminalPane {
     /// While the tab's layout animates, keep the grid: one resize when it settles, not one
     /// per frame (DESIGN.md §6.3).
     frozen: bool,
+    id: String,
     /// Where the shell was asked to start.
     start_dir: Option<PathBuf>,
     /// A job from the last launch, typed into the shell once it is ready (DESIGN.md §4.9).
     rerun: Option<String>,
+    /// Output arrived since the screen was last taken for saving.
+    screen_changed: bool,
     _tasks: Vec<Task<()>>,
 }
 
@@ -119,7 +137,13 @@ impl Focusable for TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(cwd: Option<PathBuf>, rerun: Option<String>, cx: &mut Context<Self>) -> Self {
+    pub fn new(launch: Launch, cx: &mut Context<Self>) -> Self {
+        let Launch {
+            id,
+            cwd,
+            rerun,
+            replay,
+        } = launch;
         let settings = cx.global::<Settings>();
         let mut config = SessionConfig::new(GridSize {
             rows: 24,
@@ -129,6 +153,7 @@ impl TerminalPane {
         });
         config.cwd.clone_from(&cwd);
         config.scrollback_lines = settings.scrollback_lines;
+        config.replay = replay;
 
         let (tx, rx) = mpsc::unbounded();
         // fork+exec of a large GUI process takes milliseconds: keep it off the UI thread.
@@ -166,8 +191,10 @@ impl TerminalPane {
             },
             info_refresh: None,
             frozen: false,
+            id,
             start_dir: cwd,
             rerun,
+            screen_changed: false,
             _tasks: tasks,
         }
     }
@@ -221,8 +248,23 @@ impl TerminalPane {
                 .and_then(|args| restore::command_line(&args))
         });
         SavedPane {
+            id: self.id.clone(),
             cwd: cwd.and_then(|dir| dir.into_os_string().into_string().ok()),
             command,
+        }
+    }
+
+    /// The screen to save, if it changed since last taken.
+    pub fn take_screen(&mut self) -> Option<(String, Transcript)> {
+        let session = self.session.as_ref().filter(|_| self.screen_changed)?;
+        self.screen_changed = false;
+        Some((self.id.clone(), session.transcript()))
+    }
+
+    fn mark_screen_changed(&mut self, cx: &mut Context<Self>) {
+        if !self.screen_changed {
+            self.screen_changed = true;
+            cx.emit(PaneEvent::Output);
         }
     }
 
@@ -335,6 +377,7 @@ impl TerminalPane {
         for event in batch.drain(..) {
             match event {
                 SessionEvent::Wakeup => {
+                    self.mark_screen_changed(cx);
                     self.rerun(false);
                     self.schedule_info_refresh(cx);
                     cx.notify();
@@ -503,6 +546,7 @@ impl TerminalPane {
     fn clear_scrollback(&mut self, _: &ClearScrollback, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = &self.session {
             session.clear_history();
+            self.mark_screen_changed(cx);
             cx.notify();
         }
     }

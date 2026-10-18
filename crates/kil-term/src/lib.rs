@@ -16,6 +16,7 @@ mod session;
 mod snapshot;
 mod spawn;
 mod sys;
+mod transcript;
 
 pub use child::{live_children, wait_for_children};
 pub use error::SpawnError;
@@ -26,6 +27,7 @@ pub use session::{
     GridSize, InputMode, MemoryUsage, Program, SelectionKind, Session, SessionConfig, ViewportCell,
 };
 pub use snapshot::{CellFlags, CursorShape, CursorSnapshot, Frame, Palette, RenderCell, Rgba};
+pub use transcript::Transcript;
 
 /// Self-inspection of the current process, for tests and the memory HUD.
 pub mod diagnostics {

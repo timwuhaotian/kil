@@ -99,3 +99,27 @@ fn take_dirty_should_rearm_wakeups_for_a_session_nobody_draws() {
     probe.session.write(b"\n".as_slice());
     assert!(wakeup(&probe));
 }
+
+#[test]
+fn replay_should_paint_before_the_program_output() {
+    let mut config = sh("printf NEW; exec /bin/sleep 600");
+    config.replay = b"\x1b[31mOLD\x1b[0m\r\n".to_vec();
+    let probe = start(&config);
+    assert!(wait_for_text(&probe.session, "NEW"));
+    let text = screen(&probe.session);
+    assert!(text.find("OLD") < text.find("NEW"), "{text}");
+}
+
+#[test]
+fn transcript_should_replay_into_a_new_session_as_it_was() {
+    let probe = start(&sh(
+        "printf 'one \\033[1;32mgreen\\033[0m\\n中文 two\\n'; exec /bin/sleep 600",
+    ));
+    assert!(wait_for_text(&probe.session, "中文 two"));
+    let mut config = sh("exec /bin/sleep 600");
+    config.replay = probe.session.transcript().render().unwrap();
+    let copy = start(&config);
+    assert!(wait_for_text(&copy.session, "中文 two"));
+    let text = screen(&copy.session);
+    assert!(text.starts_with("one green\n中文 two"), "{text}");
+}
