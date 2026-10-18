@@ -1,0 +1,29 @@
+# kil's zsh integration: kil starts zsh with ZDOTDIR pointing here (see shell.rs).
+# Puts the user's ZDOTDIR back and reads their .zshenv, so zsh goes on to their other startup
+# files as usual. An interactive shell then keeps the command line it runs in jobs/<its PID>,
+# emptied at each prompt: kil reads it to type the line again at its next launch, since a
+# program that sets its title (e.g. Node's process.title) overwrites its own arguments.
+builtin typeset -g _kil_job=$ZDOTDIR/jobs/$$
+if [[ -n ${KIL_ZDOTDIR+x} ]]; then
+  builtin export ZDOTDIR=$KIL_ZDOTDIR
+  builtin unset KIL_ZDOTDIR
+else
+  builtin unset ZDOTDIR
+fi
+{
+  builtin typeset _kil_file=${ZDOTDIR-$HOME}/.zshenv
+  [[ ! -r $_kil_file ]] || builtin source -- $_kil_file
+} always {
+  builtin unset _kil_file
+  if [[ -o interactive ]]; then
+    builtin autoload -Uz add-zsh-hook
+    _kil_preexec() { builtin print -rn -- "${1:-$3}" 2>/dev/null >| $_kil_job }
+    _kil_precmd() { : 2>/dev/null >| $_kil_job }
+    _kil_zshexit() { command rm -f -- $_kil_job }
+    add-zsh-hook preexec _kil_preexec
+    add-zsh-hook precmd _kil_precmd
+    add-zsh-hook zshexit _kil_zshexit
+  else
+    builtin unset _kil_job
+  fi
+}

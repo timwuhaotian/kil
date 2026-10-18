@@ -17,7 +17,7 @@ use crate::{
     proc_info::TtyId,
     pty::winsize,
     session::{Program, SessionConfig},
-    sys,
+    shell, sys,
 };
 
 /// Extra descriptor numbers swept above the highest one open at spawn time, covering
@@ -25,8 +25,10 @@ use crate::{
 const FD_SWEEP_SLACK: RawFd = 64;
 const FD_SWEEP_FALLBACK: RawFd = 4096;
 
-/// Variables other terminals and multiplexers set that would mislead programs in kil.
+/// Variables other terminals, multiplexers or an outer kil set that would mislead programs
+/// in kil.
 const FOREIGN_VARS: &[&str] = &[
+    shell::USER_ZDOTDIR_VAR,
     "TERM_SESSION_ID",
     "TMUX",
     "TMUX_PANE",
@@ -63,6 +65,9 @@ pub(crate) fn spawn(config: &SessionConfig) -> Result<Spawned, SpawnError> {
     let (program, mut command) = command_for(&config.program)?;
     command.current_dir(working_directory(config.cwd.as_deref()));
     apply_env(&mut command, &config.env);
+    if config.program == Program::LoginShell && program.file_name() == Some(OsStr::new("zsh")) {
+        shell::integrate_zsh(&mut command, &config.env);
+    }
     let stdin = slave.try_clone().map_err(SpawnError::OpenPty)?;
     let stdout = slave.try_clone().map_err(SpawnError::OpenPty)?;
     command

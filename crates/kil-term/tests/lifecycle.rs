@@ -5,7 +5,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{sh, start, wait_for_foreground, wait_for_text, wait_until, zsh};
-use kil_term::{Pid, SessionEvent, diagnostics};
+use kil_term::{Pid, SessionConfig, SessionEvent, diagnostics};
 
 #[test]
 fn drop_should_not_block_when_child_ignores_sighup() {
@@ -180,13 +180,13 @@ fn output_should_appear_in_snapshot_with_wide_chars_aligned() {
 }
 
 #[test]
-fn job_args_should_report_the_foreground_command_line() {
+fn job_should_report_the_foreground_arguments() {
     let probe = start(&zsh());
     assert!(wait_until(Duration::from_secs(5), || probe
         .session
         .foreground()
         .is_some_and(|fg| fg.is_shell)));
-    assert_eq!(probe.session.job_args(), None);
+    assert_eq!(probe.session.job(), None);
     // `; :` keeps sh from exec-ing into sleep, which would replace the arguments.
     probe
         .session
@@ -194,10 +194,35 @@ fn job_args_should_report_the_foreground_command_line() {
     // macOS /bin/sh re-execs a real shell, so its name varies; its arguments don't.
     assert!(wait_until(Duration::from_secs(5), || probe
         .session
-        .job_args()
-        .is_some_and(|args| args.len() == 5)));
-    let args = probe.session.job_args().unwrap();
-    assert_eq!(args[1..], ["-c", "/bin/sleep 600; :", "a b", ""]);
+        .job()
+        .is_some_and(|job| job.args.len() == 5)));
+    let job = probe.session.job().unwrap();
+    assert_eq!(job.args[1..], ["-c", "/bin/sleep 600; :", "a b", ""]);
+    // `zsh -f` skips kil's integration, so no command line was reported.
+    assert_eq!(job.command_line, None);
+}
+
+#[test]
+fn job_should_report_the_line_a_login_zsh_ran_whatever_the_arguments_say() {
+    let home = std::env::temp_dir().join(format!("kil-zsh-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    // The user's own startup files still run: the alias comes from their .zshrc.
+    std::fs::write(home.join(".zshrc"), "alias nap='/bin/sleep'\n").unwrap();
+    // The login shell is this process's $SHELL: the test proves something only when it is zsh.
+    let mut config = SessionConfig::new(common::SIZE);
+    config.env = vec![("HOME".into(), home.clone().into())];
+    let probe = start(&config);
+    assert!(wait_until(Duration::from_secs(5), || probe
+        .session
+        .foreground()
+        .is_some_and(|fg| fg.is_shell)));
+    probe.session.write(b"nap  600\n".as_slice());
+    assert!(wait_for_foreground(&probe.session, "sleep"));
+    let job = probe.session.job().unwrap();
+    assert_eq!(job.args, ["/bin/sleep", "600"]);
+    assert_eq!(job.command_line.as_deref(), Some("nap  600"));
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]

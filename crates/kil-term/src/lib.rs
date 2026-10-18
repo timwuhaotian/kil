@@ -20,6 +20,7 @@ mod reaper;
 mod remote;
 pub mod server;
 mod session;
+mod shell;
 mod snapshot;
 mod spawn;
 mod state;
@@ -30,7 +31,7 @@ mod wire;
 pub use child::{live_children, wait_for_children};
 pub use error::SpawnError;
 pub use events::SessionEvent;
-pub use proc_info::{ForegroundProcess, Pid, ProcIdentity, TtyId};
+pub use proc_info::{ForegroundProcess, Job, Pid, ProcIdentity, TtyId};
 pub use reaper::expedite_reaping;
 pub use remote::Client;
 pub use session::{

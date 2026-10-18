@@ -17,7 +17,7 @@ use crate::{
     error::SpawnError,
     events::{EventProxy, Role, SessionEvent},
     pane_loop::{self, Channel, Command, LoopSender},
-    proc_info::{self, ForegroundProcess, Pid, ProcIdentity, TtyId},
+    proc_info::{self, ForegroundProcess, Job, Pid, ProcIdentity, TtyId},
     pty::Pty,
     remote::Remote,
     snapshot::{Frame, Palette},
@@ -473,11 +473,10 @@ impl Session {
         proc_info::shell_cwd(self.shell?)
     }
 
-    /// Arguments of the foreground job, `argv[0]` first, verified like [`Self::foreground`].
-    /// `None` while the shell is idle.
+    /// The foreground job, verified like [`Self::foreground`]. `None` while the shell is idle.
     #[must_use]
-    pub fn job_args(&self) -> Option<Vec<OsString>> {
-        proc_info::job_args(self.shell?, self.tty)
+    pub fn job(&self) -> Option<Job> {
+        proc_info::job(self.shell?, self.tty)
     }
 
     /// Whether a job other than the shell is in the foreground (closing should confirm).

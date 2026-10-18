@@ -261,9 +261,9 @@ impl TerminalPane {
             .and_then(Session::shell_cwd)
             .or_else(|| self.start_dir.clone());
         let command = self.rerun.clone().or_else(|| {
-            session
-                .and_then(Session::job_args)
-                .and_then(|args| restore::command_line(&args))
+            let job = session.and_then(Session::job)?;
+            job.command_line
+                .or_else(|| restore::command_line(&job.args))
         });
         SavedPane {
             id: self.id.clone(),

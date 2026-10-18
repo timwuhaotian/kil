@@ -1,6 +1,11 @@
 //! Process identity and foreground-job queries (DESIGN.md §4.3).
 
-use std::{ffi::OsString, num::NonZeroI32, path::PathBuf};
+use std::{
+    ffi::OsString,
+    num::NonZeroI32,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::sys;
 
@@ -74,6 +79,11 @@ impl ProcIdentity {
         }
     }
 
+    /// When the process started.
+    pub(crate) fn started(self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(self.start.sec) + Duration::from_micros(self.start.usec)
+    }
+
     pub(crate) fn start_parts(self) -> (u64, u64) {
         (self.start.sec, self.start.usec)
     }
@@ -137,11 +147,28 @@ pub(crate) fn foreground(shell: ProcIdentity, tty: TtyId) -> Option<ForegroundPr
     })
 }
 
-/// Arguments of the foreground job, `argv[0]` first. `None` while the shell itself is in the
-/// foreground, or when the job's arguments can't be read (another user's process, e.g. `sudo`).
-pub(crate) fn job_args(shell: ProcIdentity, tty: TtyId) -> Option<Vec<OsString>> {
-    let job = foreground(shell, tty).filter(|job| !job.is_shell)?;
-    sys::proc_args(job.pid.get())
+/// The job in the foreground of a session's terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Job {
+    /// Arguments of its leader, `argv[0]` first, as the leader's memory holds them now: a
+    /// program that set its title has overwritten them.
+    pub args: Vec<OsString>,
+    /// The command line the shell started it from, as typed, when the shell reported it.
+    pub command_line: Option<String>,
+}
+
+/// The foreground job. `None` while the shell itself is in the foreground, or when the job
+/// can't be read (another user's process, e.g. `sudo`).
+pub(crate) fn job(shell: ProcIdentity, tty: TtyId) -> Option<Job> {
+    let leader = foreground(shell, tty).filter(|job| !job.is_shell)?.pid;
+    let args = sys::proc_args(leader.get())?;
+    // The line is the shell's: a job's own children, e.g. a shell it runs, ran something else.
+    let started_by_shell =
+        sys::bsd_info(leader.get()).is_some_and(|info| info.ppid == shell.pid.get());
+    let command_line = started_by_shell
+        .then(|| crate::shell::command_line(shell))
+        .flatten();
+    Some(Job { args, command_line })
 }
 
 /// Working directory of the shell itself, wherever its foreground job runs.
