@@ -38,7 +38,7 @@ Build status:
 | A8 | `~/.config/kil/keymap.toml` overrides any default, including the split and close keys. Invalid entries appear in a banner with the key and the reason, and valid entries still apply. The file is reloaded when the window regains focus, and the menu bar is set again so its items show the keys now bound. **Settings ▸ Keyboard** lists every command: clicking its shortcut and pressing a chord binds that command and applies it at once, the old keys stop working, a key another command already has is refused by name, and **Reset** puts the default back. **Kil ▸ Keyboard Shortcuts…** opens the file in the default text editor, first writing a commented template that lists the commands. | Rebind the split keys, in the app and in the file; `keymap` / `config` tests. |
 | A9 | Terminal correctness: vim, htop, less, tmux, 256-color and truecolor, CJK wide characters aligned to the grid, **Chinese IME preedit at the cursor**, selection, copy, bracketed paste, trackpad scrollback. | Manual checklist. |
 | A10 | **Process hygiene.** Child fds are exactly 0, 1, 2 plus whatever the shell opens. Signal mask and ignore set are empty. Closing never blocks the UI thread. The session process is reaped within ≤ 3 s even if it ignores SIGHUP or is blocked writing. There are no zombies. | M1 integration tests (§4.8). |
-| A11 | **Memory.** Per-pane overhead without scrollback is ≤ 2 MB. Scrollback cost matches the formula in §5 within ±10%. A churn of 500 open/close cycles returns threads, fds, child count and live `TerminalPane` count to baseline. | Churn test plus `footprint`. |
+| A11 | **Memory.** Per-pane overhead without scrollback is ≤ 2 MB. Scrollback cost matches the formula in §5 within ±10%. A churn of 500 open/close cycles returns threads, fds, child count and live `TerminalPane` count to baseline. The sidebar shows what each tab's panes cost, and the footer warns when the system is under memory pressure. | Churn test plus `footprint`; `memory` tests in `kil-term`. |
 | A12 | **Performance.** Idle CPU is 0.0% with blink off and < 1% with blink on. Animations run at 120 fps with 4 panes streaming output (Metal HUD). Throughput is at least Terminal.app's on the same file. Keypress-to-photon is ≤ 1 frame after the PTY echo. | §6.4 |
 | A13 | Release build is signed with **Developer ID Application (team 43VLF3KTFZ)**, notarized and stapled, and `spctl -a -vv` accepts it. | §11 |
 | A14 | Right-clicking a sidebar row opens a menu with **Rename Tab…**, **Reset Name** (shown only when the tab has a name) and **Close Tab**. Rename edits the title in place, and IME input works. Enter or a click elsewhere keeps the edit, and Escape cancels it. An empty name goes back to the pane's title. The name also becomes the window title. | `workspace` GPUI tests + manual Pinyin. |
@@ -327,7 +327,8 @@ high-water mark** and making it visible.
 ### 5.2 Policy
 
 - `scrollback_lines = 10_000` by default (configurable). The documented per-pane maximum is `scrollback_lines × cols × 24 B`, which is about **32 MiB at 140 columns**.
-- **Ledger.** `kil-term` exposes `Session::memory()`, computed as `history_rows × cols × 24 + viewport + frame buffer`. That is O(1) and comes straight from `grid.history_size()`. A debug HUD action shows the per-pane and total figures, and the sidebar tooltip shows the per-tab figure.
+- **Ledger.** `kil-term` exposes `Session::memory()`: the grid (`history_rows × cols × 24 + viewport`, O(1), straight from `grid.history_size()`) and, in `process_bytes`, the resident memory of the session's program and everything it started (the shell's process tree, walked by parent link).
+- **What the panes cost, and what the system is doing.** The sidebar shows each tab's figure (its panes' grid plus their programs) next to the title, from 100 MB on, and the total for every tab in the footer. Under memory pressure the footer also shows how much swap is in use. The figures are read every 2 s. *Why:* the system charges a program's memory to the app that started it, so macOS's "out of memory" alert names Kil, not the agent that grew. The figures say which pane to close.
 - `cmd-k` clears scrollback. The memory is reused by later growth, as measured, and the docs say so.
 - OSC 52 is copy-only. Apps can't read your clipboard.
 
@@ -451,7 +452,7 @@ is unit-tested with `T = u32`.
 
 **Actions** (`actions!(kil, […])`): `NewTab`, `ClosePane`, `CloseTab`, `SplitRight`, `SplitDown`,
 `FocusLeft/Right/Up/Down`, `NextTab`, `PrevTab`, `SelectTab(n)`, `Copy`, `Paste`, `ClearScrollback`,
-`FontBigger`, `FontSmaller`, `FontReset`, `ToggleMemoryHud`, `OpenSettings`, `Hide`, `HideOthers`, `ShowAll`, `Quit`.
+`FontBigger`, `FontSmaller`, `FontReset`, `OpenSettings`, `Hide`, `HideOthers`, `ShowAll`, `Quit`.
 
 App-level commands (`open_settings`, `hide`, `hide_others`, `quit`) bind with no key context, so they work in the Settings window too. Global fallbacks in `main.rs` handle them there. For example, `quit` runs the terminal window's close confirmation.
 
@@ -652,7 +653,8 @@ Each milestone ends on a proof, not on a feature count.
 |---|---|---|
 | GPUI API churn | Exact pin `=0.2.2`. GPUI is used only in the `kil` crate. | Upgrade deliberately, one bump per PR. |
 | Fork latency of a large GUI process | Spawn on the spawner thread, with the animation masking it. | p95 spawn > 10 ms in the app → switch to `posix_spawn(SETSID\|CLOEXEC_DEFAULT\|SETSIGDEF\|SETSIGMASK)` plus a tiny `kil-exec` helper (TIOCSCTTY, then exec). posix_spawn measured 0.34 ms. |
-| Allocator retains freed scrollback | Line budget, ledger, HUD (§5). | Total scrollback > 1 GiB in real use → add a global cap that trims the least-recently-viewed panes' history. |
+| Allocator retains freed scrollback | Line budget, ledger, the sidebar's figures (§5). | Total scrollback > 1 GiB in real use → add a global cap that trims the least-recently-viewed panes' history. |
+| A program in a pane grows until the machine starves | The sidebar's per-tab figure and the system's own pressure (§5.2). | A pane's program regularly needs > 2 GB → offer to end it, or a per-pane cap. |
 | One thread per session | Documented cost. | Regularly > 100 panes → a shared kqueue I/O thread with a custom loop. |
 | `AnyView::cached` doesn't isolate panes | Count prepaints in M4. | Siblings re-prepaint → per-row shaped-line cache (§5.3). |
 | GPUI's display link runs whenever the window is visible | Measured floor: 0.35% idle CPU (§6.4). | Idle CPU matters more than the GPUI pin → patch GPUI to stop the link when no frame is requested, and restart it on `request_frame`. |

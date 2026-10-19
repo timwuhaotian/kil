@@ -451,6 +451,53 @@ pub(crate) fn child_pids(pid: i32) -> Vec<i32> {
     pids
 }
 
+/// Resident memory of `pid`, in bytes.
+pub(crate) fn rss(pid: i32) -> Option<u64> {
+    let info: libc::proc_taskinfo = proc_pidinfo(pid, libc::PROC_PIDTASKINFO)?;
+    Some(info.pti_resident_size)
+}
+
+/// How hard the system is pressed for memory: 1 normal, 2 warning, 4 critical.
+pub(crate) fn memory_pressure_level() -> Option<u32> {
+    let mut level: u32 = 0;
+    let mut size = size_of::<u32>();
+    // SAFETY: the kernel writes at most `size` bytes into `level`, and only `level` is
+    // written to.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&raw mut level).cast(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(level)
+}
+
+/// Swap in use and in all, in bytes.
+pub(crate) fn swap_usage() -> Option<(u64, u64)> {
+    let mut usage = MaybeUninit::<libc::xsw_usage>::uninit();
+    let mut size = size_of::<libc::xsw_usage>();
+    // SAFETY: the kernel writes at most `size` bytes into `usage`; it is read only after a
+    // successful call, which fills the whole struct.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"vm.swapusage".as_ptr(),
+            usage.as_mut_ptr().cast(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: a successful call wrote the whole struct.
+    let usage = unsafe { usage.assume_init() };
+    Some((usage.xsu_used, usage.xsu_total))
+}
+
 /// Number of threads in `pid`.
 pub(crate) fn thread_count(pid: i32) -> Option<u32> {
     let info: libc::proc_taskinfo = proc_pidinfo(pid, libc::PROC_PIDTASKINFO)?;

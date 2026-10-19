@@ -52,6 +52,10 @@ owns every process, PID and file descriptor it creates.
 - **Strict about processes.** Children get clean descriptors and signal masks. A closed pane is
   hung up, then killed after 3 s if it ignores the hangup. No zombies, no leaked jobs. It is
   covered by integration tests that run real processes.
+- **Shows what a pane costs.** The sidebar says how much memory the program in each tab takes,
+  with everything it started, and the total for every tab. macOS charges a program's memory to
+  the app that started it, so an agent that grows to gigabytes used to be invisible until the
+  system said Kil was at fault.
 
 ## Install
 

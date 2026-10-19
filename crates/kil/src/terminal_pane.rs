@@ -221,6 +221,17 @@ impl TerminalPane {
         &self.info
     }
 
+    /// What this pane costs the machine: its grid, and the program running in it.
+    ///
+    /// The program is the larger part: an agent with its own subprocesses dwarfs the
+    /// terminal's own scrollback (DESIGN.md §5.2).
+    pub fn memory(&self) -> u64 {
+        self.session.as_ref().map_or(0, |session| {
+            let usage = session.memory();
+            u64::try_from(usage.grid_bytes).unwrap_or(u64::MAX) + usage.process_bytes
+        })
+    }
+
     /// The program ended on its own with a failure (or never started): the banner is up.
     pub fn ended_badly(&self) -> bool {
         matches!(self.status, Status::Exited(_) | Status::Failed(_))

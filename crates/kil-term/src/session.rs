@@ -201,7 +201,7 @@ pub struct ViewportCell {
     pub right_half: bool,
 }
 
-/// Memory held by a session's grid (DESIGN.md §5.2).
+/// Memory a session holds: its grid, and the program running in it (DESIGN.md §5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryUsage {
     /// Lines of scrollback currently stored.
@@ -210,6 +210,8 @@ pub struct MemoryUsage {
     pub columns: usize,
     /// Bytes of cell storage: `(history + visible) × columns × size_of::<Cell>()`.
     pub grid_bytes: usize,
+    /// Resident memory of the session's program and everything it started.
+    pub process_bytes: u64,
 }
 
 /// A running terminal: a child on a PTY, parsed by alacritty's VT state machine.
@@ -454,9 +456,11 @@ impl Session {
             .filter(|text| !text.is_empty())
     }
 
-    /// Grid memory currently held.
+    /// Memory this session holds: its grid, and the program running in it.
     #[must_use]
     pub fn memory(&self) -> MemoryUsage {
+        // Before the lock: the process tree is walked in the kernel, not in the terminal.
+        let process_bytes = self.process_memory();
         let term = self.term.lock();
         let (history_lines, columns) = (term.history_size(), term.columns());
         let grid_bytes = (history_lines + term.screen_lines()) * columns * size_of::<Cell>();
@@ -464,7 +468,17 @@ impl Session {
             history_lines,
             columns,
             grid_bytes,
+            process_bytes,
         }
+    }
+
+    /// Resident memory of the session's program and everything it started, in bytes.
+    ///
+    /// This is what a program in the pane costs the machine: an agent with its own
+    /// subprocesses dwarfs the terminal's own grid (DESIGN.md §5.2).
+    #[must_use]
+    pub fn process_memory(&self) -> u64 {
+        self.shell.map_or(0, proc_info::subtree_rss)
     }
 
     /// The process in the foreground of this terminal, verified against PID reuse.

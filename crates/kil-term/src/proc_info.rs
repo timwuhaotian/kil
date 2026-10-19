@@ -1,6 +1,7 @@
 //! Process identity and foreground-job queries (DESIGN.md §4.3).
 
 use std::{
+    collections::HashSet,
     ffi::OsString,
     num::NonZeroI32,
     path::PathBuf,
@@ -171,6 +172,26 @@ pub(crate) fn job(shell: ProcIdentity, tty: TtyId) -> Option<Job> {
     Some(Job { args, command_line })
 }
 
+/// The resident memory of `shell` and every process below it, in bytes.
+///
+/// The tree is walked down the parent link, so a program that reparented itself to launchd
+/// is not counted: it is no longer the session's. A session's own shell is counted, so the
+/// figure is what closing the session would give back.
+pub(crate) fn subtree_rss(shell: ProcIdentity) -> u64 {
+    let mut total = 0;
+    let mut seen = HashSet::new();
+    let mut queue = vec![shell.pid.get()];
+    while let Some(pid) = queue.pop() {
+        // A PID can be listed twice if it was recycled while the tree was walked.
+        if !seen.insert(pid) {
+            continue;
+        }
+        total += sys::rss(pid).unwrap_or(0);
+        queue.extend(sys::child_pids(pid));
+    }
+    total
+}
+
 /// Working directory of the shell itself, wherever its foreground job runs.
 pub(crate) fn shell_cwd(shell: ProcIdentity) -> Option<PathBuf> {
     shell.info().filter(|info| !info.zombie)?;
@@ -209,5 +230,32 @@ mod tests {
         let identity = ProcIdentity::capture(pid);
         child.wait().unwrap();
         assert!(!identity.is_some_and(ProcIdentity::is_alive));
+    }
+
+    #[test]
+    fn subtree_rss_should_count_the_processes_below_the_shell() {
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & sleep 30; wait"])
+            .spawn()
+            .unwrap();
+        let pid = Pid::new(i32::try_from(shell.id()).unwrap()).unwrap();
+        let identity = ProcIdentity::capture(pid).unwrap();
+        // The children need a moment to be forked.
+        let mut tree = 0;
+        for _ in 0..50 {
+            tree = subtree_rss(identity);
+            if tree > sys::rss(pid.get()).unwrap_or(0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alone = sys::rss(pid.get()).unwrap_or(0);
+        assert!(tree > alone, "the children are not counted");
+        // Nothing may outlive the test.
+        for child in sys::child_pids(pid.get()) {
+            let _ = sys::kill(child, libc::SIGKILL);
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
     }
 }

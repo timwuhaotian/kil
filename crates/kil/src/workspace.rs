@@ -72,6 +72,12 @@ const STOPPED: &str = "will be stopped";
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 /// A crash within this long after reopening is blamed on the re-run jobs (DESIGN.md §4.9).
 const RESTORE_SETTLE: Duration = Duration::from_secs(10);
+/// How often the panes' memory is read, for the sidebar's figures (DESIGN.md §5.2).
+const MEMORY_INTERVAL: Duration = Duration::from_secs(2);
+/// A tab's figure is shown from this much on; below it, the row stays quiet.
+const SHOWN_MEMORY: u64 = 100 * 1024 * 1024;
+/// From this much on, the figure is shown as a warning.
+const HEAVY_MEMORY: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TabId(u64);
@@ -85,6 +91,32 @@ struct Tab {
     /// A job ended here while the tab was not in view; cleared when it is.
     finished: bool,
     animating: bool,
+    /// What this tab's panes cost the machine; read every [`MEMORY_INTERVAL`].
+    memory: u64,
+}
+
+/// What the panes cost, and how the system is doing (DESIGN.md §5.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryState {
+    /// Resident memory of every pane's program, plus their grids.
+    total: u64,
+    /// How hard the system is pressed for memory.
+    pressure: kil_term::system::Pressure,
+    /// Swap in use, in bytes.
+    swap_used: u64,
+    /// Swap in all, in bytes.
+    swap_total: u64,
+}
+
+impl MemoryState {
+    /// The footer's swap line, empty while the system is not under pressure.
+    fn swap_line(&self) -> String {
+        if self.pressure == kil_term::system::Pressure::Normal {
+            String::new()
+        } else {
+            ratio_label(self.swap_used, self.swap_total)
+        }
+    }
 }
 
 /// What a sidebar row's status mark shows, most urgent first.
@@ -253,6 +285,10 @@ pub struct Workspace {
     blink: Option<Task<()>>,
     /// The pane it last blinked, so a pane that loses focus is left with its cursor drawn.
     blinking: Option<WeakEntity<TerminalPane>>,
+    /// The timer that reads what the panes cost; see [`Self::refresh_memory`].
+    memory_task: Option<Task<()>>,
+    /// What the panes cost, and how the system is doing.
+    memory: MemoryState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -313,6 +349,8 @@ impl Workspace {
             base_font_size: f32::from(cx.global::<Settings>().font_size),
             blink: None,
             blinking: None,
+            memory_task: None,
+            memory: MemoryState::default(),
             _subscriptions: vec![activation, quitting, moved],
         };
         if let Some(store) = store.clone() {
@@ -342,6 +380,7 @@ impl Workspace {
             this.activate(0, window, cx);
         }
         this.sync_blink(window, cx);
+        this.start_memory_watch(cx);
         this
     }
 
@@ -419,6 +458,7 @@ impl Workspace {
                     .map(Into::into),
                 finished: false,
                 animating: false,
+                memory: 0,
             });
         }
         if held_back {
@@ -553,6 +593,7 @@ impl Workspace {
             name: None,
             finished: false,
             animating: false,
+            memory: 0,
         });
     }
 
@@ -1096,6 +1137,53 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Reads what every pane costs, and how the system is doing (DESIGN.md §5.2).
+    ///
+    /// A program in a pane can take gigabytes, and the system charges them to the app that
+    /// started it: the sidebar's figures are how the user finds the hog before macOS does.
+    fn refresh_memory(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        let mut total = 0;
+        for tab in &mut self.tabs {
+            let mut sum = 0;
+            for pane in tab.tree.leaves() {
+                sum += pane.read(cx).memory();
+            }
+            if sum != tab.memory {
+                tab.memory = sum;
+                changed = true;
+            }
+            total += sum;
+        }
+        let system = kil_term::system::memory();
+        let state = MemoryState {
+            total,
+            pressure: system.pressure,
+            swap_used: system.swap_used,
+            swap_total: system.swap_total,
+        };
+        if state.swap_line() != self.memory.swap_line() {
+            changed = true;
+        }
+        self.memory = state;
+        // Only redraw when a figure on screen changed: the window sleeps otherwise.
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Reads what the panes cost, every [`MEMORY_INTERVAL`].
+    fn start_memory_watch(&mut self, cx: &mut Context<Self>) {
+        self.memory_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(MEMORY_INTERVAL).await;
+                if this.update(cx, Workspace::refresh_memory).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
     // ── rendering ─────────────────────────────────────────────────────────────────────
 
     /// Collapses finished closes and freezes grids of tabs whose layout is animating.
@@ -1173,6 +1261,7 @@ impl Workspace {
                     }))
                     .children(rows),
             )
+            .child(memory_footer(self.memory, chrome))
             .child(
                 div()
                     .id("new-tab")
@@ -1267,26 +1356,10 @@ impl Workspace {
                     .gap(px(TITLE_INSET - STATUS_SLOT))
                     .child(status_mark(status, chrome))
                     .child(row_title(title, editing, active, chrome))
-                    .child(
-                        div()
-                            .id(ElementId::NamedInteger("tab-close".into(), id.0))
-                            .flex_none()
-                            .size(px(18.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .text_size(px(13.))
-                            .text_color(chrome.muted)
-                            .opacity(0.)
-                            .group_hover("tab-row", |style| style.opacity(1.))
-                            .hover(|style| style.bg(chrome.hover).text_color(chrome.text))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab_id(id, window, cx);
-                            }))
-                            .child("×"),
-                    ),
+                    .when(tab.memory >= SHOWN_MEMORY, |row| {
+                        row.child(memory_label(tab.memory, chrome))
+                    })
+                    .child(tab_close(id, chrome, cx)),
             )
             .child(
                 div()
@@ -1689,6 +1762,101 @@ fn reorderable(
     )
 }
 
+/// A tab's memory figure, in the row's title line.
+fn memory_label(memory: u64, chrome: Chrome) -> Div {
+    div()
+        .flex_none()
+        .text_size(px(11.))
+        .text_color(if memory >= HEAVY_MEMORY {
+            chrome.failure
+        } else {
+            chrome.muted
+        })
+        .child(byte_label(memory))
+}
+
+/// The × of a tab row, shown while the pointer is over it.
+fn tab_close(id: TabId, chrome: Chrome, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    div()
+        .id(ElementId::NamedInteger("tab-close".into(), id.0))
+        .flex_none()
+        .size(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .text_size(px(13.))
+        .text_color(chrome.muted)
+        .opacity(0.)
+        .group_hover("tab-row", |style| style.opacity(1.))
+        .hover(|style| style.bg(chrome.hover).text_color(chrome.text))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            this.close_tab_id(id, window, cx);
+        }))
+        .child("×")
+}
+
+/// A byte count as a short label: "1.2 GB", "340 MB", "8 KB".
+fn byte_label(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        let tenths = bytes.saturating_mul(10) / GB;
+        format!("{}.{} GB", tenths / 10, tenths % 10)
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else {
+        format!("{} KB", bytes / KB)
+    }
+}
+
+/// Two byte counts as "1.8/3.0 GB", the way a gauge reads.
+fn ratio_label(used: u64, total: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+    if total >= GB {
+        let (used, total) = (used.saturating_mul(10) / GB, total.saturating_mul(10) / GB);
+        format!(
+            "{}.{}/{}.{} GB",
+            used / 10,
+            used % 10,
+            total / 10,
+            total % 10
+        )
+    } else {
+        format!("{}/{} MB", used / MB, total / MB)
+    }
+}
+
+/// The sidebar's line about what the panes cost, and how the system is doing.
+///
+/// Nothing is shown while there is nothing to say: a quiet sidebar is the point.
+fn memory_footer(memory: MemoryState, chrome: Chrome) -> Div {
+    let mut row = div().mx_2().flex().gap_2().text_size(px(11.));
+    let mut shown = false;
+    if memory.total >= SHOWN_MEMORY {
+        row = row.child(
+            div()
+                .text_color(chrome.muted)
+                .child(format!("Tabs {}", byte_label(memory.total))),
+        );
+        shown = true;
+    }
+    if memory.pressure != kil_term::system::Pressure::Normal {
+        row = row.child(div().text_color(chrome.failure).child(format!(
+            "⚠ swap {}",
+            ratio_label(memory.swap_used, memory.swap_total)
+        )));
+        shown = true;
+    }
+    if shown {
+        row = row.mb_1();
+    }
+    row
+}
+
 /// Static on purpose: a spinner would redraw the window every frame for as long as a job
 /// (say, a dev server) runs, and idle CPU must stay at zero (DESIGN.md A12).
 fn status_mark(status: TabStatus, chrome: Chrome) -> Div {
@@ -1995,6 +2163,40 @@ mod tests {
         assert!(workspace.read_with(cx, |this, _| this.menu.is_some()));
         click(cx, ROW + point(px(20.), px(18.)), MouseButton::Left, 1);
         assert!(workspace.read_with(cx, |this, _| this.menu.is_none() && this.rename.is_some()));
+    }
+
+    #[gpui::test]
+    fn a_pane_should_report_what_it_costs(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        // The session starts in the test server; give it a moment to come up.
+        let mut memory = 0;
+        for _ in 0..50 {
+            cx.run_until_parked();
+            workspace.update(cx, Workspace::refresh_memory);
+            memory = workspace.read_with(cx, |this, _| this.tabs[0].memory);
+            if memory > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(memory > 0, "the pane's program is not counted");
+    }
+
+    #[test]
+    fn byte_label_should_scale_to_the_unit() {
+        assert_eq!(byte_label(0), "0 KB");
+        assert_eq!(byte_label(8 * 1024 * 1024), "8 MB");
+        assert_eq!(byte_label(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+    }
+
+    #[test]
+    fn ratio_label_should_read_as_a_gauge() {
+        let gb = 1024 * 1024 * 1024;
+        assert_eq!(ratio_label(3 * gb / 2, 3 * gb), "1.5/3.0 GB");
+        assert_eq!(
+            ratio_label(64 * 1024 * 1024, 128 * 1024 * 1024),
+            "64/128 MB"
+        );
     }
 
     #[gpui::test]

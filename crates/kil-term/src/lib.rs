@@ -40,7 +40,49 @@ pub use session::{
 pub use snapshot::{CellFlags, CursorShape, CursorSnapshot, Frame, Palette, RenderCell, Rgba};
 pub use transcript::Transcript;
 
-/// Self-inspection of the current process, for tests and the memory HUD.
+/// What the system itself is doing with memory (DESIGN.md §5.2).
+pub mod system {
+    /// How hard the system is pressed for memory.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Pressure {
+        /// Nothing to worry about.
+        #[default]
+        Normal,
+        /// The system is swapping; memory is tight.
+        Warning,
+        /// The system is out of memory; processes may be killed.
+        Critical,
+    }
+
+    /// The system's memory state.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Memory {
+        /// How hard the system is pressed.
+        pub pressure: Pressure,
+        /// Swap in use, in bytes.
+        pub swap_used: u64,
+        /// Swap in all, in bytes.
+        pub swap_total: u64,
+    }
+
+    /// The system's memory state, read fresh.
+    #[must_use]
+    pub fn memory() -> Memory {
+        let level = crate::sys::memory_pressure_level().unwrap_or(1);
+        let (swap_used, swap_total) = crate::sys::swap_usage().unwrap_or((0, 0));
+        Memory {
+            pressure: match level {
+                2 => Pressure::Warning,
+                4 => Pressure::Critical,
+                _ => Pressure::Normal,
+            },
+            swap_used,
+            swap_total,
+        }
+    }
+}
+
+/// Self-inspection of the current process, for tests.
 pub mod diagnostics {
     use std::{ffi::c_int, io, os::fd::RawFd};
 

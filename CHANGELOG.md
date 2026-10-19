@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- The sidebar says what each tab's panes cost: the memory of the program running in it and
+  everything that program started, next to the tab's title, and the total for every tab at
+  the bottom. Under memory pressure the bottom line also shows how much swap is in use. A
+  program that grows to gigabytes — an agent with its own subprocesses — used to be invisible
+  until macOS named Kil as the app at fault.
+
 ## 0.0.6 — 2026-10-19
 
 - **Kil updates itself.** It checks at launch and every six hours, downloads a new release in
