@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Settings ▸ Theme ▸ Sidebar opacity** (`sidebar_opacity` in `config.toml`, 0–1) sets how
+  much of the blurred desktop shows through the sidebar; **Reset** goes back to the theme's.
 - The wheel sends mouse wheel events to programs that ask for mouse reporting, as Claude
   Code's full-screen view does, instead of arrow keys that barely scrolled it.
 

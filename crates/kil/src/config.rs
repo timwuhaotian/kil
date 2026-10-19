@@ -86,9 +86,24 @@ pub fn write_setting(key: &str, value: &toml::Value) -> Result<Settings, String>
     write_setting_at(&path, key, value).map_err(|err| format!("config.toml: {err}"))
 }
 
+/// Removes `key` from `config.toml`, so its default applies again, and returns what the file
+/// now holds.
+///
+/// # Errors
+/// If the file can't be read or written.
+pub fn unset_setting(key: &str) -> Result<Settings, String> {
+    let path = file("config.toml").ok_or("config.toml: no home directory")?;
+    edit_settings_at(&path, |text| settings::unset_key(text, key))
+        .map_err(|err| format!("config.toml: {err}"))
+}
+
 fn write_setting_at(path: &Path, key: &str, value: &toml::Value) -> Result<Settings, String> {
+    edit_settings_at(path, |text| settings::set_key(text, key, value))
+}
+
+fn edit_settings_at(path: &Path, edit: impl FnOnce(&str) -> String) -> Result<Settings, String> {
     let current = read_path(path).map_err(|err| err.to_string())?;
-    let text = settings::set_key(&current.unwrap_or_default(), key, value);
+    let text = edit(&current.unwrap_or_default());
     let parsed = Settings::parse(&text)?;
     path.parent()
         .map_or(Ok(()), fs::create_dir_all)
@@ -110,7 +125,8 @@ pub fn apply(cx: &mut App) -> Vec<SharedString> {
     if !cx.has_global::<Settings>() {
         cx.set_global(Settings::default());
     }
-    cx.set_global(Theme::named(cx.global::<Settings>().theme));
+    let settings = cx.global::<Settings>();
+    cx.set_global(Theme::named(settings.theme).with_sidebar_opacity(settings.sidebar_opacity));
     let user_keymap = read("keymap.toml", &mut notices);
     let (table, errors) = keymap::resolve(user_keymap.as_deref());
     notices.extend(

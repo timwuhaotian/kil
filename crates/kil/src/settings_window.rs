@@ -121,7 +121,11 @@ impl SettingsWindow {
     }
 
     fn write(&mut self, key: &str, value: &toml::Value, cx: &mut Context<Self>) {
-        match config::write_setting(key, value) {
+        self.applied(config::write_setting(key, value), cx);
+    }
+
+    fn applied(&mut self, written: Result<Settings, String>, cx: &mut Context<Self>) {
+        match written {
             Ok(file) => {
                 self.file = file;
                 self.error = None;
@@ -301,6 +305,15 @@ impl SettingsWindow {
         self.write("font_size", &f64::from(size).into(), cx);
     }
 
+    fn step_sidebar_opacity(&mut self, up: bool, cx: &mut Context<Self>) {
+        let opacity = step_percent(sidebar_opacity(&self.file), up);
+        self.write("sidebar_opacity", &f64::from(opacity).into(), cx);
+    }
+
+    fn unset(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.applied(config::unset_setting(key), cx);
+    }
+
     fn open_folder(&mut self, cx: &mut Context<Self>) {
         match config_dir() {
             None => self.error = Some("No home directory.".into()),
@@ -311,6 +324,24 @@ impl SettingsWindow {
         }
         cx.notify();
     }
+}
+
+/// The sidebar opacity in effect: the file's, else the theme's.
+fn sidebar_opacity(file: &Settings) -> f32 {
+    file.sidebar_opacity
+        .unwrap_or_else(|| Theme::named(file.theme).sidebar_bg.a)
+}
+
+/// `opacity` moved one 5 % step up or down to a multiple of 5 %, within 0–1: the themes'
+/// own 72 % steps to 75 % or 70 %, not 77 % or 67 %.
+fn step_percent(opacity: f32, up: bool) -> f32 {
+    let percent = (opacity * 100.).round();
+    let stepped = if up {
+        (percent / 5.).floor() * 5. + 5.
+    } else {
+        (percent / 5.).ceil() * 5. - 5.
+    };
+    (stepped / 100.).clamp(0., 1.)
 }
 
 /// The default directory as typed in the field: `~` for home, empty for none.
@@ -598,6 +629,8 @@ impl SettingsWindow {
                 move |this, _: &ClickEvent, _, cx| this.write("theme", &name.key().into(), cx),
             ))
         });
+        let custom = self.file.sidebar_opacity.is_some();
+        let percent = (sidebar_opacity(&self.file) * 100.).round();
         vec![
             div()
                 .py_3()
@@ -605,6 +638,37 @@ impl SettingsWindow {
                 .justify_between()
                 .children(swatches)
                 .into_any_element(),
+            row(
+                "Sidebar opacity",
+                Some("Lower lets the desktop show through"),
+                c,
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(custom, |stepper| {
+                        stepper.child(
+                            button("sidebar-opacity-reset", "Reset", c)
+                                .text_size(px(11.))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.unset("sidebar_opacity", cx);
+                                })),
+                        )
+                    })
+                    .child(button("sidebar-opacity-less", "−", c).on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| this.step_sidebar_opacity(false, cx),
+                    )))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex()
+                            .justify_center()
+                            .child(format!("{percent}%")),
+                    )
+                    .child(button("sidebar-opacity-more", "+", c).on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| this.step_sidebar_opacity(true, cx),
+                    ))),
+            ),
         ]
     }
 
@@ -752,6 +816,19 @@ mod tests {
             .iter()
             .find_map(AnyWindowHandle::downcast::<SettingsWindow>)
             .expect("the Settings window")
+    }
+
+    #[test]
+    fn opacity_steps_should_land_on_multiples_of_5_percent_within_0_to_1() {
+        let steps = [
+            (0.72, true),
+            (0.72, false),
+            (0.7, false),
+            (0.98, true),
+            (0.02, false),
+        ]
+        .map(|(opacity, up)| (step_percent(opacity, up) * 100.).round());
+        assert_eq!(steps, [75., 70., 65., 100., 0.]);
     }
 
     #[gpui::test]

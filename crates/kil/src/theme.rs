@@ -110,6 +110,15 @@ impl Theme {
         }
     }
 
+    /// This theme with the sidebar at `opacity` (Settings), or as the theme has it.
+    #[must_use]
+    pub fn with_sidebar_opacity(mut self, opacity: Option<f32>) -> Self {
+        if let Some(opacity) = opacity {
+            self.sidebar_bg.a = opacity.clamp(0., 1.);
+        }
+        self
+    }
+
     fn night() -> Self {
         Self::build(
             palette(
@@ -291,6 +300,22 @@ mod tests {
             let text = format!("theme = \"{}\"", name.key());
             assert_eq!(Settings::parse(&text).unwrap().theme, name);
         }
+    }
+
+    #[test]
+    fn sidebar_opacity_should_replace_the_themes_and_none_should_keep_it() {
+        let theme = Theme::named(ThemeName::Paper);
+        let own = theme.sidebar_bg.a;
+        assert_eq!(
+            (
+                Theme::named(ThemeName::Paper)
+                    .with_sidebar_opacity(None)
+                    .sidebar_bg
+                    .a,
+                theme.with_sidebar_opacity(Some(0.25)).sidebar_bg.a,
+            ),
+            (own, 0.25)
+        );
     }
 
     #[test]

@@ -19,6 +19,10 @@ pub struct Settings {
     /// Where new tabs open; splits follow their pane instead. `None`: new tabs follow the
     /// focused pane too.
     pub default_directory: Option<PathBuf>,
+    /// The sidebar background's opacity, 0–1, over the blurred desktop. `None`: the theme's.
+    pub sidebar_opacity: Option<f32>,
+    /// Check for, download and install updates without being asked (DESIGN.md §15).
+    pub auto_update: bool,
 }
 
 impl Global for Settings {}
@@ -33,6 +37,8 @@ impl Default for Settings {
             cursor_blink: true,
             theme: ThemeName::default(),
             default_directory: None,
+            sidebar_opacity: None,
+            auto_update: true,
         }
     }
 }
@@ -47,6 +53,8 @@ struct SettingsFile {
     cursor_blink: Option<bool>,
     theme: Option<ThemeName>,
     default_directory: Option<String>,
+    sidebar_opacity: Option<f32>,
+    auto_update: Option<bool>,
 }
 
 impl Settings {
@@ -62,6 +70,11 @@ impl Settings {
             Some(size) => return Err(format!("font_size {size} is outside 6–72")),
             None => defaults.font_size,
         };
+        let sidebar_opacity = match file.sidebar_opacity {
+            Some(opacity) if (0.0..=1.0).contains(&opacity) => Some(opacity),
+            Some(opacity) => return Err(format!("sidebar_opacity {opacity} is outside 0–1")),
+            None => None,
+        };
         Ok(Self {
             font_family: file.font_family.map_or(defaults.font_family, Into::into),
             font_size,
@@ -70,6 +83,8 @@ impl Settings {
             cursor_blink: file.cursor_blink.unwrap_or(defaults.cursor_blink),
             theme: file.theme.unwrap_or(defaults.theme),
             default_directory: file.default_directory.as_deref().and_then(expand_home),
+            sidebar_opacity,
+            auto_update: file.auto_update.unwrap_or(defaults.auto_update),
         })
     }
 }
@@ -119,6 +134,16 @@ pub fn set_key(text: &str, key: &str, value: &toml::Value) -> String {
     }
     if !found {
         out.push_str(&assignment);
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` without the lines assigning `key`, so the default applies again.
+pub fn unset_key(text: &str, key: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines().filter(|line| !assigns(line, key)) {
+        out.push_str(line);
         out.push('\n');
     }
     out
@@ -202,6 +227,28 @@ mod tests {
         assert_eq!(
             set_key("font_size = 13.0", "font_family", &"SF Mono".into()),
             "font_size = 13.0\nfont_family = \"SF Mono\"\n"
+        );
+    }
+
+    #[test]
+    fn parse_should_read_the_sidebar_opacity_and_reject_one_outside_0_to_1() {
+        assert_eq!(
+            Settings::parse("sidebar_opacity = 0.5")
+                .unwrap()
+                .sidebar_opacity,
+            Some(0.5)
+        );
+        assert!(Settings::parse("sidebar_opacity = 1.5").is_err());
+    }
+
+    #[test]
+    fn unset_key_should_drop_the_assignment_and_keep_the_rest() {
+        assert_eq!(
+            unset_key(
+                "# mine\nsidebar_opacity = 0.5\ntheme = \"dusk\"",
+                "sidebar_opacity"
+            ),
+            "# mine\ntheme = \"dusk\"\n"
         );
     }
 
