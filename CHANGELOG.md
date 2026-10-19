@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.7 — 2026-10-20
+
 - The sidebar says what each tab's panes cost: the memory of the program running in it and
   everything that program started, next to the tab's title, and the total for every tab at
   the bottom. Under memory pressure the bottom line also shows how much swap is in use. A
