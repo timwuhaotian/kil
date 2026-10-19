@@ -27,8 +27,9 @@ owns every process, PID and file descriptor it creates.
 ## Features
 
 - **Vertical tabs** in a sidebar. A ring marks a tab with a running job, and a dot marks one
-  whose job finished while you weren't looking. Double-click a tab to rename it (IME works,
-  Chinese included).
+  whose job finished while you weren't looking. Drag a tab up or down to reorder it, and
+  double-click it to rename it (IME works, Chinese included). How much of the blurred desktop
+  shows through the sidebar is a setting.
 - **Split panes** that animate open and closed. They share the tab evenly whenever a pane
   comes or goes. Drag the dividers; the focused pane is the bright one.
 - **Jobs outlive the window.** A small session server (`kil --server`, the same binary) holds
@@ -38,6 +39,9 @@ owns every process, PID and file descriptor it creates.
 - **Comes back after a restart, too.** The layout, each pane's directory, its screen and
   scrollback, and the window frame are saved every 2 s. After a logout or a reboot, the
   processes themselves are gone, so each pane's last job is typed into a new shell instead.
+- **Updates itself, quietly.** Kil checks for a new release at launch and every six hours,
+  downloads it in the background, checks its checksum, Developer ID signature and Apple
+  notarization, and installs it when you quit. Jobs keep running across the update.
 - **Five themes**: Night, Paper (light), Fjord, Ember and Dusk. Programs that ask for the
   terminal's colors, like vim deciding between light and dark, are told the theme's.
 - **A default directory** for new tabs, if you want one. Splits still open where their pane
@@ -53,7 +57,9 @@ owns every process, PID and file descriptor it creates.
 
 Download [`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
-`releases/` also holds its `.sha256`:
+From then on it keeps itself up to date: a new release is installed when you quit Kil, and
+**Kil ▸ Check for Updates…** checks right away (turn automatic updates off in **Settings ▸
+Updates**). `releases/` also holds the DMG's `.sha256`:
 
 ```sh
 shasum -a 256 -c Kil-arm64.dmg.sha256
@@ -86,7 +92,8 @@ fine on the machine that built it.
 
 Releases are built, signed and notarized locally and committed under `releases/`; CI only
 checks pull requests and `main`. [`RELEASING.md`](RELEASING.md) has the steps; the build itself
-is `scripts/release.sh` → `releases/Kil-arm64.dmg` + `.sha256`.
+is `scripts/release.sh` → `releases/Kil-arm64.dmg` + `.sha256` + `latest.toml`, which installed
+copies read to find the update.
 
 ## Using Kil
 
@@ -105,7 +112,11 @@ is `scripts/release.sh` → `releases/Kil-arm64.dmg` + `.sha256`.
 | `⌘Q` | Quit; running jobs keep going |
 
 Double-click a tab to rename it (Enter or clicking away saves, Esc cancels), right-click it
-for Rename / Close, and double-click empty sidebar space for a new tab.
+for Rename / Close, drag it up or down to reorder, and double-click empty sidebar space for a
+new tab. Double-click the top of the sidebar, beside the window buttons, to fill the screen
+and again to go back (it does what **System Settings ▸ Desktop & Dock** says a title-bar
+double-click does). Programs that report the mouse, like Claude Code's full-screen view, get
+the scroll wheel; elsewhere it scrolls Kil's scrollback.
 
 **Rebinding is in the app.** **Settings ▸ Keyboard** lists every command and the keys it runs on.
 Click a shortcut, press the new one, and it is saved and applied at once — the old keys stop
@@ -133,6 +144,8 @@ default_directory = "~/code"     # where new tabs open; leave out to follow the 
 scrollback_lines = 10000
 option_as_meta = true
 cursor_blink = true
+sidebar_opacity = 0.6            # 0–1; leave out for the theme's own
+auto_update = true               # check, download and install updates when Kil quits
 ```
 
 **`~/Library/Application Support/kil/`** holds what Kil reopens: `session.toml` (layout),

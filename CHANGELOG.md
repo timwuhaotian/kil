@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.6 — 2026-10-19
+
 - **Kil updates itself.** It checks at launch and every six hours, downloads a new release in
   the background, checks its checksum, Developer ID signature and notarization, and installs
   it when Kil quits; jobs keep running. **Kil ▸ Check for Updates…** checks now and offers
