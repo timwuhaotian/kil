@@ -49,6 +49,8 @@ Build status:
 | A22 | Five themes (Night, Paper, Fjord, Ember, Dusk), picked from swatches in Settings or with `theme` in `config.toml`. A change restyles the chrome and every pane at once, and programs that ask for the terminal's colors (OSC 10/11/4, e.g. vim choosing light or dark) get the new palette. | `theme` tests, `color_queries_should_follow_the_theme_palette`, contrast checked (§7). |
 | A23 | With a default directory set, new tabs open there (`cmd-t`, `+ New Tab`, a double-click on the sidebar, the first tab of a fresh launch). Splits still open where their pane is. Without one, a new tab follows the focused pane, as before. | `workspace` GPUI test + manual. |
 | A24 | Whenever a tab's panes change — a split (`cmd-shift-d`, `cmd-d`) or a closed pane (`cmd-shift-c`, a shell's `exit 0`) — the tab shares its space equally again among all its panes, the first one included: panes side by side share the width and panes stacked share the height, however the tab was split (`1 | 2 | 3` gets thirds whichever pane was split). Each split animates to its children's share of the panes along its axis; panes stacked across it count as their longest line. Double-clicking any divider does the same. A dragged divider holds until the next pane change or double-click, and a restored layout keeps its saved ratios. | `pane_tree` unit tests + `panes_should_share_a_tab_evenly_again_after_a_pane_closes` + `double_clicking_a_divider_should_share_the_tab_equally_again` + manual. |
+| A25 | Dragging a sidebar row moves its tab: as the pointer passes over another row the dragged tab takes its place, the rows between shift, and the active tab stays active. A press without a drag is still a click, and a row being renamed doesn't drag. The order is what the next launch reopens. | `dragging_a_row_should_move_its_tab_and_keep_the_active_one` + manual. |
+| A26 | Double-clicking the sidebar's top strip (the title bar the window doesn't draw, where the traffic lights are) does what System Settings ▸ Desktop & Dock says a title-bar double-click does: by default the window fills the screen, and the next double-click puts it back. | Manual (CGEvent double-click, window bounds before and after). |
 
 ### Non-goals (v1)
 These are left out and can be added later:
@@ -400,7 +402,8 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 **Sidebar** (220 px)
 - 44 px rows with a title (13 pt medium) and the cwd (11 pt, middle-truncated).
 - A 10 px status slot before the title (A17): an accent **ring** while a pane runs a job, an accent **dot** for a job that ended out of view, and a red **!** for an exit banner. The marks differ in shape as well as color. They are static, because a spinner would redraw the window every frame for as long as a dev server runs. There is an `×` on hover.
-- A footer `+ New Tab` button. Double-clicking empty sidebar space also opens a tab.
+- A footer `+ New Tab` button. Double-clicking empty sidebar space also opens a tab; double-clicking the strip above the rows zooms the window (A26).
+- Rows drag up and down to reorder the tabs (A25).
 - Right-click on a row opens a menu: Rename Tab…, Reset Name, Close Tab. A rename edits the title in place in a `TextField`. The user's name overrides the pane's title in the row, in the closing ghost and in the window title.
 - The selection highlight is a rounded 8 px pill that **slides** between rows.
 

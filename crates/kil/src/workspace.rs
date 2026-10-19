@@ -172,6 +172,10 @@ struct DividerDrag {
     split: SplitId,
 }
 
+/// A sidebar row being dragged to another place; the row itself moves under the pointer.
+#[derive(Clone, Copy)]
+struct TabDrag(TabId);
+
 struct EmptyDrag;
 
 impl Render for EmptyDrag {
@@ -569,6 +573,19 @@ impl Workspace {
     }
 
     /// `cmd-1`…`cmd-8` pick that tab if it exists; `cmd-9` (`usize::MAX`) picks the last.
+    /// Puts tab `id` where tab `to` is, shifting the rows between; the same tab stays active.
+    fn move_tab(&mut self, id: TabId, to: TabId, cx: &mut Context<Self>) {
+        let index = |tabs: &[Tab], id| tabs.iter().position(|tab| tab.id == id);
+        let (Some(from), Some(to)) = (index(&self.tabs, id), index(&self.tabs, to)) else {
+            return;
+        };
+        let active = self.tabs[self.active].id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = index(&self.tabs, active).unwrap_or(0);
+        cx.notify();
+    }
+
     fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let last = self.tabs.len().saturating_sub(1);
         if index == usize::MAX {
@@ -1127,7 +1144,19 @@ impl Workspace {
             .bg(chrome.sidebar_bg)
             .border_r_1()
             .border_color(chrome.divider)
-            .child(div().h(px(SIDEBAR_TOP)).flex_none())
+            // The title bar the window doesn't draw: double-clicking it zooms, as the user set
+            // in System Settings (fill the screen, then back), or minimizes.
+            .child(
+                div()
+                    .id("titlebar")
+                    .h(px(SIDEBAR_TOP))
+                    .flex_none()
+                    .on_click(|event: &ClickEvent, window, _| {
+                        if event.click_count() == 2 {
+                            window.titlebar_double_click();
+                        }
+                    }),
+            )
             .child(
                 div()
                     .id("tabs")
@@ -1195,9 +1224,11 @@ impl Workspace {
                 .rounded_lg()
                 .bg(chrome.selected)
         });
-        div()
+        let row = div()
             .id(ElementId::NamedInteger("tab".into(), id.0))
-            .group("tab-row")
+            .group("tab-row");
+        // Not while renaming: a drag in the field selects its text.
+        reorderable(row, id, editing.is_none(), cx)
             .relative()
             .flex_none()
             .h(px(ROW_HEIGHT))
@@ -1602,6 +1633,29 @@ fn split_id_bits(tab: TabId, split: SplitId) -> u64 {
     (tab.0 << 32) ^ split.bits()
 }
 
+/// Lets `row` be dragged (when `draggable`) and takes the dragged tab's place when the pointer
+/// passes over it.
+fn reorderable(
+    row: Stateful<Div>,
+    id: TabId,
+    draggable: bool,
+    cx: &mut Context<Workspace>,
+) -> Stateful<Div> {
+    row.when(draggable, |row| {
+        row.on_drag(TabDrag(id), |_, _, _, cx| cx.new(|_| EmptyDrag))
+    })
+    .on_drag_move(
+        cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
+            let TabDrag(dragged) = *event.drag(cx);
+            let (y, row) = (event.event.position.y, event.bounds);
+            // Rows are one height, so the dragged row lands under the pointer and stays.
+            if dragged != id && row.top() <= y && y < row.bottom() {
+                this.move_tab(dragged, id, cx);
+            }
+        }),
+    )
+}
+
 /// Static on purpose: a spinner would redraw the window every frame for as long as a job
 /// (say, a dev server) runs, and idle CPU must stay at zero (DESIGN.md A12).
 fn status_mark(status: TabStatus, chrome: Chrome) -> Div {
@@ -1978,6 +2032,55 @@ mod tests {
         assert_ne!(started_in(&workspace, cx), Some(home.clone()));
         cx.dispatch_action(NewTab);
         assert_eq!(started_in(&workspace, cx), Some(home));
+    }
+
+    #[gpui::test]
+    fn dragging_a_row_should_move_its_tab_and_keep_the_active_one(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(NewTab);
+        cx.dispatch_action(NewTab);
+        workspace.update(cx, |this, _| {
+            for (tab, name) in this.tabs.iter_mut().zip(["a", "b", "c"]) {
+                tab.name = Some(name.into());
+            }
+        });
+        std::thread::sleep(motion::ROW_IN + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        // Row "a" down past "b" onto "c", in small moves as a hand would.
+        cx.simulate_event(MouseDownEvent {
+            position: ROW,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for step in (1..=8u8).map(f32::from) {
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: ROW + point(px(0.), px(ROW_HEIGHT * 2. * step / 8.)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::none(),
+            });
+        }
+        cx.simulate_event(MouseUpEvent {
+            position: ROW + point(px(0.), px(ROW_HEIGHT * 2.)),
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        let (names, active) = workspace.read_with(cx, |this, _| {
+            let names: Vec<_> = this
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.name.clone())
+                .collect();
+            (names, this.tabs[this.active].name.clone())
+        });
+        assert_eq!(
+            (names, active),
+            (vec!["b".into(), "c".into(), "a".into()], Some("c".into()))
+        );
     }
 
     #[gpui::test]
