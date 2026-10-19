@@ -24,7 +24,8 @@ A release, in order. "Patch" means bumping the last number (0.0.4 → 0.0.5).
    (step 5 refuses to start otherwise), and put no version number in it.
 5. **Build:** `scripts/release.sh`. It signs with Developer ID and the hardened runtime,
    notarizes and staples the app, then the DMG, checks both with `spctl`, and overwrites
-   `releases/Kil-arm64.dmg` and its `.sha256`. It fails unless Apple accepts both. Notarization
+   `releases/Kil-arm64.dmg`, its `.sha256` and `releases/latest.toml` (the version and checksum
+   every installed Kil's updater reads). It fails unless Apple accepts both. Notarization
    takes a few minutes; credentials are described at the top of the script.
 6. **Install it here**, from the DMG, as a user would get it:
    ```sh
@@ -36,7 +37,7 @@ A release, in order. "Patch" means bumping the last number (0.0.4 → 0.0.5).
    ```
    A running Kil keeps its old code until it is quit and opened again, and its session server
    until that server exits (**Quit and Stop All Jobs**, or a reboot).
-7. **Commit** on `main`, everything at once (version, lock, changelog, README, DMG, sha256), as
+7. **Commit** on `main`, everything at once (version, lock, changelog, README, DMG, sha256, `latest.toml`), as
    `Kil x.y.z: <what changed, briefly>`, with a body listing the changes and the notarization
    result.
 8. **Push** `main`, and check that CI passes and the download link serves the new DMG:
@@ -44,4 +45,5 @@ A release, in order. "Patch" means bumping the last number (0.0.4 → 0.0.5).
    git push origin main
    curl -sIL https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg | grep -i content-length
    ```
-   The length matches `stat -f %z releases/Kil-arm64.dmg`.
+   The length matches `stat -f %z releases/Kil-arm64.dmg`. Installed copies of Kil find the
+   release within six hours, or at their next launch, and install it when they quit.

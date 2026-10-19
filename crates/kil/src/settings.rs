@@ -242,6 +242,12 @@ mod tests {
     }
 
     #[test]
+    fn auto_update_should_default_to_on() {
+        assert!(Settings::parse("").unwrap().auto_update);
+        assert!(!Settings::parse("auto_update = false").unwrap().auto_update);
+    }
+
+    #[test]
     fn unset_key_should_drop_the_assignment_and_keep_the_rest() {
         assert_eq!(
             unset_key(

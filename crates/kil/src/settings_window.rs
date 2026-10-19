@@ -17,7 +17,7 @@ use crate::{
     settings::{Settings, abbreviate_home, config_dir, expand_home},
     text_field::{FieldEvent, TextField},
     theme::{Theme, ThemeName, hsla},
-    workspace,
+    update, workspace,
 };
 
 actions!(settings_window, [CloseWindow]);
@@ -728,6 +728,32 @@ impl SettingsWindow {
     }
 }
 
+impl SettingsWindow {
+    fn update_rows(&self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        vec![
+            row(
+                "Update automatically",
+                Some("Downloads in the background, installs when Kil quits"),
+                c,
+                toggle("auto-update", self.file.auto_update, c).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        let on = !this.file.auto_update;
+                        this.write("auto_update", &on.into(), cx);
+                    },
+                )),
+            ),
+            row(
+                concat!("Kil ", env!("CARGO_PKG_VERSION")),
+                None,
+                c,
+                button("check-for-updates", "Check Now", c).on_click(|_, _, cx| {
+                    cx.dispatch_action(&update::CheckForUpdates);
+                }),
+            ),
+        ]
+    }
+}
+
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = Colors::of(cx.global::<Theme>());
@@ -735,6 +761,7 @@ impl Render for SettingsWindow {
         let terminal = self.terminal_rows(c, window, cx);
         let appearance = self.appearance_rows(c, cx);
         let keyboard = self.keyboard_rows(c, cx);
+        let updates = self.update_rows(c, cx);
         let files = vec![row(
             "Config files",
             Some("config.toml, keymap.toml"),
@@ -785,6 +812,7 @@ impl Render for SettingsWindow {
                     .child(section("FONT", c, font))
                     .child(section("KEYBOARD", c, keyboard))
                     .child(section("TERMINAL", c, terminal))
+                    .child(section("UPDATES", c, updates))
                     .child(section("FILES", c, files))
                     .child(
                         div()

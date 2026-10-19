@@ -1,8 +1,9 @@
 #!/bin/sh
 # Builds Kil, signs it with Developer ID, notarizes and staples it, and packs it in a DMG under
 # releases/, which git tracks (DESIGN.md §11). Run locally; CI never builds releases.
-# Usage: scripts/release.sh   → releases/Kil-arm64.dmg (+ .sha256), replacing the last release:
-# downloads are always the latest, and the version is only for us (Info.plist, git history).
+# Usage: scripts/release.sh   → releases/Kil-arm64.dmg (+ .sha256, latest.toml), replacing the last
+# release: downloads are always the latest, and the version is only for us (Info.plist, git
+# history) and for the app's updater, which reads latest.toml (DESIGN.md §15).
 #
 # Signing: KIL_SIGN_IDENTITY, default "Developer ID Application" (the one such identity in the
 # login keychain).
@@ -73,4 +74,6 @@ xcrun stapler staple "$dmg"
 spctl --assess --type execute --verbose=2 "$app"
 spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
 (cd releases && shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256")
+printf 'version = "%s"\nsha256 = "%s"\n' "$version" "$(awk '{print $1}' "$dmg.sha256")" \
+  > releases/latest.toml
 echo "$dmg ($version)"

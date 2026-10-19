@@ -6,6 +6,11 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Kil updates itself.** It checks at launch and every six hours, downloads a new release in
+  the background, checks its checksum, Developer ID signature and notarization, and installs
+  it when Kil quits; jobs keep running. **Kil ▸ Check for Updates…** checks now and offers
+  **Restart Now**. Turn it off with **Settings ▸ Updates** or `auto_update = false`. This
+  release has to be installed by hand once; later ones arrive on their own.
 - Drag a tab up or down the sidebar to reorder it; the new order is saved with the session.
 - Double-click the top of the sidebar to fill the screen, and again to go back (or whatever
   System Settings ▸ Desktop & Dock says a title-bar double-click does).

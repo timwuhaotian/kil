@@ -51,6 +51,7 @@ Build status:
 | A24 | Whenever a tab's panes change — a split (`cmd-shift-d`, `cmd-d`) or a closed pane (`cmd-shift-c`, a shell's `exit 0`) — the tab shares its space equally again among all its panes, the first one included: panes side by side share the width and panes stacked share the height, however the tab was split (`1 | 2 | 3` gets thirds whichever pane was split). Each split animates to its children's share of the panes along its axis; panes stacked across it count as their longest line. Double-clicking any divider does the same. A dragged divider holds until the next pane change or double-click, and a restored layout keeps its saved ratios. | `pane_tree` unit tests + `panes_should_share_a_tab_evenly_again_after_a_pane_closes` + `double_clicking_a_divider_should_share_the_tab_equally_again` + manual. |
 | A25 | Dragging a sidebar row moves its tab: as the pointer passes over another row the dragged tab takes its place, the rows between shift, and the active tab stays active. A press without a drag is still a click, and a row being renamed doesn't drag. The order is what the next launch reopens. | `dragging_a_row_should_move_its_tab_and_keep_the_active_one` + manual. |
 | A26 | Double-clicking the sidebar's top strip (the title bar the window doesn't draw, where the traffic lights are) does what System Settings ▸ Desktop & Dock says a title-bar double-click does: by default the window fills the screen, and the next double-click puts it back. | Manual (CGEvent double-click, window bounds before and after). |
+| A27 | Kil updates itself (§15). Five seconds after launch and every six hours, with `auto_update` on (the default), it reads `releases/latest.toml` on `main`; for a newer version it downloads the DMG and keeps its app only if the SHA-256, the version, the Developer ID team (the running app's) and Apple's notarization all check out. Quitting Kil, however it quits, then replaces the bundle, so the next launch is the new version; running jobs keep running in the session server. **Kil ▸ Check for Updates…** (or **Check Now** in Settings) says it is up to date, why it can't update, or offers **Restart Now**; the menu item becomes **Restart to Update to x.y.z**, which quits without asking about jobs and reopens the new app. An ad-hoc-signed build, a bare binary and a copy run from the DMG never replace themselves. | `update` tests (the committed release passes every check, the swap) + manual: a Developer ID build labelled older updates on quit. |
 
 ### Non-goals (v1)
 These are left out and can be added later:
@@ -532,6 +533,9 @@ The Settings window writes one key per change (`config::write_setting`). It repl
 Both files are re-read when the window gains focus and the file's mtime has changed. There is no
 watcher thread and no extra dependency.
 
+
+The Settings window's **Updates** section has the `auto_update` switch and **Check Now**.
+
 ---
 
 ## 10. Rust practice (Apollo handbook, applied)
@@ -779,3 +783,39 @@ Not automated: a peer with another uid (needs a second user), and the three-butt
 | Two parses and one more socket per output chunk | Measured: on par with a local session (§14.4). | Throughput below Terminal.app → the server passes the master fd to the attached app (`SCM_RIGHTS`) and parses only while detached. |
 | Jobs keep running after a quit and are forgotten | The quit sheet names them when any are busy. | Users report surprise → a menu-bar or Dock badge while detached jobs run. |
 | A protocol change kills jobs once | The protocol is versioned separately from the app, and changes rarely. | Frequent changes → a negotiated minor version with additive frames. |
+
+---
+
+## 15. Updates (`update.rs`)
+
+Users get one file, the latest DMG, and never see a version (§11). The updater keeps that: it
+asks `main` what the latest release is, not GitHub's release API, because releases are commits.
+
+- **What it reads.** `scripts/release.sh` writes `releases/latest.toml` (`version`, `sha256`)
+  next to the DMG, and the release commit carries both, so the two always describe the same
+  build. The app fetches it raw from `main` and compares it with its own `CARGO_PKG_VERSION`
+  as `major.minor.patch` numbers. File times in git would say when, not what, and would differ
+  per clone.
+- **When.** 5 s after launch, then every 6 h, while `auto_update` is on; one timer, so idle
+  CPU stays at zero (A12). A manual check runs whatever the setting.
+- **Checks, in order**, on a background thread with the system's own tools (`curl`, `shasum`,
+  `hdiutil`, `ditto`, `codesign`, `spctl`), so no new dependency: the DMG's SHA-256 against the
+  manifest; the app's `CFBundleShortVersionString` against the manifest (a CDN serving a new
+  manifest with an old DMG fails here and is retried later); its signature against the running
+  app's Developer ID team (`codesign --verify --deep --strict -R`); and Gatekeeper's notarization
+  (`spctl --assess`). The manifest and DMG come from the same place, so the checksum only catches
+  corruption; the signature check is what keeps a tampered download out. The staged app lives in
+  `~/Library/Caches/dev.kil.terminal/update` and is reused by the next check of that version.
+- **Install on quit.** `on_app_quit` copies the staged app beside the bundle (`.Kil.app.new`),
+  renames the bundle away, renames the new one in, and deletes the old. The bundle is never
+  missing, and a failure puts the old one back. The running app keeps the code it loaded, and a
+  session server started from the old binary keeps running on it; the new app speaks to it by
+  the protocol negotiation of §14.
+- **Restart to Update** detaches like `⌘Q` without the jobs prompt (they keep running), and a
+  `/bin/sh` waits for this process to exit before `open`ing the new bundle.
+- **Not updated:** a bare binary (`cargo run`), an ad-hoc-signed bundle (a local build), a copy
+  running from the DMG or translocated by Gatekeeper, and a bundle in a folder Kil can't write.
+  A manual check says which.
+- **Tested** by `update` tests: version order, the manifest, which bundles are replaceable, the
+  swap and its rollback, and the committed `releases/` passing every check `stage` makes (from a
+  `file://` URL, against team 43VLF3KTFZ).

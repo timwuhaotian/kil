@@ -12,6 +12,7 @@ mod terminal_element;
 mod terminal_pane;
 mod text_field;
 mod theme;
+mod update;
 mod workspace;
 
 use std::{
@@ -45,8 +46,8 @@ fn forget_launcher_identity() {
 }
 
 /// The menu bar. Set again whenever the keymap changes, so the shortcuts it shows are the
-/// ones bound.
-fn menus() -> Vec<Menu> {
+/// ones bound, and when an update is ready to install.
+fn menus(cx: &App) -> Vec<Menu> {
     use workspace as w;
     vec![
         Menu {
@@ -54,6 +55,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::action("Keyboard Shortcuts…", OpenKeymap),
+                update::menu_item(cx),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
@@ -193,6 +195,7 @@ fn main() {
             return;
         };
         register_app_actions(cx);
+        update::init(cx);
         // Settings alone doesn't keep the app alive.
         cx.on_window_closed(|cx| {
             if !cx

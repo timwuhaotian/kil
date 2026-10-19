@@ -142,7 +142,7 @@ pub fn apply(cx: &mut App) -> Vec<SharedString> {
             .chain(settings_window::bindings()),
     );
     // A menu shows the keys bound when it was set, so it is set again with these.
-    cx.set_menus(crate::menus());
+    cx.set_menus(crate::menus(cx));
     notices
 }
 
