@@ -12,17 +12,31 @@ use std::{mem::MaybeUninit, os::unix::process::ExitStatusExt, ptr, thread, time:
 use common::{Probe, sh, start, wait_for_foreground};
 use kil_term::{SessionEvent, diagnostics};
 
+/// A descriptor number no shell uses for itself: a child opens its own (its tty, for one)
+/// low, so a planted descriptor high is told apart from them.
+const PLANTED_FD: i32 = 60;
+
 #[test]
 fn spawn_should_give_child_only_stdio_when_parent_has_inheritable_fd() {
     // SAFETY: open(2) of a constant path; closed below.
     let planted = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
     assert!(planted >= 3);
+    // SAFETY: F_GETFD on any number; it fails when the number is free.
+    let free = unsafe { libc::fcntl(PLANTED_FD, libc::F_GETFD) } == -1;
+    assert!(free, "descriptor {PLANTED_FD} is in use");
+    // SAFETY: dup2 to a free number; the descriptor it replaces is closed.
+    let planted = unsafe { libc::dup2(planted, PLANTED_FD) };
+    assert_eq!(planted, PLANTED_FD);
     let probe = start(&sh("exec /bin/sleep 600"));
     assert!(wait_for_foreground(&probe.session, "sleep"));
     let fds = diagnostics::open_fds_of(probe.session.pid()).unwrap();
     // SAFETY: closes the descriptor opened above.
-    unsafe { libc::close(planted) };
-    assert_eq!(fds, [0, 1, 2]);
+    unsafe { libc::close(PLANTED_FD) };
+    // The child may have descriptors of its own; the planted one must not be among them.
+    assert!(
+        !fds.contains(&PLANTED_FD),
+        "the child inherited the planted descriptor: {fds:?}"
+    );
 }
 
 /// Waits for the child's exit and returns the signal that ended it.
