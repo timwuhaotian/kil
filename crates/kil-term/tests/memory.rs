@@ -20,9 +20,11 @@ fn process_memory_should_count_what_the_program_holds() {
         "the program's memory is not counted: {} bytes",
         probe.session.process_memory()
     );
-    assert_eq!(
-        probe.session.memory().process_bytes,
-        probe.session.process_memory()
+    // One reading: two in a row differ while the shell is still taking the string in.
+    let process_bytes = probe.session.memory().process_bytes;
+    assert!(
+        process_bytes > 20 * 1024 * 1024,
+        "memory() leaves the program out: {process_bytes} bytes"
     );
 }
 
