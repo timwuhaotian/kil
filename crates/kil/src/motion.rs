@@ -7,6 +7,10 @@ pub const CLOSE_PANE: Duration = Duration::from_millis(160);
 pub const PILL: Duration = Duration::from_millis(160);
 pub const ROW_IN: Duration = Duration::from_millis(180);
 pub const ROW_OUT: Duration = Duration::from_millis(140);
+/// A row making room for the one being dragged past it.
+pub const ROW_SHIFT: Duration = Duration::from_millis(140);
+/// A dropped row settling from under the pointer into its slot.
+pub const ROW_DROP: Duration = Duration::from_millis(180);
 pub const TAB_SWITCH: Duration = Duration::from_millis(140);
 pub const FOCUS_DIM: Duration = Duration::from_millis(120);
 /// Longer than the update poll, so the download bar glides between readings.

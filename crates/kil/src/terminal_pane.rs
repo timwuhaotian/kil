@@ -193,6 +193,16 @@ impl TerminalPane {
         ];
         let pane = cx.entity();
         let cursor = cx.new(|cx| TerminalCursor::new(&pane, cx));
+        // Named for its folder from the start, not "shell" until the shell is up. Where a
+        // fresh shell starts (DESIGN.md §4.2): the asked-for directory, else `$HOME`. A session
+        // the server kept may be anywhere, so it waits for the first refresh.
+        let start = if attach {
+            None
+        } else {
+            cwd.clone()
+                .filter(|dir| dir.is_dir())
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        };
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -210,7 +220,14 @@ impl TerminalPane {
             scroll_remainder: 0.,
             selecting: false,
             info: PaneInfo {
-                title: "shell".into(),
+                title: start
+                    .as_deref()
+                    .map_or_else(|| "shell".into(), |dir| dir_name(dir).into()),
+                cwd: start
+                    .as_deref()
+                    .map(abbreviate_home)
+                    .unwrap_or_default()
+                    .into(),
                 ..PaneInfo::default()
             },
             info_refresh: None,
@@ -246,9 +263,14 @@ impl TerminalPane {
     }
 
     /// Working directory of the foreground job (else the shell), queried fresh: new tabs and
-    /// splits open here.
+    /// splits open here. Until the shell is up, where it was asked to start: a split made
+    /// right after another opened in `$HOME`.
     pub fn current_dir(&self) -> Option<PathBuf> {
-        self.session.as_ref()?.foreground()?.cwd
+        self.session
+            .as_ref()
+            .and_then(Session::foreground)
+            .and_then(|foreground| foreground.cwd)
+            .or_else(|| self.start_dir.clone())
     }
 
     /// Name of the foreground job if it is not the shell, queried fresh for confirmations.
@@ -500,7 +522,10 @@ impl TerminalPane {
             self.layouts += 1;
         }
         self.geometry = Some(geometry);
-        if self.grid != Some(grid) && (!self.frozen || self.grid.is_none()) {
+        // Not even a new pane's first size while frozen: a pane split off grows in from
+        // nothing, and its shell starting one row high, then grown, put its blank screen into
+        // scrollback and pulled it back above the prompt, which sat at the bottom.
+        if self.grid != Some(grid) && !self.frozen {
             self.grid = Some(grid);
             if let Some(session) = &self.session {
                 session.resize(grid);

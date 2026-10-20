@@ -27,11 +27,13 @@ owns every process, PID and file descriptor it creates.
 ## Features
 
 - **Vertical tabs** in a sidebar. A ring marks a tab with a running job, and a dot marks one
-  whose job finished while you weren't looking. Drag a tab up or down to reorder it, and
-  double-click it to rename it (IME works, Chinese included). How much of the blurred desktop
-  shows through the sidebar is a setting.
-- **Split panes** that animate open and closed. They share the tab evenly whenever a pane
-  comes or goes. Drag the dividers; the focused pane is the bright one.
+  whose job finished while you weren't looking. Drag a tab up or down to reorder it: it lifts
+  off the list and follows the pointer while the others slide out of its way. Double-click
+  it to rename it (IME works, Chinese included). A new tab is named for its folder. How much
+  of the blurred desktop shows through the sidebar is a setting.
+- **Split panes** that animate open and closed, with the keys or the two buttons at the top
+  right of the tab. A new pane opens where the pane it split is. They share the tab evenly
+  whenever a pane comes or goes. Drag the dividers; the focused pane is the bright one.
 - **Jobs outlive the window.** A small session server (`kil --server`, the same binary) holds
   every pane's terminal. `⌘Q` and closing the window only detach from it, and so does a crash.
   The next launch goes back on the same processes, with the full screen, scrollback and input

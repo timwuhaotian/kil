@@ -6,6 +6,20 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Dragging a tab shows it moving.** The row lifts off the sidebar and follows the pointer
+  up and down, an open slot shows where it will land, the rows it passes slide out of its
+  way, and when you let go it settles into place.
+- **Split buttons** at the top right of the tab split the focused pane right or down, the
+  same as `⌘⇧D` and `⌘D`.
+- Tab titles are semibold, so they stand out from the folder line under them.
+- A new tab is named for its folder at once, instead of “shell” until its shell started.
+- A split made right after another, before the pane it split had its shell, opened in your
+  home folder; it now opens where that pane is.
+- A pane split off below had its first prompt at the bottom of the pane instead of the top.
+  It grew in from nothing, and its shell started one row high: growing pulled the blank
+  screen back from scrollback above the prompt. A new pane now takes its size once the
+  split has settled.
+
 ## 0.0.9 — 2026-10-21
 
 - **Check for Updates shows what it's doing.** A small window opens at once and follows the

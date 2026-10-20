@@ -49,7 +49,8 @@ Build status:
 | A22 | Five themes (Night, Paper, Fjord, Ember, Dusk), picked from swatches in Settings or with `theme` in `config.toml`. A change restyles the chrome and every pane at once, and programs that ask for the terminal's colors (OSC 10/11/4, e.g. vim choosing light or dark) get the new palette. | `theme` tests, `color_queries_should_follow_the_theme_palette`, contrast checked (§7). |
 | A23 | With a default directory set, new tabs open there (`cmd-t`, `+ New Tab`, a double-click on the sidebar, the first tab of a fresh launch). Splits still open where their pane is. Without one, a new tab follows the focused pane, as before. | `workspace` GPUI test + manual. |
 | A24 | Whenever a tab's panes change — a split (`cmd-shift-d`, `cmd-d`) or a closed pane (`cmd-shift-c`, a shell's `exit 0`) — the tab shares its space equally again among all its panes, the first one included: panes side by side share the width and panes stacked share the height, however the tab was split (`1 | 2 | 3` gets thirds whichever pane was split). Each split animates to its children's share of the panes along its axis; panes stacked across it count as their longest line. Double-clicking any divider does the same. A dragged divider holds until the next pane change or double-click, and a restored layout keeps its saved ratios. | `pane_tree` unit tests + `panes_should_share_a_tab_evenly_again_after_a_pane_closes` + `double_clicking_a_divider_should_share_the_tab_equally_again` + manual. |
-| A25 | Dragging a sidebar row moves its tab: as the pointer passes over another row the dragged tab takes its place, the rows between shift, and the active tab stays active. A press without a drag is still a click, and a row being renamed doesn't drag. The order is what the next launch reopens. | `dragging_a_row_should_move_its_tab_and_keep_the_active_one` + manual. |
+| A25 | Dragging a sidebar row moves its tab: the row lifts off the list (opaque, with a shadow) and follows the pointer up and down, held to the sidebar's column, while an open slot shows where it will drop. As the pointer passes over another row the dragged tab takes its place and the rows between slide over (`ROW_SHIFT`); let go, the row settles from under the pointer into its slot (`ROW_DROP`). The active tab stays active. A press without a drag is still a click, and a row being renamed doesn't drag. The order is what the next launch reopens. | `dragging_a_row_should_move_its_tab_and_keep_the_active_one` + manual. |
+| A27 | Two buttons at the top right of the tab split the focused pane right and down, as `cmd-shift-d` and `cmd-d` do. They are faint until the pointer is over them, and a click on them doesn't reach the pane below. | `the_split_buttons_should_split_the_focused_pane` + manual. |
 | A26 | Double-clicking the sidebar's top strip (the title bar the window doesn't draw, where the traffic lights are) does what System Settings ▸ Desktop & Dock says a title-bar double-click does: by default the window fills the screen, and the next double-click puts it back. | Manual (CGEvent double-click, window bounds before and after). |
 | A27 | Kil updates itself (§15). Five seconds after launch and every six hours, with `auto_update` on (the default), it reads `releases/latest.toml` on `main`; for a newer version it downloads the DMG and keeps its app only if the SHA-256, the version, the Developer ID team (the running app's) and Apple's notarization all check out. Quitting Kil, however it quits, then replaces the bundle, so the next launch is the new version; running jobs keep running in the session server. **Kil ▸ Check for Updates…** (or **Check Now** in Settings) opens a window that follows the check (checking, the download's bytes against its size, verifying) and then says it is up to date, why it can't update, or offers **Restart Now** and **Later**; the menu item becomes **Restart to Update to x.y.z**, which quits without asking about jobs and reopens the new app. An ad-hoc-signed build, a bare binary and a copy run from the DMG never replace themselves. | `update` tests (the committed release passes every check, the download reports its bytes, the swap), `update_window` test (the window follows a check to **Later**) + manual: a Developer ID build labelled older updates on quit. |
 
@@ -222,8 +223,8 @@ Queries:
   3. **Verify `e_tdev == tty`.**
   4. Read the name from `pbi_name`/`pbi_comm` and the cwd from `PROC_PIDVNODEPATHINFO`.
 - **Busy** means `tpgid != shell pgid` (F7).
-- **Cwd for a new tab or pane** is a fresh synchronous query on the focused pane: the foreground leader's cwd, falling back to the shell's cwd.
-- **Tab title:** the OSC 0/2 title if set. Otherwise the foreground name when busy. Otherwise the shell cwd with `~` abbreviation. Refreshed at most every 250 ms after a `Wakeup`, and on focus. Never per frame.
+- **Cwd for a new tab or pane** is a fresh synchronous query on the focused pane: the foreground leader's cwd, falling back to the shell's cwd. A pane whose shell is not up yet answers with the directory it was asked to start in: a split made right after another used to open in `$HOME`.
+- **Tab title:** the OSC 0/2 title if set. Otherwise the foreground name when busy. Otherwise the shell cwd's folder name (`~` for the home directory). Until the shell is up, a fresh pane shows the folder it starts in, not a placeholder. Refreshed at most every 250 ms after a `Wakeup`, and on focus. Never per frame.
 - **Background tabs.** A session stays dirty until it is snapshotted and sends no `Wakeup` while dirty, and a pane in a background tab is never drawn. Its title and busy state therefore froze after its first output, so a finished job kept its ring and never got its dot. The info refresh now calls `Session::take_dirty`, which re-arms wakeups at most once per 250 ms per undrawn pane, and marks the pane's frame stale so its next draw snapshots.
 - A busy → idle transition emits `PaneEvent::JobFinished`. The tab records it as *done* unless it is the active tab of an active window, and selecting the tab or reactivating the window clears it (A17).
 
@@ -370,7 +371,7 @@ high-water mark** and making it visible.
 
 ### 6.3 Resize policy
 
-- *As built:* while a tab's layout is animating, every pane in it keeps its current grid (`TerminalPane::frozen`). Content is clipped to the animated bounds, which reads as a curtain. When the animation settles, the grid resizes once. That gives one `TIOCSWINSZ` per layout change without computing target pixel sizes. A newly created pane takes its first measured size immediately.
+- *As built:* while a tab's layout is animating, every pane in it keeps its current grid (`TerminalPane::frozen`). Content is clipped to the animated bounds, which reads as a curtain. When the animation settles, the grid resizes once. That gives one `TIOCSWINSZ` per layout change without computing target pixel sizes. A pane split off mid-animation is frozen too and takes no size until it settles: it grows in from nothing, and a shell started one row high and then grown had its blank screen in scrollback, pulled back above the prompt, which sat at the bottom.
 - While a divider is dragged, at most one resize is sent per frame, and only when rows or columns actually change.
 
 ### 6.4 Budgets and how to measure
@@ -408,10 +409,11 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 - `WindowBackgroundAppearance::Blurred` behind the sidebar. The terminal area stays opaque for readability and to avoid overdraw.
 
 **Sidebar** (220 px)
-- 44 px rows with a title (13 pt medium) and the cwd (11 pt, middle-truncated).
+- 44 px rows with a title (13 pt semibold) and the cwd (11 pt, middle-truncated).
 - A 10 px status slot before the title (A17): an accent **ring** while a pane runs a job, an accent **dot** for a job that ended out of view, and a red **!** for an exit banner. The marks differ in shape as well as color. They are static, because a spinner would redraw the window every frame for as long as a dev server runs. There is an `×` on hover.
 - A footer `+ New Tab` button. Double-clicking empty sidebar space also opens a tab; double-clicking the strip above the rows zooms the window (A26).
 - Rows drag up and down to reorder the tabs (A25).
+- Split Right and Split Down buttons sit at the top right of the tab, over the terminal, at 45% opacity until hovered (A27); notices start below them.
 - Right-click on a row opens a menu: Rename Tab…, Reset Name, Close Tab. A rename edits the title in place in a `TextField`. The user's name overrides the pane's title in the row, in the closing ghost and in the window title.
 - The selection highlight is a rounded 8 px pill that **slides** between rows.
 
@@ -433,6 +435,8 @@ reduce-motion hook.
 |---|---|---|---|
 | Tab added | row height 0→44, opacity 0→1 | 180 ms | `ease_out_quint` |
 | Tab removed | reverse | 140 ms | `ease_in_out` |
+| Row passed by a dragged row | y offset ±1 row→0 | 140 ms | `ease_out_quint` |
+| Dragged row let go | y offset from the pointer→0 | 180 ms | `ease_out_quint` |
 | Tab selected | pill y | 160 ms | `ease_out_quint` |
 | Split | ratio 1.0→0.5 | 200 ms | `ease_out_quint` |
 | Panes changed | every other split's ratio →0.5 | 200 ms | `ease_out_quint` |

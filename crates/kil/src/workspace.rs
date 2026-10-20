@@ -63,6 +63,10 @@ actions!(
 const SIDEBAR_WIDTH: f32 = 220.;
 const SIDEBAR_TOP: f32 = 52.;
 const ROW_HEIGHT: f32 = 44.;
+/// The rows' inset from the sidebar's edges.
+const ROWS_INSET: f32 = 8.;
+/// The split buttons at the top right of the tab.
+const SPLIT_BUTTONS_HEIGHT: f32 = 24.;
 /// The row's status mark; the cwd line indents past it to align with the title.
 const STATUS_SLOT: f32 = 10.;
 const TITLE_INSET: f32 = STATUS_SLOT + 6.;
@@ -98,6 +102,9 @@ struct Tab {
     animating: bool,
     /// What this tab's panes cost the machine; read every [`MEMORY_INTERVAL`].
     memory: u64,
+    /// Offset of the row from its slot, in rows; eases to 0 as it makes room for a dragged
+    /// row, or settles into place after a drop.
+    shift: Tween,
 }
 
 /// What the panes cost, and how the system is doing (DESIGN.md §5.2).
@@ -213,6 +220,71 @@ struct DividerDrag {
 #[derive(Clone, Copy)]
 struct TabDrag(TabId);
 
+/// The row being dragged: where in it the pointer took it, and where its slot is now.
+#[derive(Clone, Copy)]
+struct RowDrag {
+    tab: TabId,
+    grab: Point<Pixels>,
+    slot_top: Pixels,
+}
+
+/// The dragged row, lifted off the list: it follows the pointer up and down while the slot
+/// it will drop into stays open below.
+#[derive(Clone)]
+struct RowPreview {
+    title: SharedString,
+    cwd: SharedString,
+    status: TabStatus,
+    chrome: Chrome,
+    /// Where across the row it was taken, to keep it in the sidebar's column.
+    grab_x: Pixels,
+}
+
+impl Render for RowPreview {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let chrome = self.chrome;
+        // Drawn at the pointer, less where the row was taken; held to the column, so the
+        // row moves only up and down, as the list does.
+        let left = px(ROWS_INSET) - (window.mouse_position().x - self.grab_x);
+        div().child(
+            div()
+                .absolute()
+                .left(left)
+                .top_0()
+                .w(px(SIDEBAR_WIDTH - 2. * ROWS_INSET))
+                .h(px(ROW_HEIGHT))
+                .rounded_lg()
+                // The sidebar is translucent; a lifted row is not.
+                .bg(Hsla {
+                    a: 1.,
+                    ..chrome.sidebar_bg
+                })
+                .shadow_lg()
+                .child(
+                    div()
+                        .size_full()
+                        .px_3()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(chrome.divider)
+                        .bg(chrome.selected)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(TITLE_INSET - STATUS_SLOT))
+                                .child(status_mark(self.status, chrome))
+                                .child(row_title(self.title.clone(), None, true, chrome)),
+                        )
+                        .child(row_cwd(self.cwd.clone(), chrome)),
+                ),
+        )
+    }
+}
+
 struct EmptyDrag;
 
 /// The sidebar, drawn as a view of its own: output in a pane or a cursor blink redraws the
@@ -292,6 +364,7 @@ pub struct Workspace {
     /// Held by the open menu so Escape reaches it instead of the terminal.
     menu_focus: FocusHandle,
     rename: Option<Rename>,
+    dragging: Option<RowDrag>,
     notices: Vec<SharedString>,
     config: config::Stamp,
     pane_subscriptions: HashMap<EntityId, Subscription>,
@@ -378,6 +451,7 @@ impl Workspace {
             menu: None,
             menu_focus: cx.focus_handle(),
             rename: None,
+            dragging: None,
             notices,
             config: config::stamp(),
             pane_subscriptions: HashMap::new(),
@@ -504,6 +578,7 @@ impl Workspace {
                 finished: false,
                 animating: false,
                 memory: 0,
+                shift: Tween::settled(0.),
             });
         }
         if held_back {
@@ -676,6 +751,7 @@ impl Workspace {
             finished: false,
             animating: false,
             memory: 0,
+            shift: Tween::settled(0.),
         });
     }
 
@@ -706,6 +782,33 @@ impl Workspace {
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
         self.active = index(&self.tabs, active).unwrap_or(0);
+        // The rows between slide over by one, from where they are, rather than jump.
+        let now = Instant::now();
+        let (between, by) = if from < to {
+            (from..to, 1.)
+        } else {
+            (to + 1..from + 1, -1.)
+        };
+        for tab in &mut self.tabs[between] {
+            tab.shift.set(tab.shift.value(now) + by);
+            tab.shift
+                .retarget(0., motion::ROW_SHIFT, Ease::OutQuint, now);
+        }
+        cx.notify();
+    }
+
+    /// The dragged row was let go: it settles from under the pointer into its slot.
+    fn drop_row(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.dragging.take() else {
+            return;
+        };
+        let top = window.mouse_position().y - drag.grab.y;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == drag.tab) {
+            let now = Instant::now();
+            tab.shift.set((top - drag.slot_top) / px(ROW_HEIGHT));
+            tab.shift
+                .retarget(0., motion::ROW_DROP, Ease::OutQuint, now);
+        }
         cx.notify();
     }
 
@@ -1274,7 +1377,8 @@ impl Workspace {
                 self.pane_subscriptions.remove(&gone.entity_id());
             }
             let animating = tab.tree.is_animating(now);
-            if animating != tab.animating {
+            // While animating too, for a pane split off mid-animation.
+            if animating || animating != tab.animating {
                 tab.animating = animating;
                 for pane in tab.tree.leaves() {
                     pane.update(cx, |pane, cx| pane.set_frozen(animating, cx));
@@ -1286,7 +1390,7 @@ impl Workspace {
     /// What [`Sidebar`] draws.
     fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
-        if self.pill.is_animating(now) {
+        if self.pill.is_animating(now) || self.tabs.iter().any(|tab| tab.shift.is_animating(now)) {
             // Asked from the sidebar's render, so it is the sidebar that draws the next frame.
             window.request_animation_frame();
         }
@@ -1333,7 +1437,7 @@ impl Workspace {
                     .id("tabs")
                     .flex_1()
                     .overflow_y_scroll()
-                    .px_2()
+                    .px(px(ROWS_INSET))
                     .flex()
                     .flex_col()
                     // Rows stop their clicks, so this is a double-click on the empty space.
@@ -1386,7 +1490,15 @@ impl Workspace {
             .map(|rename| rename.field.clone());
         let status = tab.status(cx);
         let active = index == self.active;
-        let pill = active.then(|| {
+        let lifted = cx.has_active_drag() && self.dragging.is_some_and(|drag| drag.tab == id);
+        let preview = RowPreview {
+            title: title.clone(),
+            cwd: info.cwd.clone(),
+            status,
+            chrome,
+            grab_x: px(0.),
+        };
+        let pill = (active && !lifted).then(|| {
             div()
                 .absolute()
                 .left_0()
@@ -1400,11 +1512,26 @@ impl Workspace {
             .id(ElementId::NamedInteger("tab".into(), id.0))
             .group("tab-row");
         // Not while renaming: a drag in the field selects its text.
-        reorderable(row, id, editing.is_none(), cx)
+        let row = reorderable(row, id, editing.is_none().then_some(preview), cx)
             .relative()
+            .top(px(ROW_HEIGHT * tab.shift.value(now)))
             .flex_none()
             .h(px(ROW_HEIGHT))
-            .px_3()
+            .rounded_lg();
+        if lifted {
+            // The open slot the lifted row will drop into.
+            return row
+                .child(
+                    div()
+                        .size_full()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(chrome.hover)
+                        .bg(chrome.hover),
+                )
+                .into_any_element();
+        }
+        row.px_3()
             .flex()
             .flex_col()
             .justify_center()
@@ -1444,15 +1571,7 @@ impl Workspace {
                     })
                     .child(tab_close(id, chrome, cx)),
             )
-            .child(
-                div()
-                    .relative()
-                    .pl(px(TITLE_INSET))
-                    .truncate()
-                    .text_size(px(11.))
-                    .text_color(chrome.muted)
-                    .child(info.cwd),
-            )
+            .child(row_cwd(info.cwd, chrome).relative())
             .with_animation(
                 ElementId::NamedInteger("tab-in".into(), id.0),
                 Animation::new(motion::ROW_IN).with_easing(|t| Ease::OutQuint.apply(t)),
@@ -1697,6 +1816,72 @@ fn render_split(
         .into_any_element()
 }
 
+/// Split Right and Split Down, at the top right of the tab: quiet until the pointer comes.
+fn split_buttons(chrome: Chrome, cx: &mut Context<Workspace>) -> impl IntoElement {
+    let button = |axis: Axis| {
+        let horizontal = axis == Axis::Horizontal;
+        // A pane with its divider: across for Split Right, down for Split Down.
+        let line = div().absolute().bg(chrome.text).map(|line| {
+            if horizontal {
+                line.top_0().bottom_0().left(px(6.)).w(px(1.))
+            } else {
+                line.left_0().right_0().top(px(4.5)).h(px(1.))
+            }
+        });
+        div()
+            .id(if horizontal {
+                "split-right"
+            } else {
+                "split-down"
+            })
+            .size(px(SPLIT_BUTTONS_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(chrome.hover))
+            .debug_selector(move || {
+                if horizontal {
+                    "split-right"
+                } else {
+                    "split-down"
+                }
+                .to_owned()
+            })
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.split(axis, window, cx);
+            }))
+            .child(
+                div()
+                    .relative()
+                    .w(px(14.))
+                    .h(px(11.))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(chrome.text)
+                    .child(line),
+            )
+    };
+    div()
+        .id("split-buttons")
+        .absolute()
+        .top_2()
+        .right_2()
+        .p(px(2.))
+        .flex()
+        .gap(px(2.))
+        .rounded_lg()
+        .bg(chrome.terminal_bg)
+        .opacity(0.45)
+        .hover(|style| style.opacity(1.))
+        // Clicks here are the buttons', not the pane's below.
+        .occlude()
+        .child(button(Axis::Horizontal))
+        .child(button(Axis::Vertical))
+}
+
 /// The 1px line plus a 7px grab area. Drawn last so the grab area sits above both panes.
 /// Dragging it moves the divider; double-clicking it shares the tab equally again.
 fn divider(
@@ -1803,23 +1988,55 @@ fn split_id_bits(tab: TabId, split: SplitId) -> u64 {
     (tab.0 << 32) ^ split.bits()
 }
 
-/// Lets `row` be dragged (when `draggable`) and takes the dragged tab's place when the pointer
-/// passes over it.
+/// Lets `row` be dragged (when it has a `preview`, the row lifted) and takes the dragged
+/// tab's place when the pointer passes over it.
 fn reorderable(
     row: Stateful<Div>,
     id: TabId,
-    draggable: bool,
+    preview: Option<RowPreview>,
     cx: &mut Context<Workspace>,
 ) -> Stateful<Div> {
-    row.when(draggable, |row| {
-        row.on_drag(TabDrag(id), |_, _, _, cx| cx.new(|_| EmptyDrag))
+    let workspace = cx.entity().downgrade();
+    row.when_some(preview, |row, preview| {
+        row.on_drag(TabDrag(id), move |_, grab, _, cx| {
+            let _ = workspace.update(cx, |this, cx| {
+                this.dragging = Some(RowDrag {
+                    tab: id,
+                    grab,
+                    slot_top: px(0.),
+                });
+                cx.notify();
+            });
+            let preview = RowPreview {
+                grab_x: grab.x,
+                ..preview.clone()
+            };
+            cx.new(|_| preview)
+        })
     })
     .on_drag_move(
         cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
             let TabDrag(dragged) = *event.drag(cx);
             let (y, row) = (event.event.position.y, event.bounds);
+            if dragged == id {
+                if let Some(drag) = &mut this.dragging {
+                    drag.slot_top = row.top();
+                }
+                return;
+            }
+            // Where the row rests, not where it is sliding through: a row sliding away under
+            // the pointer would be passed again, and the two would trade places back and forth.
+            let Some(shift) = this
+                .tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| px(ROW_HEIGHT * tab.shift.value(Instant::now())))
+            else {
+                return;
+            };
+            let top = row.top() - shift;
             // Rows are one height, so the dragged row lands under the pointer and stays.
-            if dragged != id && row.top() <= y && y < row.bottom() {
+            if top <= y && y < top + px(ROW_HEIGHT) {
                 this.move_tab(dragged, id, cx);
             }
         }),
@@ -1959,7 +2176,11 @@ fn row_title(
     active: bool,
     chrome: Chrome,
 ) -> Div {
-    let title_box = div().flex_1().min_w_0().text_size(px(13.));
+    let title_box = div()
+        .flex_1()
+        .min_w_0()
+        .text_size(px(13.))
+        .font_weight(FontWeight::SEMIBOLD);
     match editing {
         Some(field) => title_box.text_color(chrome.text).child(field),
         None => title_box
@@ -1967,6 +2188,16 @@ fn row_title(
             .text_color(if active { chrome.text } else { chrome.muted })
             .child(title),
     }
+}
+
+/// The row's second line: where its focused pane is.
+fn row_cwd(cwd: SharedString, chrome: Chrome) -> Div {
+    div()
+        .pl(px(TITLE_INSET))
+        .truncate()
+        .text_size(px(11.))
+        .text_color(chrome.muted)
+        .child(cwd)
 }
 
 fn render_ghost(ghost: &Ghost, chrome: Chrome) -> AnyElement {
@@ -1983,6 +2214,7 @@ fn render_ghost(ghost: &Ghost, chrome: Chrome) -> AnyElement {
                 .pl(px(TITLE_INSET))
                 .truncate()
                 .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(chrome.muted)
                 .child(ghost.title.clone()),
         )
@@ -2062,6 +2294,11 @@ impl Render for Workspace {
         if active_animating {
             window.request_animation_frame();
         }
+        // A row let go outside the window drops nowhere; the drag just ends.
+        if self.dragging.is_some() && !cx.has_active_drag() {
+            self.dragging = None;
+            self.sidebar.update(cx, |_, cx| cx.notify());
+        }
         if let Some(tab) = self.tabs.get(self.active) {
             let title = tab.title(cx);
             if title != self.window_title {
@@ -2086,7 +2323,7 @@ impl Render for Workspace {
             div()
                 .id("notices")
                 .absolute()
-                .top_3()
+                .top(px(SPLIT_BUTTONS_HEIGHT + 16.))
                 .right_3()
                 .max_w(px(460.))
                 .flex()
@@ -2116,6 +2353,7 @@ impl Render for Workspace {
         let root = select_tab_listeners(bind_actions(root, cx), cx);
         root.flex()
             .size_full()
+            .on_drop(cx.listener(|this, _: &TabDrag, window, cx| this.drop_row(window, cx)))
             .child(
                 AnyView::from(self.sidebar.clone()).cached(
                     StyleRefinement::default()
@@ -2131,6 +2369,9 @@ impl Render for Workspace {
                     .h_full()
                     .bg(chrome.terminal_bg)
                     .children(content)
+                    .when(!self.tabs.is_empty(), |el| {
+                        el.child(split_buttons(chrome, cx))
+                    })
                     .children(notices),
             )
             .children(self.menu.map(|menu| self.render_menu(menu, chrome, cx)))
@@ -2369,6 +2610,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_tab_made_before_its_shell_is_up_should_have_its_folder_and_splits_follow_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = workspace(cx);
+        let dir = std::path::PathBuf::from("/usr");
+        cx.update(|_, cx| {
+            let settings = Settings {
+                default_directory: Some(dir.clone()),
+                ..cx.global::<Settings>().clone()
+            };
+            cx.set_global(settings);
+        });
+        // Each split comes before the pane it splits has its shell.
+        workspace.update_in(cx, |this, window, cx| {
+            this.new_tab(&NewTab, window, cx);
+            this.split(Axis::Horizontal, window, cx);
+            this.split(Axis::Vertical, window, cx);
+        });
+        // Named for its folder at once, not "shell" until its shell is up.
+        let title = workspace.read_with(cx, |this, cx| this.tabs[this.active].title(cx));
+        assert_eq!(title, SharedString::from("usr"));
+        let dirs = workspace.read_with(cx, |this, cx| {
+            let tab = &this.tabs[this.active];
+            tab.tree
+                .leaves()
+                .iter()
+                .map(|pane| pane.read(cx).start_dir().cloned())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(dirs, vec![Some(dir); 3]);
+    }
+
+    #[gpui::test]
     fn dragging_a_row_should_move_its_tab_and_keep_the_active_one(cx: &mut TestAppContext) {
         let (workspace, cx) = workspace(cx);
         cx.dispatch_action(NewTab);
@@ -2397,6 +2671,12 @@ mod tests {
                 modifiers: Modifiers::none(),
             });
         }
+        // The row is lifted off the list, its slot left open where it will drop.
+        let lifted = workspace.read_with(cx, |this, _| this.dragging.map(|drag| drag.tab));
+        assert_eq!(
+            lifted,
+            workspace.read_with(cx, |this, _| Some(this.tabs[2].id))
+        );
         cx.simulate_event(MouseUpEvent {
             position: ROW + point(px(0.), px(ROW_HEIGHT * 2.)),
             button: MouseButton::Left,
@@ -2415,6 +2695,33 @@ mod tests {
             (names, active),
             (vec!["b".into(), "c".into(), "a".into()], Some("c".into()))
         );
+        assert!(workspace.read_with(cx, |this, _| this.dragging.is_none()));
+    }
+
+    #[gpui::test]
+    fn the_split_buttons_should_split_the_focused_pane(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let axes = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |this, _| {
+                fn axes(node: &Node<Entity<TerminalPane>>, out: &mut Vec<Axis>) {
+                    if let Node::Split(split) = node {
+                        out.push(split.axis);
+                        axes(&split.first, out);
+                        axes(&split.second, out);
+                    }
+                }
+                let mut out = Vec::new();
+                axes(this.tabs[this.active].tree.root(), &mut out);
+                out
+            })
+        };
+        let right = cx.debug_bounds("split-right").expect("split right drawn");
+        click(cx, right.center(), MouseButton::Left, 1);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let down = cx.debug_bounds("split-down").expect("split down drawn");
+        click(cx, down.center(), MouseButton::Left, 1);
+        assert_eq!(axes(cx), [Axis::Horizontal, Axis::Vertical]);
     }
 
     #[gpui::test]
@@ -2549,6 +2856,29 @@ mod tests {
         let screen = pane.read_with(cx, |pane, _| pane.screen_text());
         assert!(screen.contains("GOT:^[[<64;"), "{screen}");
         assert!(!screen.contains("GOT:^[[A") && !screen.contains("GOT:^[OA"));
+    }
+
+    #[gpui::test]
+    fn a_pane_split_off_below_should_start_its_prompt_at_the_top(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(SplitDown);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        let settled = |cx: &mut VisualTestContext| {
+            let animating = workspace.read_with(cx, |this, _| this.tabs[0].animating);
+            let cursor = pane.read_with(cx, |pane, _| pane.frame.cursor);
+            !animating
+                && pane.read_with(cx, |pane, _| !pane.screen_text().trim().is_empty())
+                && cursor.is_some()
+        };
+        wait_for(cx, settled);
+        // The shell's first output, once the split has settled.
+        std::thread::sleep(Duration::from_millis(300));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let (rows, cursor) = pane.read_with(cx, |pane, _| (pane.frame.rows, pane.frame.cursor));
+        let row = cursor.expect("cursor in view").row;
+        assert!(rows > 10, "{rows} rows");
+        assert!(row < 4, "prompt on row {row} of {rows}");
     }
 
     #[gpui::test]
