@@ -309,6 +309,11 @@ impl TerminalPane {
             .join("\n")
     }
 
+    /// Whether [`Self::take_screen`] has a screen to give.
+    pub fn screen_changed(&self) -> bool {
+        self.screen_changed && self.session.is_some()
+    }
+
     /// The screen to save, if it changed since last taken.
     pub fn take_screen(&mut self) -> Option<(String, Transcript)> {
         let session = self.session.as_ref().filter(|_| self.screen_changed)?;

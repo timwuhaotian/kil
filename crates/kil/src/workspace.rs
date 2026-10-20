@@ -70,6 +70,11 @@ const TITLE_INSET: f32 = STATUS_SLOT + 6.;
 const STOPPED: &str = "will be stopped";
 /// While anything changes, the session is saved at most this often: what a crash can lose.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
+/// While output continues, screens are saved at most this often. A saved screen is for when
+/// the session server is lost too (a restart, or the server crashing): a crash of Kil or a
+/// quit leaves the jobs and their screens in the server, and quitting saves screens at once.
+/// Each save of a long colored scrollback holds that pane's terminal for milliseconds.
+const SCREEN_INTERVAL: Duration = Duration::from_secs(30);
 /// A crash within this long after reopening is blamed on the re-run jobs (DESIGN.md §4.9).
 const RESTORE_SETTLE: Duration = Duration::from_secs(10);
 /// How often the panes' memory is read, for the sidebar's figures (DESIGN.md §5.2).
@@ -274,8 +279,10 @@ pub struct Workspace {
     /// The window is leaving: what the next launch reopens is saved, or (after the last tab
     /// closed) cleared, and nothing may overwrite it.
     ended: bool,
-    /// The next throttled save; see [`Self::schedule_save`].
-    save_task: Option<Task<()>>,
+    /// The next throttled save, and when it runs; see [`Self::save_in`].
+    save_task: Option<(Instant, Task<()>)>,
+    /// When the screens were last taken for saving; `None` until they first are.
+    screens_saved: Option<Instant>,
     pane_ids: PaneIds,
     frame: SavedWindow,
     window_title: SharedString,
@@ -325,6 +332,10 @@ impl Workspace {
             this.frame = SavedWindow::of(window.window_bounds());
             this.schedule_save(cx);
         });
+        // What a restore would show changes only with the workspace's own state, which
+        // notifies it. Not on every redraw: a cursor blink or a pane's output redraws the
+        // window, and saving for that kept an idle window saving every 2 s.
+        let changed = cx.observe_self(Self::schedule_save);
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             tabs: Vec::new(),
@@ -343,6 +354,7 @@ impl Workspace {
             store: None,
             ended: false,
             save_task: None,
+            screens_saved: None,
             pane_ids: PaneIds::new(),
             frame: SavedWindow::of(window.window_bounds()),
             window_title: SharedString::default(),
@@ -351,7 +363,7 @@ impl Workspace {
             blinking: None,
             memory_task: None,
             memory: MemoryState::default(),
-            _subscriptions: vec![activation, quitting, moved],
+            _subscriptions: vec![activation, quitting, moved, changed],
         };
         if let Some(store) = store.clone() {
             // From here on, a crash is not the reopened jobs' doing.
@@ -479,41 +491,75 @@ impl Workspace {
     /// Saves soon, at most once per [`SAVE_INTERVAL`] however much changes, so a crash or a
     /// forced quit loses little. Writing happens off the UI thread.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        if self.store.is_none() || self.ended || self.save_task.is_some() {
+        self.save_in(SAVE_INTERVAL, cx);
+    }
+
+    /// Saves the screens that output changed, at most once per [`SCREEN_INTERVAL`].
+    fn schedule_screens(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let wait = self.screens_saved.map_or(Duration::ZERO, |at| {
+            SCREEN_INTERVAL.saturating_sub(now.saturating_duration_since(at))
+        });
+        self.save_in(wait.max(SAVE_INTERVAL), cx);
+    }
+
+    /// Saves in `delay`, or sooner if a save is already due sooner.
+    fn save_in(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        if self.store.is_none() || self.ended {
             return;
         }
-        self.save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SAVE_INTERVAL).await;
+        let at = cx.background_executor().now() + delay;
+        if self.save_task.as_ref().is_some_and(|(due, _)| *due <= at) {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |this, cx| {
                 this.save_task = None;
-                if let Some(snapshot) = this.snapshot(cx) {
+                if let Some(snapshot) = this.snapshot(false, cx) {
                     cx.background_spawn(async move { snapshot.write() })
                         .detach();
                 }
             });
-        }));
+        });
+        self.save_task = Some((at, task));
     }
 
     /// Saves on this thread, for when the window closes or the app quits: before the sessions
     /// end, since it is their jobs that get saved.
     fn save_now(&mut self, cx: &mut Context<Self>) {
         self.save_task = None;
-        if let Some(snapshot) = self.snapshot(cx) {
+        if let Some(snapshot) = self.snapshot(true, cx) {
             snapshot.write();
             snapshot.store.settled();
         }
     }
 
-    /// What the next launch needs, taken now; `None` once the sessions have ended.
-    fn snapshot(&mut self, cx: &mut Context<Self>) -> Option<Snapshot> {
+    /// What the next launch needs, taken now; `None` once the sessions have ended. Screens
+    /// that changed are taken if `all_screens`, or once [`SCREEN_INTERVAL`] has passed since
+    /// they last were; until then they wait for a later save.
+    fn snapshot(&mut self, all_screens: bool, cx: &mut Context<Self>) -> Option<Snapshot> {
         let store = self.store.clone().filter(|_| !self.ended)?;
+        let now = cx.background_executor().now();
+        let screens_due = all_screens
+            || self
+                .screens_saved
+                .is_none_or(|at| now.saturating_duration_since(at) >= SCREEN_INTERVAL);
+        if screens_due {
+            self.screens_saved = Some(now);
+        }
         let ticket = store.ticket();
         let mut screens = Vec::new();
+        let mut waiting = false;
         let mut tabs = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
             let root = tab.tree.shape().map(&mut |pane: &Entity<TerminalPane>| {
                 pane.update(cx, |pane, _| {
-                    screens.extend(pane.take_screen());
+                    if screens_due {
+                        screens.extend(pane.take_screen());
+                    } else {
+                        waiting |= pane.screen_changed();
+                    }
                     pane.saved()
                 })
             });
@@ -527,6 +573,9 @@ impl Workspace {
                     .unwrap_or(0),
                 root,
             });
+        }
+        if waiting {
+            self.schedule_screens(cx);
         }
         let saved = SavedWorkspace {
             active: self.active,
@@ -836,7 +885,7 @@ impl Workspace {
                 }
             }
             PaneEvent::Closed => self.remove_pane(pane, window, cx),
-            PaneEvent::Output => self.schedule_save(cx),
+            PaneEvent::Output => self.schedule_screens(cx),
         }
     }
 
@@ -1987,8 +2036,6 @@ select_tab_handlers!(
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Whatever re-renders the window may have changed what a restore would show.
-        self.schedule_save(cx);
         let now = Instant::now();
         self.settle(now, cx);
         let active_animating = self
@@ -2625,6 +2672,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[gpui::test]
+    fn redrawing_should_not_schedule_a_save(cx: &mut TestAppContext) {
+        let dir = scratch_dir("redraw");
+        let (workspace, cx) = workspace_saving_to(Some(Store::at(dir)), cx);
+        workspace.update(cx, |this, _| this.save_task = None);
+        // What a cursor blink, or output in a pane, does to the window.
+        cx.update(|window, _| window.refresh());
+        assert!(workspace.read_with(cx, |this, _| this.save_task.is_none()));
+    }
+
+    #[gpui::test]
+    fn output_should_save_screens_less_often_than_layout_changes(cx: &mut TestAppContext) {
+        let dir = scratch_dir("screens");
+        let (workspace, cx) = workspace_saving_to(Some(Store::at(dir)), cx);
+        let due = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |this, _| this.save_task.as_ref().map(|(at, _)| *at))
+        };
+        let now = cx.executor().now();
+        workspace.update(cx, |this, cx| {
+            this.save_task = None;
+            this.screens_saved = Some(now);
+            this.schedule_screens(cx);
+        });
+        assert_eq!(due(cx), Some(now + SCREEN_INTERVAL));
+        // A layout change still reaches the disk within SAVE_INTERVAL.
+        cx.dispatch_action(SplitDown);
+        assert_eq!(due(cx), Some(now + SAVE_INTERVAL));
     }
 
     #[gpui::test]

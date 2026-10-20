@@ -130,7 +130,7 @@ pub struct Store {
     /// Saves are numbered when taken and run on any thread; an older one never overwrites a
     /// newer `session.toml`.
     taken: Arc<AtomicU64>,
-    written: Arc<Mutex<u64>>,
+    written: Arc<Mutex<Written>>,
     /// A hash of each pane's screen as last written. A pane that printed without changing
     /// what it shows (a prompt drawn again, a spinner) is offered again at every save.
     screens: Arc<Mutex<HashMap<String, u64>>>,
@@ -153,7 +153,7 @@ impl Store {
         Self {
             dir,
             taken: Arc::new(AtomicU64::new(0)),
-            written: Arc::new(Mutex::new(0)),
+            written: Arc::default(),
             screens: Arc::default(),
         }
     }
@@ -231,12 +231,17 @@ impl Store {
             .written
             .lock()
             .map_err(|_| "session.toml: a save panicked".to_owned())?;
-        if ticket < *written {
+        if ticket < written.ticket {
             return Ok(());
         }
-        write_whole(&self.session(), text.as_bytes()).map_err(fail)?;
-        *written = ticket;
-        self.forget_others(saved);
+        // Saves are taken on any change the window notices, most of which leave the layout
+        // as it was: then the file is too.
+        if text != written.session {
+            write_whole(&self.session(), text.as_bytes()).map_err(fail)?;
+            self.forget_others(saved);
+            written.session = text;
+        }
+        written.ticket = ticket;
         Ok(())
     }
 
@@ -244,7 +249,10 @@ impl Store {
     pub fn clear(&self) {
         let ticket = self.ticket();
         if let Ok(mut written) = self.written.lock() {
-            *written = ticket;
+            *written = Written {
+                ticket,
+                session: String::new(),
+            };
         }
         self.screens().clear();
         remove(&self.session());
@@ -298,6 +306,13 @@ impl Store {
         screens.insert(id.to_owned(), hash);
         Ok(())
     }
+}
+
+/// The newest save written, and the `session.toml` it wrote.
+#[derive(Default)]
+struct Written {
+    ticket: u64,
+    session: String,
 }
 
 /// Written beside, then renamed over: a crash mid-write never leaves half a file.
@@ -495,6 +510,27 @@ mod tests {
             (store.transcript("old-1"), store.transcript("kept-1")),
             (Vec::new(), b"y".to_vec())
         );
+    }
+
+    #[test]
+    fn save_should_not_rewrite_an_unchanged_layout() {
+        use std::os::unix::fs::MetadataExt;
+
+        let store = scratch("same-layout");
+        let inode = || fs::metadata(store.session()).unwrap().ino();
+        let saved = |active| SavedWorkspace {
+            active,
+            ..SavedWorkspace::default()
+        };
+        store.save(store.ticket(), &saved(1), &[]).unwrap();
+        let first = inode();
+        store.save(store.ticket(), &saved(1), &[]).unwrap();
+        assert_eq!(inode(), first);
+        store.save(store.ticket(), &saved(2), &[]).unwrap();
+        assert_ne!(inode(), first);
+        store.clear();
+        store.save(store.ticket(), &saved(2), &[]).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().saved.active, 2);
     }
 
     #[test]
