@@ -215,6 +215,30 @@ struct TabDrag(TabId);
 
 struct EmptyDrag;
 
+/// The sidebar, drawn as a view of its own: output in a pane or a cursor blink redraws the
+/// window, and this view is then reused instead of laying out and painting every row again.
+/// Everything it shows is the workspace's, which is notified when any of it changes.
+struct Sidebar {
+    workspace: WeakEntity<Workspace>,
+    #[cfg(test)]
+    renders: usize,
+    _workspace_changed: Subscription,
+}
+
+impl Render for Sidebar {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.render_sidebar(window, cx).into_any_element()
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 impl Render for EmptyDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -288,6 +312,7 @@ pub struct Workspace {
     window_title: SharedString,
     /// Font size from the config file, for `font_reset`.
     base_font_size: f32,
+    sidebar: Entity<Sidebar>,
     /// The window's one cursor-blink timer; see [`Self::sync_blink`].
     blink: Option<Task<()>>,
     /// The pane it last blinked, so a pane that loses focus is left with its cursor drawn.
@@ -336,6 +361,13 @@ impl Workspace {
         // notifies it. Not on every redraw: a cursor blink or a pane's output redraws the
         // window, and saving for that kept an idle window saving every 2 s.
         let changed = cx.observe_self(Self::schedule_save);
+        let workspace = cx.entity();
+        let sidebar = cx.new(|cx| Sidebar {
+            workspace: workspace.downgrade(),
+            #[cfg(test)]
+            renders: 0,
+            _workspace_changed: cx.observe(&workspace, |_, _, cx| cx.notify()),
+        });
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             tabs: Vec::new(),
@@ -359,6 +391,7 @@ impl Workspace {
             frame: SavedWindow::of(window.window_bounds()),
             window_title: SharedString::default(),
             base_font_size: f32::from(cx.global::<Settings>().font_size),
+            sidebar,
             blink: None,
             blinking: None,
             memory_task: None,
@@ -1250,12 +1283,14 @@ impl Workspace {
         }
     }
 
-    fn render_sidebar(
-        &self,
-        now: Instant,
-        chrome: Chrome,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// What [`Sidebar`] draws.
+    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        if self.pill.is_animating(now) {
+            // Asked from the sidebar's render, so it is the sidebar that draws the next frame.
+            window.request_animation_frame();
+        }
+        let chrome = Chrome::of(cx.global::<Theme>());
         let mut rows: Vec<AnyElement> = self
             .ghosts
             .iter()
@@ -1815,13 +1850,13 @@ fn reorderable(
     )
 }
 
-/// A tab's memory figure, in the row's title line.
 /// A memory figure as the sidebar shows it: its label, and whether it warns. `None` below
 /// [`SHOWN_MEMORY`], where the row stays quiet.
 fn shown_memory(bytes: u64) -> Option<(String, bool)> {
     (bytes >= SHOWN_MEMORY).then(|| (byte_label(bytes), bytes >= HEAVY_MEMORY))
 }
 
+/// A tab's memory figure, in the row's title line.
 fn memory_label((label, heavy): (String, bool), chrome: Chrome) -> Div {
     div()
         .flex_none()
@@ -2048,7 +2083,7 @@ impl Render for Workspace {
             .tabs
             .get(self.active)
             .is_some_and(|tab| tab.tree.is_animating(now));
-        if active_animating || self.pill.is_animating(now) {
+        if active_animating {
             window.request_animation_frame();
         }
         if let Some(tab) = self.tabs.get(self.active) {
@@ -2105,7 +2140,14 @@ impl Render for Workspace {
         let root = select_tab_listeners(bind_actions(root, cx), cx);
         root.flex()
             .size_full()
-            .child(self.render_sidebar(now, chrome, cx))
+            .child(
+                AnyView::from(self.sidebar.clone()).cached(
+                    StyleRefinement::default()
+                        .w(px(SIDEBAR_WIDTH))
+                        .h_full()
+                        .flex_none(),
+                ),
+            )
             .child(
                 div()
                     .relative()
@@ -2613,6 +2655,23 @@ mod tests {
         // A change of the pane's own does lay its grid out again.
         pane.update(cx, |_, cx| cx.notify());
         assert_eq!(layouts(cx), before + 1);
+    }
+
+    #[gpui::test]
+    fn output_in_a_pane_should_not_redraw_the_sidebar(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        let sidebar = workspace.read_with(cx, |this, _| this.sidebar.clone());
+        let renders =
+            |cx: &mut VisualTestContext| sidebar.read_with(cx, |sidebar, _| sidebar.renders);
+        cx.update(|window, _| window.refresh());
+        let before = renders(cx);
+        // What new output does to a pane.
+        pane.update(cx, |_, cx| cx.notify());
+        assert_eq!(renders(cx), before);
+        // The workspace's own changes are the sidebar's.
+        workspace.update(cx, |_, cx| cx.notify());
+        assert_eq!(renders(cx), before + 1);
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
