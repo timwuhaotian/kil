@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/kil-term", "crates/kil"]
+# gpui 0.2.2 with a change of ours (vendor/gpui/KIL.md): a dependency, not a member.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.7"
@@ -30,6 +32,9 @@ env_logger = "0.11"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

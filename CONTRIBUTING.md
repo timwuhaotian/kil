@@ -39,6 +39,9 @@ reaping and leaks. They must leave no process behind. One test expects your logi
 - **Keep the layers.** `kil-term` has no UI and owns processes, PTYs and the session server;
   `kil` is the GPUI app. Unsafe code lives in `kil-term/src/sys/`, each block with a
   `SAFETY` comment.
+- **`vendor/gpui`** is gpui 0.2.2 with one change of ours, so idle windows stop asking for
+  frames; its `KIL.md` says what changed and how to update it. Mark any change there
+  `Modified for Kil`.
 - **Comments explain why**, not what. Match the density and style of the code around you.
 - **Commit messages** start with a short summary in the imperative or as a statement of what
   now happens ("IME text and candidates follow a hidden cursor"), then explain the problem and

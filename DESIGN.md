@@ -72,7 +72,7 @@ These are left out and can be added later:
 
 | Concern | Choice | Why |
 |---|---|---|
-| UI, GPU, text, input | **`gpui = "=0.2.2"`** (Apache-2.0) | Metal renderer with display-link frames and no frames when idle. It has an action and keymap system with key contexts (the customizable-shortcut requirement), `with_animation` and easings, `request_animation_frame`, `AnyView::cached`, `EntityInputHandler` (IME), transparent titlebar and blurred window background, and a `leak-detection` feature for tests. All of these were confirmed in the 0.2.2 source. Shaders compile at build time with the installed Xcode Metal toolchain. Pinned exactly because the API is pre-1.0 and changes between versions. |
+| UI, GPU, text, input | **`gpui = "=0.2.2"`** (Apache-2.0), from `vendor/gpui` | Metal renderer with display-link frames. Kil builds a copy of 0.2.2 with one change, through `[patch.crates-io]`: a window with nothing to draw stops its display link (`vendor/gpui/KIL.md`, §13). It has an action and keymap system with key contexts (the customizable-shortcut requirement), `with_animation` and easings, `request_animation_frame`, `AnyView::cached`, `EntityInputHandler` (IME), transparent titlebar and blurred window background, and a `leak-detection` feature for tests. All of these were confirmed in the 0.2.2 source. Shaders compile at build time with the installed Xcode Metal toolchain. Pinned exactly because the API is pre-1.0 and changes between versions. |
 | VT parser, grid, PTY I/O loop | **`alacritty_terminal = "=0.26.0"`** (Apache-2.0) | Proven parser, grid, selection and damage tracking. Its `EventLoop` is generic over the public `EventedPty + OnResize` traits. |
 | PTY spawn and child lifecycle | **Our own `Pty`**, implementing alacritty's public traits | alacritty's `tty::new` fails on macOS in measured ways (§4.1). We keep its parser and loop and replace only spawn, exit detection and teardown. |
 | Darwin syscalls | `libc = "0.2"` | `openpty`, `proc_pidinfo`, `proc_listchildpids`, `tcgetpgrp`, `kevent`. All of these exist in 0.2.183. |
@@ -366,6 +366,7 @@ high-water mark** and making it visible.
   2. Glyph runs. A run breaks on a style change **and never spans a `WIDE_CHAR`**. Each run is placed at `col × cell_w`, so fallback CJK fonts can't drift the grid.
   3. Selection, cursor and IME preedit (underlined, at the cursor).
 - Each pane is wrapped in `AnyView::cached`, so output in one pane doesn't re-prepaint its siblings. Verify this in M4 by counting prepaints.
+- *As built:* the cursor is a cached view of its own (`TerminalCursor`), drawn over its pane's view as a sibling, so a blink redraws one quad instead of laying out and painting the grid (`a_cursor_blink_should_redraw_the_cursor_and_not_the_grid`). It follows the pane's notifications, since output, scrolling and resizes move it. The sidebar is a cached view too, following the workspace's own notifications: a pane's redraw marks every view above it dirty, and the sidebar used to be drawn by the workspace's render (`output_in_a_pane_should_not_redraw_the_sidebar`).
 
 ### 6.3 Resize policy
 
@@ -386,7 +387,10 @@ high-water mark** and making it visible.
 
 **Measured** (release, one pane, M4 Pro, macOS 27.0):
 - **Throughput.** `seq 1 3000000` takes 3.5–4.0 s, and 300k colored lines with CJK take 0.5 s. That's the macOS PTY limit: BSD `script` relaying the same `seq` through a PTY takes 4.6 s. The PTY thread spends ~70% of its time in `read`/`kevent` and ~22% in the VT parser. The UI thread uses ~0.25 s over the whole run, about 0.5 ms per frame.
-- **Idle.** 0.35% with blink off and 0.7% with blink on. The floor is GPUI 0.2.2's `CVDisplayLink`, which runs at every vsync while the window is visible, even with nothing to draw (it stops only when the window is occluded). A12's 0.0% is not reachable without changing GPUI (§13).
+- **Idle.** 0.00% with blink off, over 20 s. It was 0.35–0.40%: GPUI 0.2.2's `CVDisplayLink` ran at every vsync while the window was visible, even with nothing to draw. The vendored GPUI stops it after 8 idle frames and starts it again when the window becomes dirty, a frame callback is scheduled, or input arrives (§13).
+- **Blink on.** 0.67% in a 1000×700 window full of colored text (1.2% before), 0.80% with ten tabs (1.33%). A blink redraws the cursor's view only (§6.2), but GPUI still submits the whole scene: ~1.8 ms per blink, against 2.9 ms when the grid was laid out again.
+- **A program whose memory creeps** (100 KB/s, below the 100 MB the sidebar shows): 0 redraws in 30 s and 0.03% CPU; before, 14 redraws (one per memory reading) and 0.90%, since readings were compared byte for byte (§5.2).
+- **Streaming.** A frame of a full-screen TUI streaming at full speed takes 0.81 ms, and no longer grows with the number of tabs (0.92 ms with one tab and 1.12 ms with ten before the sidebar was cached). The app's CPU while streaming is the mirror's parse (§14.4), ~76% of a core at full speed; the UI thread ~5%.
 - **Blink.** One timer per window, running only while the window is active, for the focused pane only. Before, there was one 530 ms timer per pane, focused or not.
 - **Zombies.** 0 after every run.
 
@@ -653,13 +657,13 @@ Each milestone ends on a proof, not on a feature count.
 
 | Risk | Mitigation now | Trigger to change course |
 |---|---|---|
-| GPUI API churn | Exact pin `=0.2.2`. GPUI is used only in the `kil` crate. | Upgrade deliberately, one bump per PR. |
+| GPUI API churn | Exact pin `=0.2.2`, built from `vendor/gpui` with one change (`Modified for Kil`). GPUI is used only in the `kil` crate. | Upgrade deliberately, one bump per PR, carrying the change over (`vendor/gpui/KIL.md`). |
 | Fork latency of a large GUI process | Spawn on the spawner thread, with the animation masking it. | p95 spawn > 10 ms in the app → switch to `posix_spawn(SETSID\|CLOEXEC_DEFAULT\|SETSIGDEF\|SETSIGMASK)` plus a tiny `kil-exec` helper (TIOCSCTTY, then exec). posix_spawn measured 0.34 ms. |
 | Allocator retains freed scrollback | Line budget, ledger, the sidebar's figures (§5). | Total scrollback > 1 GiB in real use → add a global cap that trims the least-recently-viewed panes' history. |
 | A program in a pane grows until the machine starves | The sidebar's per-tab figure and the system's own pressure (§5.2). | A pane's program regularly needs > 2 GB → offer to end it, or a per-pane cap. |
 | One thread per session | Documented cost. | Regularly > 100 panes → a shared kqueue I/O thread with a custom loop. |
 | `AnyView::cached` doesn't isolate panes | Count prepaints in M4. | Siblings re-prepaint → per-row shaped-line cache (§5.3). |
-| GPUI's display link runs whenever the window is visible | Measured floor: 0.35% idle CPU (§6.4). | Idle CPU matters more than the GPUI pin → patch GPUI to stop the link when no frame is requested, and restart it on `request_frame`. |
+| GPUI's display link runs whenever the window is visible | **Done:** the vendored GPUI stops it after 8 idle frames and starts it again on dirt, `on_next_frame` or input; idle CPU 0.00% (§6.4). Upstream (2026-10) still runs it while visible. | A frame that should come doesn't (a path that dirties the window without waking it) → wake from that path too. |
 | Re-shaping every run each frame (§5.3) | UI thread ~0.5 ms per frame while streaming. | Frame drops with 4 streaming panes at 120 fps → per-row shaped-line cache keyed by row content. |
 | Residual TOCTOU on `killpg` of a non-child group | Identity re-check right before the signal. | None needed: by default we never kill non-child groups. |
 | TCC and App Nap behavior on macOS 27 | Info.plist keys and entitlements. | Fails the M6 fresh-install check → adjust the keys and entitlements. |
