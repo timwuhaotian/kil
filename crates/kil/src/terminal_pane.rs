@@ -25,7 +25,7 @@ use crate::{
     keys,
     restore::{self, SavedPane},
     settings::{Settings, abbreviate_home},
-    terminal_element::{TerminalElement, cells},
+    terminal_element::{TerminalCursor, TerminalElement, cells},
     theme::Theme,
 };
 
@@ -114,7 +114,8 @@ pub struct TerminalPane {
     grid: Option<GridSize>,
     pub(crate) geometry: Option<Geometry>,
     pub(crate) marked_text: Option<String>,
-    pub(crate) cursor_visible: bool,
+    /// Drawn over the pane as a view of its own; see [`TerminalCursor`].
+    cursor: Entity<TerminalCursor>,
     last_input: Instant,
     scroll_remainder: f32,
     selecting: bool,
@@ -130,6 +131,9 @@ pub struct TerminalPane {
     rerun: Option<String>,
     /// Output arrived since the screen was last taken for saving.
     screen_changed: bool,
+    /// How many times the grid was laid out: once per redraw of this pane's view.
+    #[cfg(test)]
+    pub(crate) layouts: usize,
     _tasks: Vec<Task<()>>,
 }
 
@@ -187,6 +191,8 @@ impl TerminalPane {
             }),
             cx.spawn(async move |this, cx| pump(this, rx, cx).await),
         ];
+        let pane = cx.entity();
+        let cursor = cx.new(|cx| TerminalCursor::new(&pane, cx));
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -199,7 +205,7 @@ impl TerminalPane {
             grid: None,
             geometry: None,
             marked_text: None,
-            cursor_visible: true,
+            cursor,
             last_input: Instant::now(),
             scroll_remainder: 0.,
             selecting: false,
@@ -213,6 +219,8 @@ impl TerminalPane {
             start_dir: cwd,
             rerun,
             screen_changed: false,
+            #[cfg(test)]
+            layouts: 0,
             _tasks: tasks,
         }
     }
@@ -487,6 +495,10 @@ impl TerminalPane {
 
     /// Called by the element each prepaint with the laid-out grid.
     pub(crate) fn layout(&mut self, grid: GridSize, geometry: Geometry, palette: &Palette) {
+        #[cfg(test)]
+        {
+            self.layouts += 1;
+        }
         self.geometry = Some(geometry);
         if self.grid != Some(grid) && (!self.frozen || self.grid.is_none()) {
             self.grid = Some(grid);
@@ -512,7 +524,7 @@ impl TerminalPane {
         session.clear_selection();
         session.write(bytes);
         self.last_input = Instant::now();
-        self.cursor_visible = true;
+        self.show_cursor(cx);
         cx.notify();
     }
 
@@ -635,20 +647,23 @@ impl TerminalPane {
     /// One blink step; the window's cursor timer calls it on the focused pane only.
     pub fn blink(&mut self, window: &Window, cx: &mut Context<Self>) {
         let active = self.focus_handle.is_focused(window) && window.is_window_active();
-        // Keep the cursor solid while typing.
-        let visible = !active || self.last_input.elapsed() < BLINK_INTERVAL || !self.cursor_visible;
-        if visible != self.cursor_visible {
-            self.cursor_visible = visible;
-            cx.notify();
-        }
+        let typing = self.last_input.elapsed() < BLINK_INTERVAL;
+        self.cursor.update(cx, |cursor, cx| {
+            // Keep the cursor solid while typing.
+            let visible = !active || typing || !cursor.visible;
+            cursor.set_visible(visible, cx);
+        });
     }
 
     /// Leaves the cursor drawn, for when blinking stops or moves to another pane.
     pub fn show_cursor(&mut self, cx: &mut Context<Self>) {
-        if !self.cursor_visible {
-            self.cursor_visible = true;
-            cx.notify();
-        }
+        self.cursor
+            .update(cx, |cursor, cx| cursor.set_visible(true, cx));
+    }
+
+    /// The view that draws this pane's cursor, over the pane.
+    pub fn cursor(&self) -> &Entity<TerminalCursor> {
+        &self.cursor
     }
 
     fn banner(&self) -> Option<SharedString> {
@@ -673,9 +688,8 @@ impl TerminalPane {
 }
 
 impl Render for TerminalPane {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.global::<Theme>();
-        let focused = self.focus_handle.is_focused(window);
         let banner = self.banner().map(|text| {
             div()
                 .absolute()
@@ -707,7 +721,7 @@ impl Render for TerminalPane {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll))
-            .child(TerminalElement::new(cx.entity(), focused))
+            .child(TerminalElement::new(cx.entity()))
             .children(banner)
     }
 }

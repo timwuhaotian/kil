@@ -1591,12 +1591,12 @@ fn render_node(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     match node {
-        Node::Leaf(pane) => render_leaf(pane, tab, chrome),
+        Node::Leaf(pane) => render_leaf(pane, tab, chrome, cx),
         Node::Split(split) => render_split(split, tab, now, chrome, cx),
     }
 }
 
-fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome) -> AnyElement {
+fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App) -> AnyElement {
     let focused = *pane == tab.focused;
     let several = matches!(tab.tree.root(), Node::Split(_));
     let dim = several.then(|| {
@@ -1613,6 +1613,11 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome) -> AnyEle
         .overflow_hidden()
         // Cached: output in one pane doesn't re-render its siblings.
         .child(AnyView::from(pane.clone()).cached(StyleRefinement::default().size_full()))
+        // A sibling, not a child, of the pane's view: a blink redraws only the cursor.
+        .child(
+            AnyView::from(pane.read(cx).cursor().clone())
+                .cached(StyleRefinement::default().absolute().inset_0()),
+        )
         .children(dim)
         .into_any_element()
 }
@@ -2592,6 +2597,22 @@ mod tests {
         assert!(blinking(cx));
         cx.deactivate_window();
         assert!(!blinking(cx));
+    }
+
+    #[gpui::test]
+    fn a_cursor_blink_should_redraw_the_cursor_and_not_the_grid(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        let cursor = pane.read_with(cx, |pane, _| pane.cursor().clone());
+        let layouts = |cx: &mut VisualTestContext| pane.read_with(cx, |pane, _| pane.layouts);
+        // Everything drawn once, so what follows is the only change.
+        cx.update(|window, _| window.refresh());
+        let before = layouts(cx);
+        cursor.update(cx, |cursor, cx| cursor.set_visible(false, cx));
+        assert_eq!(layouts(cx), before);
+        // A change of the pane's own does lay its grid out again.
+        pane.update(cx, |_, cx| cx.notify());
+        assert_eq!(layouts(cx), before + 1);
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {

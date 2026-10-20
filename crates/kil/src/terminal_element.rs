@@ -1,11 +1,12 @@
-//! Paints a pane's grid: merged backgrounds, grid-locked glyph runs, cursor, IME text
-//! (DESIGN.md §6.2).
+//! Paints a pane's grid: merged backgrounds, grid-locked glyph runs and IME text; and, as a
+//! view of its own, the pane's cursor (DESIGN.md §6.2).
 
 use gpui::{
-    App, BorderStyle, Bounds, Element, ElementId, Entity, Focusable, Font, FontStyle, FontWeight,
-    Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
-    Point, ShapedLine, SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window,
-    fill, outline, point, px, relative, size,
+    App, BorderStyle, Bounds, Context, Element, ElementId, Entity, Focusable, Font, FontStyle,
+    FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
+    PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, StrikethroughStyle, Style,
+    Subscription, TextRun, UnderlineStyle, WeakEntity, Window, fill, outline, point, px, relative,
+    size,
 };
 use kil_term::{CellFlags, CursorShape, Frame, GridSize, RenderCell, Rgba};
 
@@ -21,12 +22,11 @@ const LINE_HEIGHT: f32 = 1.25;
 
 pub struct TerminalElement {
     pane: Entity<TerminalPane>,
-    focused: bool,
 }
 
 impl TerminalElement {
-    pub fn new(pane: Entity<TerminalPane>, focused: bool) -> Self {
-        Self { pane, focused }
+    pub fn new(pane: Entity<TerminalPane>) -> Self {
+        Self { pane }
     }
 }
 
@@ -34,14 +34,12 @@ pub struct Layout {
     line_height: Pixels,
     backgrounds: Vec<PaintQuad>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
-    cursor: Option<PaintQuad>,
     overlays: Vec<(Point<Pixels>, ShapedLine)>,
 }
 
 /// Colors the element needs, copied out of the theme so `cx` is free for the pane update.
 struct Colors {
     default_bg: Rgba,
-    cursor: Hsla,
     selection: Hsla,
 }
 
@@ -157,7 +155,6 @@ impl Element for TerminalElement {
         let palette = theme.terminal.clone();
         let colors = Colors {
             default_bg: palette.background,
-            cursor: hsla(palette.cursor),
             selection: theme.selection_bg,
         };
 
@@ -173,11 +170,9 @@ impl Element for TerminalElement {
             cell_width: pixels_u16(cell_width),
             cell_height: pixels_u16(line_height),
         };
-        let focused = self.focused;
         self.pane.update(cx, |pane, _| {
             pane.layout(grid, geometry, &palette);
             let mut layout = build(&pane.frame, geometry, &font, font_size, &colors, window);
-            layout.cursor = cursor(&pane.frame, geometry, &colors, focused, pane.cursor_visible);
             if let Some(text) = &pane.marked_text {
                 layout.overlays.extend(marked(
                     &pane.frame,
@@ -209,9 +204,6 @@ impl Element for TerminalElement {
             if let Err(err) = line.paint(*origin, layout.line_height, window, cx) {
                 log::warn!("glyph paint failed: {err}");
             }
-        }
-        if let Some(cursor) = layout.cursor.take() {
-            window.paint_quad(cursor);
         }
         for (origin, line) in &layout.overlays {
             let _ = line.paint(*origin, layout.line_height, window, cx);
@@ -338,15 +330,125 @@ fn build(
         line_height: cell.height,
         backgrounds,
         lines,
-        cursor: None,
         overlays: Vec::new(),
+    }
+}
+
+/// A pane's cursor, drawn over the pane as a view of its own. A blink then redraws this one
+/// quad: when the pane drew it, every blink laid out and painted every glyph of the grid
+/// again (~2.9 ms twice a second for a screen of colored text, measured).
+///
+/// It follows the pane's notifications, since output, scrolling or a resize move the cursor;
+/// the blink notifies only this.
+pub struct TerminalCursor {
+    pane: WeakEntity<TerminalPane>,
+    /// The blink's phase.
+    pub(crate) visible: bool,
+    _pane_changed: Subscription,
+}
+
+impl TerminalCursor {
+    pub fn new(pane: &Entity<TerminalPane>, cx: &mut Context<Self>) -> Self {
+        Self {
+            pane: pane.downgrade(),
+            visible: true,
+            _pane_changed: cx.observe(pane, |_, _, cx| cx.notify()),
+        }
+    }
+
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for TerminalCursor {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        CursorElement {
+            pane: self.pane.clone(),
+            visible: self.visible,
+        }
+    }
+}
+
+struct CursorElement {
+    pane: WeakEntity<TerminalPane>,
+    visible: bool,
+}
+
+impl IntoElement for CursorElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for CursorElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<PaintQuad>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        &mut (): &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let color = hsla(cx.global::<Theme>().terminal.cursor);
+        let pane = self.pane.upgrade()?;
+        let focused = pane.focus_handle(cx).is_focused(window);
+        // The pane's own prepaint, earlier in this frame, laid out the grid and took the
+        // frame this reads.
+        let pane = pane.read(cx);
+        cursor(&pane.frame, pane.geometry?, color, focused, self.visible)
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        &mut (): &mut Self::RequestLayoutState,
+        cursor: &mut Self::PrepaintState,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        if let Some(cursor) = cursor.take() {
+            window.paint_quad(cursor);
+        }
     }
 }
 
 fn cursor(
     frame: &Frame,
     geometry: Geometry,
-    colors: &Colors,
+    color: Hsla,
     focused: bool,
     visible: bool,
 ) -> Option<PaintQuad> {
@@ -365,20 +467,20 @@ fn cursor(
     );
     let block = Bounds::new(at, size(width, cell.height));
     if !focused || cursor.shape == CursorShape::HollowBlock {
-        return Some(outline(block, colors.cursor, BorderStyle::Solid));
+        return Some(outline(block, color, BorderStyle::Solid));
     }
     if !visible {
         return None;
     }
     let bar = px(2.);
     Some(match cursor.shape {
-        CursorShape::Beam => fill(Bounds::new(at, size(bar, cell.height)), colors.cursor),
+        CursorShape::Beam => fill(Bounds::new(at, size(bar, cell.height)), color),
         CursorShape::Underline => fill(
             Bounds::new(point(at.x, at.y + cell.height - bar), size(width, bar)),
-            colors.cursor,
+            color,
         ),
         // Translucent so the glyph underneath stays readable without a second text pass.
-        CursorShape::Block | CursorShape::HollowBlock => fill(block, colors.cursor.opacity(0.7)),
+        CursorShape::Block | CursorShape::HollowBlock => fill(block, color.opacity(0.7)),
         CursorShape::Hidden => return None,
     })
 }
