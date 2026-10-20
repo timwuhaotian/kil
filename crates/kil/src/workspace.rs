@@ -1198,10 +1198,10 @@ impl Workspace {
             for pane in tab.tree.leaves() {
                 sum += pane.read(cx).memory();
             }
-            if sum != tab.memory {
-                tab.memory = sum;
-                changed = true;
-            }
+            // The bytes change at every reading of any running program; what the row shows
+            // seldom does, and a redraw for nothing is what keeps an idle window awake.
+            changed |= shown_memory(sum) != shown_memory(tab.memory);
+            tab.memory = sum;
             total += sum;
         }
         let system = kil_term::system::memory();
@@ -1211,9 +1211,8 @@ impl Workspace {
             swap_used: system.swap_used,
             swap_total: system.swap_total,
         };
-        if state.swap_line() != self.memory.swap_line() {
-            changed = true;
-        }
+        changed |= shown_memory(state.total) != shown_memory(self.memory.total)
+            || state.swap_line() != self.memory.swap_line();
         self.memory = state;
         // Only redraw when a figure on screen changed: the window sleeps otherwise.
         if changed {
@@ -1405,8 +1404,8 @@ impl Workspace {
                     .gap(px(TITLE_INSET - STATUS_SLOT))
                     .child(status_mark(status, chrome))
                     .child(row_title(title, editing, active, chrome))
-                    .when(tab.memory >= SHOWN_MEMORY, |row| {
-                        row.child(memory_label(tab.memory, chrome))
+                    .when_some(shown_memory(tab.memory), |row, shown| {
+                        row.child(memory_label(shown, chrome))
                     })
                     .child(tab_close(id, chrome, cx)),
             )
@@ -1812,16 +1811,18 @@ fn reorderable(
 }
 
 /// A tab's memory figure, in the row's title line.
-fn memory_label(memory: u64, chrome: Chrome) -> Div {
+/// A memory figure as the sidebar shows it: its label, and whether it warns. `None` below
+/// [`SHOWN_MEMORY`], where the row stays quiet.
+fn shown_memory(bytes: u64) -> Option<(String, bool)> {
+    (bytes >= SHOWN_MEMORY).then(|| (byte_label(bytes), bytes >= HEAVY_MEMORY))
+}
+
+fn memory_label((label, heavy): (String, bool), chrome: Chrome) -> Div {
     div()
         .flex_none()
         .text_size(px(11.))
-        .text_color(if memory >= HEAVY_MEMORY {
-            chrome.failure
-        } else {
-            chrome.muted
-        })
-        .child(byte_label(memory))
+        .text_color(if heavy { chrome.failure } else { chrome.muted })
+        .child(label)
 }
 
 /// The × of a tab row, shown while the pointer is over it.
@@ -1885,11 +1886,11 @@ fn ratio_label(used: u64, total: u64) -> String {
 fn memory_footer(memory: MemoryState, chrome: Chrome) -> Div {
     let mut row = div().mx_2().flex().gap_2().text_size(px(11.));
     let mut shown = false;
-    if memory.total >= SHOWN_MEMORY {
+    if let Some((label, _)) = shown_memory(memory.total) {
         row = row.child(
             div()
                 .text_color(chrome.muted)
-                .child(format!("Tabs {}", byte_label(memory.total))),
+                .child(format!("Tabs {label}")),
         );
         shown = true;
     }
@@ -2115,6 +2116,8 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use gpui::{
         Modifiers, MouseUpEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
         VisualTestContext, point,
@@ -2227,6 +2230,32 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(memory > 0, "the pane's program is not counted");
+    }
+
+    #[gpui::test]
+    fn memory_should_redraw_only_when_a_shown_figure_changes(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let notified = Rc::new(Cell::new(0));
+        let count = Rc::clone(&notified);
+        let _watch =
+            cx.update(|_, cx| cx.observe(&workspace, move |_, _| count.set(count.get() + 1)));
+        workspace.update(cx, Workspace::refresh_memory);
+        cx.run_until_parked();
+        notified.set(0);
+        // A program's resident memory moved by a few bytes, far below what the sidebar shows.
+        workspace.update(cx, |this, cx| {
+            this.tabs[0].memory += 4096;
+            this.refresh_memory(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(notified.get(), 0);
+        // Over the threshold, the row shows the figure: that is a change.
+        workspace.update(cx, |this, cx| {
+            this.tabs[0].memory = SHOWN_MEMORY * 2;
+            this.refresh_memory(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(notified.get(), 1);
     }
 
     #[test]
