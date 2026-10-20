@@ -2,12 +2,14 @@
 //! quits, reopened at the next launch however the last one ended (DESIGN.md §4.9).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
-    fs, io,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    io,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -129,6 +131,9 @@ pub struct Store {
     /// newer `session.toml`.
     taken: Arc<AtomicU64>,
     written: Arc<Mutex<u64>>,
+    /// A hash of each pane's screen as last written. A pane that printed without changing
+    /// what it shows (a prompt drawn again, a spinner) is offered again at every save.
+    screens: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl Store {
@@ -149,6 +154,7 @@ impl Store {
             dir,
             taken: Arc::new(AtomicU64::new(0)),
             written: Arc::new(Mutex::new(0)),
+            screens: Arc::default(),
         }
     }
 
@@ -217,7 +223,7 @@ impl Store {
         // Rendered now, from the live terminals: a late write is never older than an early one.
         for (id, transcript) in screens {
             if let Some(bytes) = transcript.render().filter(|_| is_valid_id(id)) {
-                write_whole(&self.transcript_path(id), &bytes).map_err(fail)?;
+                self.write_screen(id, &bytes).map_err(fail)?;
             }
         }
         let text = toml::to_string(saved).map_err(|err| format!("session.toml: {err}"))?;
@@ -240,6 +246,7 @@ impl Store {
         if let Ok(mut written) = self.written.lock() {
             *written = ticket;
         }
+        self.screens().clear();
         remove(&self.session());
         remove(&self.marker());
         if let Err(err) = fs::remove_dir_all(self.dir.join("panes"))
@@ -270,6 +277,26 @@ impl Store {
                 remove(&path);
             }
         }
+        self.screens().retain(|id, _| kept.contains(id));
+    }
+
+    fn screens(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+        self.screens.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Writes `bytes` as pane `id`'s screen, unless they are what its file already holds.
+    fn write_screen(&self, id: &str, bytes: &[u8]) -> io::Result<()> {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let hash = hasher.finish();
+        // Held across the write, so two saves can't each skip or record the other's.
+        let mut screens = self.screens();
+        if screens.get(id) == Some(&hash) {
+            return Ok(());
+        }
+        write_whole(&self.transcript_path(id), bytes)?;
+        screens.insert(id.to_owned(), hash);
+        Ok(())
     }
 }
 
@@ -468,6 +495,27 @@ mod tests {
             (store.transcript("old-1"), store.transcript("kept-1")),
             (Vec::new(), b"y".to_vec())
         );
+    }
+
+    #[test]
+    fn a_screen_should_be_written_only_when_it_changed() {
+        use std::os::unix::fs::MetadataExt;
+
+        let store = scratch("unchanged");
+        fs::create_dir_all(store.dir.join("panes")).unwrap();
+        // Every write is a new file renamed into place, so a new inode means a rewrite.
+        let inode = || fs::metadata(store.transcript_path("a-1")).unwrap().ino();
+        store.write_screen("a-1", b"same").unwrap();
+        let first = inode();
+        store.write_screen("a-1", b"same").unwrap();
+        assert_eq!(inode(), first);
+        store.write_screen("a-1", b"changed").unwrap();
+        assert_ne!(inode(), first);
+        // After a clear the file is gone, whatever was written before.
+        store.clear();
+        fs::create_dir_all(store.dir.join("panes")).unwrap();
+        store.write_screen("a-1", b"changed").unwrap();
+        assert_eq!(store.transcript("a-1"), b"changed");
     }
 
     #[test]
