@@ -35,8 +35,6 @@ use crate::{
 
 /// With no session and no client for this long, the server exits.
 const IDLE_EXIT: Duration = Duration::from_secs(5);
-/// How often the accept loop looks at whether it is idle.
-const IDLE_CHECK: Duration = Duration::from_secs(1);
 /// Natural exit after `StopAll` before the reaper escalates, as on quit (DESIGN.md §4.6).
 const STOP_GRACE: Duration = Duration::from_millis(500);
 /// `sun_path` holds 104 bytes on macOS, the NUL included.
@@ -166,21 +164,37 @@ fn listen(dir: &Path) -> io::Result<Option<Listening>> {
 }
 
 /// Sessions by id. A generation tells a session apart from a later one with the same id.
-#[derive(Default)]
 struct Registry {
     sessions: Mutex<HashMap<String, (u64, Session)>>,
     generation: AtomicU64,
     /// Connections being served that are not (yet) a session's.
     clients: AtomicUsize,
+    /// The accept loop's. It sleeps until a connection comes or something here goes away, so
+    /// a server with sessions never wakes on a timer just to see whether it is idle.
+    poller: Poller,
 }
 
 impl Registry {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            sessions: Mutex::default(),
+            generation: AtomicU64::new(0),
+            clients: AtomicUsize::new(0),
+            poller: Poller::new()?,
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, Session)>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn is_idle(&self) -> bool {
         self.clients.load(Ordering::Acquire) == 0 && self.lock().is_empty()
+    }
+
+    /// A session or a client went away: the accept loop looks again at whether it is idle.
+    fn changed(&self) {
+        let _ = self.poller.notify();
     }
 }
 
@@ -191,18 +205,18 @@ impl Listening {
                   `self` and is deleted before `run` returns"
     )]
     fn run(self) {
-        let registry = Arc::new(Registry::default());
-        let poller = match Poller::new() {
-            Ok(poller) => poller,
+        let registry = match Registry::new() {
+            Ok(registry) => Arc::new(registry),
             Err(err) => {
                 log::error!("session server: kqueue unavailable: {err}");
                 return;
             }
         };
+        let poller = &registry.poller;
         if let Err(err) = self.listener.set_nonblocking(true).and_then(|()| {
             // SAFETY: see the method's `expect`.
             // Level-triggered: `add`'s default one-shot would stop watching after the first
-            // connection, leaving later ones to the idle check's 1 s timeout.
+            // connection, and nothing would wake the loop for later ones.
             unsafe { poller.add_with_mode(&self.listener, Event::readable(0), PollMode::Level) }
         }) {
             log::error!("session server: cannot watch the socket: {err}");
@@ -211,8 +225,20 @@ impl Listening {
         let mut events = Events::new();
         let mut idle_since = None;
         loop {
+            // Busy, it sleeps until a connection or `Registry::changed`; idle, until it is
+            // time to exit.
+            let timeout = if registry.is_idle() {
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                match IDLE_EXIT.checked_sub(since.elapsed()) {
+                    Some(left) if !left.is_zero() => Some(left),
+                    _ => break,
+                }
+            } else {
+                idle_since = None;
+                None
+            };
             events.clear();
-            if let Err(err) = poller.wait(&mut events, Some(IDLE_CHECK))
+            if let Err(err) = poller.wait(&mut events, timeout)
                 && err.kind() != ErrorKind::Interrupted
             {
                 log::error!("session server: poll failed: {err}");
@@ -228,14 +254,6 @@ impl Listening {
                         break;
                     }
                 }
-            }
-            if registry.is_idle() {
-                let since = *idle_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= IDLE_EXIT {
-                    break;
-                }
-            } else {
-                idle_since = None;
             }
         }
         let _ = poller.delete(&self.listener);
@@ -258,17 +276,20 @@ fn accept(stream: UnixStream, registry: &Arc<Registry>) {
         }
     }
     registry.clients.fetch_add(1, Ordering::AcqRel);
-    let registry = Arc::clone(registry);
+    let served = Arc::clone(registry);
     let spawned = thread::Builder::new()
         .name("kil-server-client".into())
         .spawn(move || {
-            if let Err(err) = serve_client(stream, &registry) {
+            if let Err(err) = serve_client(stream, &served) {
                 log::debug!("session server: client ended: {err}");
             }
-            registry.clients.fetch_sub(1, Ordering::AcqRel);
+            served.clients.fetch_sub(1, Ordering::AcqRel);
+            served.changed();
         });
     if let Err(err) = spawned {
         log::error!("session server: no thread for a client: {err}");
+        // Counted above but never served: it must not keep the server from going idle.
+        registry.clients.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -304,6 +325,8 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
                         if sessions.get(&name).is_some_and(|(g, _)| *g == generation) {
                             sessions.remove(&name);
                         }
+                        drop(sessions);
+                        registry.changed();
                     }
                 };
                 let mut sessions = registry.lock();

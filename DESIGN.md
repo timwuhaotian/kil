@@ -773,7 +773,7 @@ Not automated: a peer with another uid (needs a second user), and the three-butt
 | **S1** ✅ | `kil-term`: `pane_loop.rs` replaces alacritty's `EventLoop` for sessions (same tests, still in-process), then `kil --server` with the protocol, remote sessions, `flock` and `getpeereid`. | All §4.8 tests pass through the pane loop, plus §14.7. |
 | **S2** ✅ | Attach state stream (§14.5), with the alt screen and modes. | `attach_should_rebuild_*`, `queries_should_be_answered_once_by_the_server`, `state.rs` unit tests. |
 | **S3** ✅ | App: connect or spawn the server, attach on launch, quit detaches, *Quit and Stop All Jobs*, close pane or tab, the extra tab for unknown sessions. | GPUI tests, and the real binary by hand: quit, `kill -9` and a killed server (see Build status). |
-| **S4** (partly) | Measured: throughput and echo latency (§14.4). **Open:** memory and the server's idle wakeups (one per second from its idle check), the TCC fresh-install check (§11) for a server that outlived its app, a hands-on pass with vim, ssh and a dev server, and the protocol hand-over (§14.3). | `ls ~/Desktop` from a reattached pane works on a fresh install. |
+| **S4** (partly) | Measured: throughput and echo latency (§14.4). The server has no timer while it has sessions or clients: a session ending or a client leaving wakes its accept loop, and only an idle server waits, for its exit (`the_server_should_exit_once_its_last_session_and_client_are_gone`). **Open:** memory, the TCC fresh-install check (§11) for a server that outlived its app, a hands-on pass with vim, ssh and a dev server, and the protocol hand-over (§14.3). | `ls ~/Desktop` from a reattached pane works on a fresh install. |
 
 ### 14.9 Risks and triggers
 

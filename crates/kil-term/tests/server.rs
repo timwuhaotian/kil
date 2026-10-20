@@ -214,6 +214,16 @@ fn the_socket_should_be_private_and_vanish_when_idle() {
 }
 
 #[test]
+fn the_server_should_exit_once_its_last_session_and_client_are_gone() {
+    let (dir, client) = server("last");
+    spawn(&client, "a-1", &sh("exec /bin/sleep 600")).close();
+    drop(client);
+    // No timer wakes a server that has sessions: their leaving must.
+    let socket = server::socket_path(&dir);
+    assert!(wait_until(Duration::from_secs(10), || !socket.exists()));
+}
+
+#[test]
 fn spawn_should_paint_the_replay_before_the_program_output() {
     let (_dir, client) = server("replay");
     let mut config = program("/bin/sh", &["-c", "printf NEW; exec /bin/sleep 600"]);
