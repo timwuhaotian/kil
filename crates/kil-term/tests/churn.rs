@@ -23,6 +23,21 @@ fn footprint() -> Footprint {
     }
 }
 
+/// The footprint once it holds still: a session's own thread ends a moment after its child
+/// is reaped, and a baseline taken in between counted it (4 threads, then 3 after the churn).
+fn settled_footprint() -> Footprint {
+    let mut last = footprint();
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        let now = footprint();
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
 #[expect(
     clippy::expect_used,
     reason = "test helper: a failed spawn fails the test"
@@ -41,7 +56,7 @@ fn churn_should_return_fds_threads_and_children_to_baseline() {
     assert!(wait_until(Duration::from_secs(5), || footprint()
         .children
         .is_empty()));
-    let baseline = footprint();
+    let baseline = settled_footprint();
 
     churn(500);
 
