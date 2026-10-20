@@ -36,9 +36,12 @@ owns every process, PID and file descriptor it creates.
   every pane's terminal. `⌘Q` and closing the window only detach from it, and so does a crash.
   The next launch goes back on the same processes, with the full screen, scrollback and input
   modes. **Kil ▸ Quit and Stop All Jobs** ends everything.
-- **Comes back after a restart, too.** The layout, each pane's directory, its screen and
-  scrollback, and the window frame are saved every 2 s. After a logout or a reboot, the
-  processes themselves are gone, so each pane's last job is typed into a new shell instead.
+- **Comes back after a restart, too.** The layout, each pane's directory and the window frame
+  are saved within 2 s of a change, and each pane's screen and scrollback every 30 s while it
+  prints, and at once when you quit. After a logout or a reboot, the processes themselves are
+  gone, so each pane's last job is typed into a new shell instead.
+- **Idle means idle.** A window with nothing to draw doesn't wake: no CPU at rest, and a
+  blinking cursor redraws only itself. Nothing is written to disk unless something changed.
 - **Updates itself, quietly.** Kil checks for a new release at launch and every six hours,
   downloads it in the background, checks its checksum, Developer ID signature and Apple
   notarization, and installs it when you quit. Jobs keep running across the update.
@@ -165,6 +168,7 @@ crates/
 │              src/sys/darwin.rs plus a few kqueue registrations, each with a SAFETY comment.
 └─ kil/        the GPUI app: window, sidebar, split tree, rendering, input and IME, keymap,
                settings, saving and restoring the session.
+vendor/gpui/   GPUI 0.2.2 with one change of ours: an idle window stops asking for frames.
 ```
 
 - Each pane's program runs in the **session server**, which owns its PTY and child. The app

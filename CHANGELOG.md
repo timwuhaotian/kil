@@ -6,6 +6,21 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.8 — 2026-10-20
+
+- **An idle Kil uses no CPU.** A window with nothing to draw stops asking macOS for frames: it
+  used to wake 60–120 times a second, 0.4% CPU on an M4 Pro, and now measures 0.0%. A blinking
+  cursor redraws only itself instead of the whole pane (1.2% to 0.7%), output in one pane no
+  longer lays the sidebar out again, and the memory figures redraw the sidebar only when one it
+  shows changes.
+- **Less writing to disk.** The session is saved when it changes, not at every redraw: a
+  blinking cursor used to rewrite `session.toml` every 2 s. Screens are saved at most every
+  30 s while output continues, and only when they changed; the session server keeps them
+  through a crash of Kil, and quitting still saves everything at once. Saving a long colored
+  scrollback holds its pane half as long.
+- The session server sleeps until a session or a client comes or goes, instead of waking
+  every second.
+
 ## 0.0.7 — 2026-10-20
 
 - The sidebar says what each tab's panes cost: the memory of the program running in it and
