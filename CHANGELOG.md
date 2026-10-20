@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.9 — 2026-10-21
+
 - **Check for Updates shows what it's doing.** A small window opens at once and follows the
   check: a sweeping bar while it asks for the latest version, a bar that fills with the
   download (“1.8 MB of 4.6 MB”), then the signature checks. When the new Kil is ready it
