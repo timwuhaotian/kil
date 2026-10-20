@@ -70,16 +70,42 @@ pub(crate) fn encode<T: EventListener>(term: &Term<T>) -> Option<Vec<u8>> {
 }
 
 /// Writes cells as text plus the SGR changes between them.
+///
+/// It runs under the terminal lock, over every cell of the scrollback (DESIGN.md §4.9), so
+/// the per-cell path allocates nothing and touches no reference counts.
 pub(crate) struct Painter {
     pub(crate) out: Vec<u8>,
-    pen: Cell,
+    pen: Pen,
+}
+
+/// What a cell's SGR attributes are made of. A plain copy: a whole `Cell` would clone its
+/// `Arc` of extras at every style change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Pen {
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+}
+
+impl Pen {
+    fn of(cell: &Cell) -> Self {
+        Self {
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags & STYLE,
+        }
+    }
+
+    fn plain() -> Self {
+        Self::of(&Cell::default())
+    }
 }
 
 impl Painter {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             out: Vec::with_capacity(capacity),
-            pen: Cell::default(),
+            pen: Pen::plain(),
         }
     }
 
@@ -123,16 +149,18 @@ impl Painter {
 
     /// Switches the SGR attributes to `cell`'s, if they differ.
     pub(crate) fn pen(&mut self, cell: &Cell) {
-        if !same_style(cell, &self.pen) {
-            push_sgr(&mut self.out, cell);
-            self.pen.clone_from(cell);
+        let pen = Pen::of(cell);
+        if pen != self.pen {
+            push_sgr(&mut self.out, pen);
+            self.pen = pen;
         }
     }
 
     pub(crate) fn reset(&mut self) {
-        if !same_style(&self.pen, &Cell::default()) {
+        let plain = Pen::plain();
+        if self.pen != plain {
             self.out.extend_from_slice(b"\x1b[0m");
-            self.pen = Cell::default();
+            self.pen = plain;
         }
     }
 }
@@ -144,19 +172,21 @@ fn is_blank(cell: &Cell) -> bool {
         && cell.zerowidth().is_none()
 }
 
-fn same_style(a: &Cell, b: &Cell) -> bool {
-    a.fg == b.fg && a.bg == b.bg && a.flags & STYLE == b.flags & STYLE
-}
-
 fn push_char(out: &mut Vec<u8>, c: char) {
-    let mut buf = [0; 4];
-    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    if c.is_ascii()
+        && let Ok(byte) = u8::try_from(c)
+    {
+        out.push(byte);
+    } else {
+        let mut buf = [0; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
 }
 
-/// A full reset plus `cell`'s attributes, so nothing carries over from the previous pen.
-fn push_sgr(out: &mut Vec<u8>, cell: &Cell) {
+/// A full reset plus `pen`'s attributes, so nothing carries over from the previous pen.
+fn push_sgr(out: &mut Vec<u8>, pen: Pen) {
     out.extend_from_slice(b"\x1b[0");
-    let flags = cell.flags;
+    let flags = pen.flags;
     for (flag, code) in [
         (Flags::BOLD, ";1"),
         (Flags::DIM, ";2"),
@@ -174,27 +204,52 @@ fn push_sgr(out: &mut Vec<u8>, cell: &Cell) {
             out.extend_from_slice(code.as_bytes());
         }
     }
-    push_color(out, cell.fg, 30);
-    push_color(out, cell.bg, 40);
+    push_color(out, pen.fg, 30);
+    push_color(out, pen.bg, 40);
     out.push(b'm');
 }
 
 /// `base` is 30 for the foreground and 40 for the background.
-fn push_color(out: &mut Vec<u8>, color: Color, base: u8) {
-    let code = match color {
+fn push_color(out: &mut Vec<u8>, color: Color, base: usize) {
+    match color {
         Color::Named(named) => match named as usize {
-            index @ 0..8 => format!(";{}", usize::from(base) + index),
-            index @ 8..16 => format!(";{}", usize::from(base) + 60 + index - 8),
-            _ => match dim_index(named) {
-                Some(index) => format!(";{}", usize::from(base) + index),
+            index @ 0..8 => push_param(out, base + index),
+            index @ 8..16 => push_param(out, base + 60 + index - 8),
+            _ => {
                 // Foreground, Background and Cursor are the defaults.
-                None => return,
-            },
+                if let Some(index) = dim_index(named) {
+                    push_param(out, base + index);
+                }
+            }
         },
-        Color::Indexed(index) => format!(";{};5;{index}", base + 8),
-        Color::Spec(rgb) => format!(";{};2;{};{};{}", base + 8, rgb.r, rgb.g, rgb.b),
-    };
-    out.extend_from_slice(code.as_bytes());
+        Color::Indexed(index) => {
+            push_param(out, base + 8);
+            push_param(out, 5);
+            push_param(out, index.into());
+        }
+        Color::Spec(rgb) => {
+            push_param(out, base + 8);
+            push_param(out, 2);
+            for channel in [rgb.r, rgb.g, rgb.b] {
+                push_param(out, channel.into());
+            }
+        }
+    }
+}
+
+/// `;` and `n` in decimal, without going through `format!` and a `String` for each.
+fn push_param(out: &mut Vec<u8>, n: usize) {
+    out.push(b';');
+    let start = out.len();
+    let mut rest = n;
+    loop {
+        out.push(b"0123456789"[rest % 10]);
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    out[start..].reverse();
 }
 
 fn dim_index(named: NamedColor) -> Option<usize> {
@@ -278,6 +333,19 @@ mod tests {
         let mut copy = term_with(&encode(&original).unwrap(), SIZE);
         copy.resize(wide);
         assert_eq!(text(&copy)[0], "0123456789abcdef");
+    }
+
+    #[test]
+    fn encode_should_write_each_style_change_as_one_full_sgr() {
+        let original = term_with(
+            b"\x1b[1;31mA\x1b[0;92mB\x1b[48;5;208mC\x1b[0;38;2;1;2;3mD\x1b[0;2;3;4;7;9mE\x1b[0m F\r\n",
+            SIZE,
+        );
+        assert_eq!(
+            String::from_utf8(encode(&original).unwrap()).unwrap(),
+            "\x1b[0;1;31mA\x1b[0;92mB\x1b[0;92;48;5;208mC\x1b[0;38;2;1;2;3mD\
+             \x1b[0;2;3;4;7;9mE\x1b[0m F\r\n\r\n"
+        );
     }
 
     #[test]
