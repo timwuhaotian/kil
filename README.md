@@ -65,8 +65,8 @@ owns every process, PID and file descriptor it creates.
 Download [`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
 From then on it keeps itself up to date: a new release is installed when you quit Kil, and
-**Kil ▸ Check for Updates…** checks right away (turn automatic updates off in **Settings ▸
-Updates**). `releases/` also holds the DMG's `.sha256`:
+**Kil ▸ Check for Updates…** checks right away, in a small window that shows the download
+and offers **Restart Now** or **Later** (turn automatic updates off in **Settings ▸ Updates**). `releases/` also holds the DMG's `.sha256`:
 
 ```sh
 shasum -a 256 -c Kil-arm64.dmg.sha256

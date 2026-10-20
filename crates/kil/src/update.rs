@@ -7,15 +7,21 @@
 use std::{
     ffi::OsStr,
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
 use gpui::{App, AppContext as _, Global, MenuItem, actions};
 use serde::Deserialize;
 
-use crate::{settings::Settings, workspace};
+use crate::{
+    settings::Settings,
+    update_window::{self, Shown},
+    workspace,
+};
 
 actions!(update, [CheckForUpdates, RestartToUpdate]);
 
@@ -27,6 +33,41 @@ const DMG_URL: &str = "https://github.com/timwuhaotian/kil/raw/main/releases/Kil
 const FIRST_CHECK: Duration = Duration::from_secs(5);
 /// A terminal stays open for days; one wakeup in hours keeps idle CPU at zero (A12).
 const CHECK_EVERY: Duration = Duration::from_hours(6);
+/// How often a download's size is read, and the update window redraws its bar.
+pub const POLL: Duration = Duration::from_millis(100);
+
+/// What a check is doing, for the update window to show.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Step {
+    #[default]
+    Checking,
+    /// The DMG's bytes so far, and its size once the server has said it.
+    Downloading {
+        version: String,
+        got: u64,
+        total: Option<u64>,
+    },
+    Verifying {
+        version: String,
+    },
+}
+
+/// A check's current step: written by its thread, read by the update window.
+#[derive(Debug, Default)]
+pub struct Progress(Mutex<Step>);
+
+impl Progress {
+    pub fn step(&self) -> Step {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set(&self, step: Step) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = step;
+    }
+}
 
 /// `releases/latest.toml`: the release's version and its DMG's SHA-256.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -85,12 +126,76 @@ fn run(program: &str, args: &[&OsStr]) -> Result<String, String> {
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(failure(program, output.status, &output.stderr))
+}
+
+fn failure(program: &str, status: ExitStatus, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
     let name = Path::new(program).file_name().unwrap_or_default().display();
-    Err(match stderr.trim() {
-        "" => format!("{name}: {}", output.status),
+    match stderr.trim() {
+        "" => format!("{name}: {status}"),
         why => format!("{name}: {why}"),
-    })
+    }
+}
+
+/// The body size the last response in a `curl -D` dump gives; redirects come before it.
+fn content_length(headers: &str) -> Option<u64> {
+    let last = headers
+        .rsplit_once("\nHTTP/")
+        .map_or(headers, |(_, last)| last);
+    last.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .filter(|&size| size > 0)
+}
+
+/// Downloads `url` to `to`, telling `progress` how much has arrived, by the file's size and
+/// the headers curl writes before the body.
+fn download(url: &str, to: &Path, version: &str, progress: &Progress) -> Result<(), String> {
+    const CURL: &str = "/usr/bin/curl";
+    let headers = to.with_extension("headers");
+    let mut curl = Command::new(CURL)
+        .args(["-fsSL", "--max-time", "900", "-D"])
+        .arg(&headers)
+        .arg("-o")
+        .arg(to)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("{CURL}: {err}"))?;
+    let report = || {
+        progress.set(Step::Downloading {
+            version: version.to_owned(),
+            got: fs::metadata(to).map_or(0, |file| file.len()),
+            total: fs::read_to_string(&headers)
+                .ok()
+                .and_then(|headers| content_length(&headers)),
+        });
+    };
+    let status = loop {
+        report();
+        match curl.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(POLL),
+            Err(err) => return Err(format!("{CURL}: {err}")),
+        }
+    };
+    report();
+    let _ = fs::remove_file(&headers);
+    if status.success() {
+        return Ok(());
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = curl.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+    Err(failure(CURL, status, &stderr))
 }
 
 /// The Developer ID team that signed `app`; `None` for an ad-hoc signature (a local build).
@@ -175,25 +280,26 @@ pub fn stage(
     dmg_url: &str,
     dir: &Path,
     team: &str,
+    progress: &Progress,
 ) -> Result<PathBuf, String> {
+    let version = &manifest.version;
+    let verifying = || {
+        progress.set(Step::Verifying {
+            version: version.clone(),
+        });
+    };
     let app = dir.join("Kil.app");
-    if app.exists() && verify(&app, &manifest.version, team).is_ok() {
-        return Ok(app);
+    if app.exists() {
+        verifying();
+        if verify(&app, version, team).is_ok() {
+            return Ok(app);
+        }
     }
     let _ = fs::remove_dir_all(dir);
     fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     let dmg = dir.join("Kil.dmg");
-    run(
-        "/usr/bin/curl",
-        &[
-            "-fsSL".as_ref(),
-            "--max-time".as_ref(),
-            "900".as_ref(),
-            "-o".as_ref(),
-            dmg.as_os_str(),
-            dmg_url.as_ref(),
-        ],
-    )?;
+    download(dmg_url, &dmg, version, progress)?;
+    verifying();
     let sum = run(
         "/usr/bin/shasum",
         &["-a".as_ref(), "256".as_ref(), dmg.as_os_str()],
@@ -235,7 +341,7 @@ pub fn stage(
     }
     copied?;
     let _ = fs::remove_file(&dmg);
-    verify(&app, &manifest.version, team).inspect_err(|_| {
+    verify(&app, version, team).inspect_err(|_| {
         let _ = fs::remove_dir_all(&app);
     })?;
     Ok(app)
@@ -300,7 +406,7 @@ enum Found {
 }
 
 /// One check, start to end; blocks, so it runs on a background thread.
-fn find(current: &str) -> Result<Found, String> {
+fn find(current: &str, progress: &Progress) -> Result<Found, String> {
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
     let bundle = replaceable_bundle(&exe)?;
     let team = team_of(&bundle)
@@ -310,7 +416,7 @@ fn find(current: &str) -> Result<Found, String> {
         return Ok(Found::UpToDate);
     }
     writable(bundle.parent().unwrap_or(&bundle))?;
-    let app = stage(&manifest, DMG_URL, &cache_dir()?, &team)?;
+    let app = stage(&manifest, DMG_URL, &cache_dir()?, &team, progress)?;
     Ok(Found::Ready(Ready {
         version: manifest.version,
         app,
@@ -320,7 +426,8 @@ fn find(current: &str) -> Result<Found, String> {
 
 #[derive(Default)]
 struct Updater {
-    checking: bool,
+    /// The check under way.
+    checking: Option<Arc<Progress>>,
     /// Someone chose Check for Updates, and is told the outcome.
     asked: bool,
     ready: Option<Ready>,
@@ -333,13 +440,8 @@ impl Global for Updater {}
 /// Starts the checks and installs a staged update whenever Kil quits.
 pub fn init(cx: &mut App) {
     cx.set_global(Updater::default());
-    cx.on_action(|_: &CheckForUpdates, cx| check(true, cx));
-    cx.on_action(|_: &RestartToUpdate, cx| {
-        if cx.global::<Updater>().ready.is_some() {
-            cx.global_mut::<Updater>().reopen = true;
-            workspace::detach_and_quit(cx);
-        }
-    });
+    cx.on_action(|_: &CheckForUpdates, cx| check_now(cx));
+    cx.on_action(|_: &RestartToUpdate, cx| restart(cx));
     cx.on_app_quit(|cx| {
         install_on_quit(cx);
         async {}
@@ -377,68 +479,75 @@ pub fn menu_item(cx: &App) -> MenuItem {
     }
 }
 
+/// Check for Updates…: a check whose progress and outcome the update window shows.
+pub fn check_now(cx: &mut App) {
+    check(true, cx);
+}
+
+/// Restart to Update: quits without asking about jobs, installs, and opens the new Kil.
+pub fn restart(cx: &mut App) {
+    if cx.global::<Updater>().ready.is_some() {
+        cx.global_mut::<Updater>().reopen = true;
+        workspace::detach_and_quit(cx);
+    }
+}
+
 fn check(asked: bool, cx: &mut App) {
     let updater = cx.global_mut::<Updater>();
-    if let Some(ready) = updater.ready.clone() {
+    if let Some(ready) = &updater.ready {
         if asked {
-            offer_restart(&ready.version, cx);
+            let shown = Shown::Ready(ready.version.clone());
+            update_window::show(shown, cx);
         }
         return;
     }
     updater.asked |= asked;
-    if updater.checking {
-        return;
+    let progress = match updater.checking.clone() {
+        Some(progress) => progress,
+        None => start(cx),
+    };
+    if asked {
+        update_window::show(Shown::Working(progress), cx);
     }
-    updater.checking = true;
-    let found = cx.background_spawn(async { find(env!("CARGO_PKG_VERSION")) });
+}
+
+/// Starts a check on a background thread; `checked` gets its outcome.
+fn start(cx: &mut App) -> Arc<Progress> {
+    let progress = Arc::new(Progress::default());
+    cx.global_mut::<Updater>().checking = Some(progress.clone());
+    let found = cx.background_spawn({
+        let progress = progress.clone();
+        async move { find(env!("CARGO_PKG_VERSION"), &progress) }
+    });
     cx.spawn(async move |cx| {
         let found = found.await;
         let _ = cx.update(|cx| checked(found, cx));
     })
     .detach();
+    progress
 }
 
 fn checked(found: Result<Found, String>, cx: &mut App) {
     let updater = cx.global_mut::<Updater>();
-    updater.checking = false;
+    updater.checking = None;
     let asked = std::mem::take(&mut updater.asked);
-    match found {
+    let shown = match found {
         Ok(Found::Ready(ready)) => {
             log::info!("Kil {} is ready to install", ready.version);
             let version = ready.version.clone();
             updater.ready = Some(ready);
             cx.set_menus(crate::menus(cx));
-            if asked {
-                offer_restart(&version, cx);
-            }
+            Shown::Ready(version)
         }
-        Ok(Found::UpToDate) if asked => workspace::tell(
-            cx,
-            "Kil is up to date.",
-            concat!(env!("CARGO_PKG_VERSION"), " is the newest version."),
-        ),
-        Ok(Found::UpToDate) => {}
+        Ok(Found::UpToDate) => Shown::UpToDate,
         Err(err) => {
             log::warn!("update check: {err}");
-            if asked {
-                workspace::tell(cx, "Kil can't update right now.", &err);
-            }
+            Shown::Failed(err)
         }
+    };
+    if asked {
+        update_window::show(shown, cx);
     }
-}
-
-fn offer_restart(version: &str, cx: &mut App) {
-    workspace::ask(
-        cx,
-        &format!("Kil {version} is ready."),
-        "It installs when Kil quits. Restart now? Running jobs keep going.",
-        &["Restart Now", "Later"],
-        |answer, cx| {
-            if answer == 0 {
-                cx.dispatch_action(&RestartToUpdate);
-            }
-        },
-    );
 }
 
 fn install_on_quit(cx: &mut App) {
@@ -526,6 +635,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn content_length_should_be_the_last_responses() {
+        let redirected = "HTTP/2 302 \r\ncontent-length: 0\r\n\r\nHTTP/2 200 \r\nContent-Length: 4570610\r\n\r\n";
+        assert_eq!(
+            [
+                content_length(redirected),
+                content_length("HTTP/2 302 \r\ncontent-length: 0\r\n\r\n"),
+                content_length("HTTP/2 302 \r\ncontent-length: 9\r\n\r\nHTTP/2 200 \r\n"),
+                content_length("Content-Length: 94\r\nAccept-ranges: bytes\r\n"),
+            ],
+            [Some(4_570_610), None, None, Some(94)]
+        );
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kil-update-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -571,6 +694,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_should_report_every_byte_of_a_known_size() {
+        let dmg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../releases/Kil-arm64.dmg");
+        let size = fs::metadata(&dmg).unwrap().len();
+        let to = scratch("download").join("Kil.dmg");
+        let progress = Progress::default();
+        let url = format!("file://{}", fs::canonicalize(&dmg).unwrap().display());
+        download(&url, &to, "9.9.9", &progress).unwrap();
+        assert_eq!(
+            (progress.step(), to.with_extension("headers").exists()),
+            (
+                Step::Downloading {
+                    version: "9.9.9".into(),
+                    got: size,
+                    total: Some(size),
+                },
+                false
+            )
+        );
+        let missing = download("file:///nowhere/Kil.dmg", &to, "9.9.9", &progress);
+        assert!(missing.is_err_and(|err| err.starts_with("curl: ")));
+    }
+
     /// The release on `main` end to end, from the repository instead of GitHub: the manifest
     /// matches the DMG, and the app in it passes every check an update makes.
     #[test]
@@ -580,14 +726,16 @@ mod tests {
             Manifest::parse(&fs::read_to_string(releases.join("latest.toml")).unwrap()).unwrap();
         let dmg = fs::canonicalize(releases.join("Kil-arm64.dmg")).unwrap();
         let dir = scratch("stage");
-        let staged = stage(
-            &manifest,
-            &format!("file://{}", dmg.display()),
-            &dir,
-            "43VLF3KTFZ",
-        )
-        .unwrap();
+        let url = format!("file://{}", dmg.display());
+        let progress = Progress::default();
+        let staged = stage(&manifest, &url, &dir, "43VLF3KTFZ", &progress).unwrap();
         assert!(staged.join("Contents/MacOS/kil").is_file());
+        assert_eq!(
+            progress.step(),
+            Step::Verifying {
+                version: manifest.version.clone()
+            }
+        );
         assert!(verify(&staged, &manifest.version, "AAAAAAAAAA").is_err());
         let _ = fs::remove_dir_all(&dir);
     }

@@ -393,20 +393,20 @@ fn swatch(name: ThemeName, chosen: bool, c: Colors) -> Stateful<Div> {
 
 /// Theme colors copied out so `cx` stays free for listeners while rendering.
 #[derive(Clone, Copy)]
-struct Colors {
-    bg: Hsla,
-    card: Hsla,
-    text: Hsla,
-    muted: Hsla,
-    hover: Hsla,
-    off: Hsla,
-    accent: Hsla,
-    divider: Hsla,
-    error: Hsla,
+pub struct Colors {
+    pub bg: Hsla,
+    pub card: Hsla,
+    pub text: Hsla,
+    pub muted: Hsla,
+    pub hover: Hsla,
+    pub off: Hsla,
+    pub accent: Hsla,
+    pub divider: Hsla,
+    pub error: Hsla,
 }
 
 impl Colors {
-    fn of(theme: &Theme) -> Self {
+    pub fn of(theme: &Theme) -> Self {
         Self {
             bg: theme.terminal_bg,
             card: theme.sidebar_hover,
@@ -475,7 +475,11 @@ fn row(
         .into_any_element()
 }
 
-fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, c: Colors) -> Stateful<Div> {
+pub fn button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    c: Colors,
+) -> Stateful<Div> {
     div()
         .id(id)
         .h(px(24.))
@@ -746,8 +750,9 @@ impl SettingsWindow {
                 concat!("Kil ", env!("CARGO_PKG_VERSION")),
                 None,
                 c,
+                // Called, not dispatched, so it doesn't depend on which window is active.
                 button("check-for-updates", "Check Now", c).on_click(|_, _, cx| {
-                    cx.dispatch_action(&update::CheckForUpdates);
+                    update::check_now(cx);
                 }),
             ),
         ]

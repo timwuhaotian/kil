@@ -15,6 +15,7 @@ use crate::{
     settings::{Settings, config_dir},
     settings_window, text_field,
     theme::Theme,
+    update_window,
 };
 
 /// Modification times of both files; a change triggers a reload.
@@ -139,7 +140,8 @@ pub fn apply(cx: &mut App) -> Vec<SharedString> {
         keymap::bindings(&table)
             .into_iter()
             .chain(text_field::bindings())
-            .chain(settings_window::bindings()),
+            .chain(settings_window::bindings())
+            .chain(update_window::bindings()),
     );
     // A menu shows the keys bound when it was set, so it is set again with these.
     cx.set_menus(crate::menus(cx));

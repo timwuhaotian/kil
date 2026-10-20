@@ -1555,30 +1555,6 @@ pub fn detach_and_quit(cx: &mut App) {
     });
 }
 
-/// Shows `message` in the terminal window, with an OK button.
-pub fn tell(cx: &mut App, message: &str, detail: &str) {
-    ask(cx, message, detail, &["OK"], |_, _| {});
-}
-
-/// Asks `message` in the terminal window, then runs `then` with the answer's index.
-pub fn ask(
-    cx: &mut App,
-    message: &str,
-    detail: &str,
-    answers: &[&str],
-    then: impl FnOnce(usize, &mut App) + 'static,
-) {
-    in_terminal_window(cx, |_, window, cx| {
-        let answer = window.prompt(PromptLevel::Info, message, Some(detail), answers, cx);
-        cx.spawn(async move |_, cx| {
-            if let Ok(answer) = answer.await {
-                let _ = cx.update(|cx| then(answer, cx));
-            }
-        })
-        .detach();
-    });
-}
-
 /// Runs `QuitAndStopJobs` in the terminal window, for when another window has focus.
 pub fn quit_and_stop_app(cx: &mut App) {
     in_terminal_window(cx, |this, window, cx| {

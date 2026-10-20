@@ -6,6 +6,13 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Check for Updates shows what it's doing.** A small window opens at once and follows the
+  check: a sweeping bar while it asks for the latest version, a bar that fills with the
+  download (“1.8 MB of 4.6 MB”), then the signature checks. When the new Kil is ready it
+  offers **Restart Now** or **Later**; later, it installs when you quit, so the next launch is
+  the new version. **Hide** closes the window and it comes back with the outcome. **Check Now**
+  in Settings opens the same window.
+
 ## 0.0.8 — 2026-10-20
 
 - **An idle Kil uses no CPU.** A window with nothing to draw stops asking macOS for frames: it

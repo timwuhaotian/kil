@@ -13,6 +13,7 @@ mod terminal_pane;
 mod text_field;
 mod theme;
 mod update;
+mod update_window;
 mod workspace;
 
 use std::{

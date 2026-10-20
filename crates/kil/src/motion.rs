@@ -9,6 +9,10 @@ pub const ROW_IN: Duration = Duration::from_millis(180);
 pub const ROW_OUT: Duration = Duration::from_millis(140);
 pub const TAB_SWITCH: Duration = Duration::from_millis(140);
 pub const FOCUS_DIM: Duration = Duration::from_millis(120);
+/// Longer than the update poll, so the download bar glides between readings.
+pub const PROGRESS: Duration = Duration::from_millis(240);
+/// One pass of the update bar while the size of the work isn't known.
+pub const SWEEP: Duration = Duration::from_millis(1200);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ease {
