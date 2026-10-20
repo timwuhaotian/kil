@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.10 — 2026-10-21
+
 - **Dragging a tab shows it moving.** The row lifts off the sidebar and follows the pointer
   up and down, an open slot shows where it will land, the rows it passes slide out of its
   way, and when you let go it settles into place.
