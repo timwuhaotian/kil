@@ -64,23 +64,13 @@ owns every process, PID and file descriptor it creates.
 
 ## Size
 
-Kil is a 4.6 MB download and 8.6 MB installed. Here is how that compares with the latest macOS
-release of other terminals, measured on 2026-10-21 (download is the DMG or zip; installed is
-the `.app` on disk):
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/size-dark.svg">
+  <img src="docs/size-light.svg" width="960" alt="Installed size of macOS terminals: Kil 8.6 MB, Alacritty 14.7 MB, Ghostty 65.0 MB, iTerm2 202.9 MB, Hyper 240.9 MB, kitty 253.0 MB, WezTerm 266.1 MB, Tabby 439.6 MB, Wave 556.1 MB, Warp 913.7 MB">
+</picture>
 
-| Terminal | Version | Download | Installed | Built with |
-|---|---|---:|---:|---|
-| **Kil** | 0.0.10 | **4.6 MB** | **8.6 MB** | Rust, GPUI |
-| Alacritty | 0.17.0 | 6.1 MB | 14.7 MB | Rust, OpenGL |
-| Ghostty | 1.3.1 | 33.8 MB | 65.0 MB | Zig, Swift |
-| iTerm2 | 3.7.6 | 62.5 MB | 202.9 MB | Objective-C, Swift |
-| Hyper | 3.4.1 | 88.2 MB | 240.9 MB | Electron |
-| kitty | 0.49.2 | 77.8 MB | 253.0 MB | C, Python |
-| WezTerm | 20240203 | 103.0 MB | 266.1 MB | Rust |
-| Tabby | 1.0.238 | 157.1 MB | 439.6 MB | Electron |
-| Wave | 0.14.5 | 192.6 MB | 556.1 MB | Electron |
-| Warp | 0.2026.10.14 | 339.0 MB | 913.7 MB | Rust |
-
+Versions measured: Kil 0.0.10, Alacritty 0.17.0, Ghostty 1.3.1, iTerm2 3.7.6, Hyper 3.4.1,
+kitty 0.49.2, WezTerm 20240203, Tabby 1.0.238, Wave 0.14.5, Warp 0.2026.10.14.
 Kil, Hyper, Tabby and Wave are measured as their Apple silicon builds. The others ship one
 universal app for Intel and Apple silicon, which carries each binary twice. Alacritty is the
 only one near Kil's size, and it has no tabs or split panes.
