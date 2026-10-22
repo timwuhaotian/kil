@@ -132,7 +132,7 @@ copies read to find the update.
 | `⌘⌥←→↑↓` | Focus the pane in that direction |
 | `⌘1`…`⌘9`, `⌘⇧[` / `⌘⇧]` | Select a tab, previous / next tab |
 | `⇧↩` | New line without sending, in Claude Code, kimi and other TUIs (sends ESC CR, like `⌥↩`) |
-| `⌘C` / `⌘V` | Copy / paste (bracketed paste when the program asks for it) |
+| `⌘C` / `⌘V` | Copy / paste (bracketed paste when the program asks for it; with an image on the clipboard such a program gets an empty paste, so killi attaches the image) |
 | `⌘K` | Clear scrollback |
 | `⌘=` / `⌘-` / `⌘0` | Font bigger / smaller / reset |
 | `⌘,` | Settings |

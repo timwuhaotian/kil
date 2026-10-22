@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.13 — 2026-10-22
+
 - **Cmd-V with an image on the clipboard reaches coding agents.** A program in
   bracketed-paste mode gets an empty paste, so killi attaches the image; before, Kil sent
   nothing and only Ctrl-V worked.
