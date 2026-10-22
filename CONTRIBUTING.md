@@ -37,8 +37,9 @@ reaping and leaks. They must leave no process behind. One test expects your logi
   (pure logic, real processes, or GPUI's `TestAppContext`). Things only a person can check,
   like Pinyin input or how an animation feels, go in the pull request's description.
 - **Keep the layers.** `kil-term` has no UI and owns processes, PTYs and the session server;
-  `kil` is the GPUI app. Unsafe code lives in `kil-term/src/sys/`, each block with a
-  `SAFETY` comment.
+  `kil` is the GPUI app. Unsafe code lives in `kil-term/src/sys/` and in
+  `kil/src/notify.rs` (the notification center's Objective-C), each block with a `SAFETY`
+  comment.
 - **`vendor/gpui`** is gpui 0.2.2 with one change of ours, so idle windows stop asking for
   frames; its `KIL.md` says what changed and how to update it. Mark any change there
   `Modified for Kil`.

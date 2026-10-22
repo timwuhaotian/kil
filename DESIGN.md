@@ -115,7 +115,7 @@ kil/
 │  │  ├─ src/remote.rs        Client, and the feed of a remote session's mirror Term
 │  │  ├─ src/wire.rs          frames of the server protocol
 │  │  ├─ src/error.rs         SpawnError, SessionError (thiserror)
-│  │  ├─ src/sys/darwin.rs    the ONLY module with `unsafe` (FFI), each block // SAFETY:
+│  │  ├─ src/sys/darwin.rs    the only module of kil-term with `unsafe` (FFI), each block // SAFETY:
 │  │  └─ tests/               lifecycle, hygiene, hostile children, churn (§4.8)
 │  └─ kil/                    GPUI app
 │     ├─ src/main.rs          anyhow at the edge only
@@ -131,6 +131,7 @@ kil/
 │     ├─ src/keymap.rs        defaults + keymap.toml → gpui KeyBinding
 │     ├─ src/keys.rs          keystroke → PTY bytes (modes, option-as-meta)
 │     ├─ src/config.rs        config.toml
+│     ├─ src/notify.rs        a program's notification as a macOS one, and the click on it (§Unsafe)
 │     └─ src/theme.rs
 ├─ packaging/                 Info.plist, kil.entitlements, AppIcon.icns   (M6)
 └─ scripts/release.sh         build → sign → notarize → staple → releases/*.dmg (local, no CI)
@@ -559,6 +560,7 @@ The Settings window's **Updates** section has the `auto_update` switch and **Che
 
 **Unsafe**
 - Allowed only in `kil-term/src/sys/darwin.rs`, via `#[expect(unsafe_code, reason = "Darwin FFI")]`. *As built*, there are more scoped `expect`s. One is each registration of a source with a `polling::Poller`, which is `unsafe` because the source must outlive it: `Pty::register`, the pane loop's client, the mirror feed and the server's listener. Each deletes its source before dropping it. The other is the first statement of `main`, because edition 2024 makes env mutation `unsafe`.
+- The other module with `unsafe` is `kil/src/notify.rs`: the Objective-C delegate class of `UNUserNotificationCenter` and its completion blocks, via `#[expect(unsafe_code, reason = "Objective-C: …")]`. It posts a pane's OSC 9/777 notification as Kil and hears the click, whose request identifier names the pane (`kil-pane.<pane id>.<n>`; a pane's id lasts across launches). The click reaches the workspace over a channel, and `Workspace::go_to_pane` brings Kil forward and focuses that pane. macOS refuses notifications from an app that isn't properly signed, so only a Developer ID build shows them.
 - Every block has a `// SAFETY:` comment.
 - Everything else is safe Rust under `unsafe_code = "deny"`.
 

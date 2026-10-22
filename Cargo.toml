@@ -30,6 +30,12 @@ thiserror = "2"
 anyhow = "1"
 env_logger = "0.11"
 futures = "0.3"
+# UserNotifications is how a notification comes from Kil itself (crates/kil/src/notify.rs). These
+# are the versions gpui already brings in, so only the framework's bindings are new.
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSError", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 

@@ -33,7 +33,8 @@ owns every process, PID and file descriptor it creates.
   of the blurred desktop shows through the sidebar is a setting.
 - **Notifications from programs.** When a program posts one (OSC 9 or 777: killi, Claude
   Code and others do when a long job ends) and its tab isn't in view, macOS shows it and the
-  tab gets the dot; clicking the notification brings Kil forward and goes to that pane.
+  tab gets the dot; clicking the notification brings Kil forward and goes to the pane that
+  sent it. The first one asks macOS for permission.
 - **Split panes** that animate open and closed, with the keys or the two buttons at the top
   right of the tab. A new pane opens where the pane it split is. They share the tab evenly
   whenever a pane comes or goes. Drag the dividers; the focused pane is the bright one.
@@ -113,7 +114,8 @@ ditto target/release/Kil.app /Applications/Kil.app
 ```
 
 `bundle.sh debug` builds a debug bundle instead. A locally built app is ad-hoc signed, which is
-fine on the machine that built it.
+fine on the machine that built it, except that macOS refuses notifications from an app that is
+not properly signed, so a program's notifications show only in the released Kil.
 
 ### Making a release (maintainers)
 
@@ -187,7 +189,7 @@ crates/
 │              snapshots, the session server and its client. Unsafe code is Darwin FFI in
 │              src/sys/darwin.rs plus a few kqueue registrations, each with a SAFETY comment.
 └─ kil/        the GPUI app: window, sidebar, split tree, rendering, input and IME, keymap,
-               settings, saving and restoring the session.
+               settings, notifications, saving and restoring the session.
 vendor/gpui/   GPUI 0.2.2 with one change of ours: an idle window stops asking for frames.
 ```
 

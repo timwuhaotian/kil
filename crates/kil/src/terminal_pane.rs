@@ -341,6 +341,11 @@ impl TerminalPane {
             .join("\n")
     }
 
+    /// The pane's id: its session's name in the server, kept across launches.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Whether [`Self::take_screen`] has a screen to give.
     pub fn screen_changed(&self) -> bool {
         self.screen_changed && self.session.is_some()

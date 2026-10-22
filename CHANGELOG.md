@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Clicking a notification goes to the tab and pane that sent it.** It used to open Script
+  Editor: the notification was posted through `osascript`, so macOS counted it as Script
+  Editor's. Kil now posts its own, so it shows under Kil, and a click brings Kil forward on
+  the pane that sent that notification, not the latest one. The first notification asks macOS
+  for permission to show them.
+
 ## 0.0.13 — 2026-10-22
 
 - **Cmd-V with an image on the clipboard reaches coding agents.** A program in

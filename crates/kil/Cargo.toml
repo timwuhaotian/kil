@@ -17,9 +17,13 @@ categories.workspace = true
 kil-term.workspace = true
 gpui.workspace = true
 anyhow.workspace = true
+block2.workspace = true
 env_logger.workspace = true
 futures.workspace = true
 log.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-user-notifications.workspace = true
 serde.workspace = true
 toml.workspace = true
 

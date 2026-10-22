@@ -198,6 +198,7 @@ fn main() {
         };
         register_app_actions(cx);
         update::init(cx);
+        let clicks = notify::init();
         // Settings alone doesn't keep the app alive.
         cx.on_window_closed(|cx| {
             if !cx
@@ -232,11 +233,21 @@ fn main() {
             window_min_size: Some(size(px(480.), px(320.))),
             ..Default::default()
         };
-        if let Err(err) = cx.open_window(options, |window, cx| {
+        let opened = cx.open_window(options, |window, cx| {
             cx.new(|cx| Workspace::new(notices, client, store, restored, window, cx))
-        }) {
-            log::error!("failed to open window: {err:#}");
-            cx.quit();
+        });
+        match opened {
+            Ok(window) => {
+                if let Some(clicks) = clicks {
+                    let _ = window.update(cx, |_, window, cx| {
+                        Workspace::go_to_clicked_notifications(clicks, window, cx);
+                    });
+                }
+            }
+            Err(err) => {
+                log::error!("failed to open window: {err:#}");
+                cx.quit();
+            }
         }
         cx.activate(true);
     });
