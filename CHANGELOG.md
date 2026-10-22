@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.11 — 2026-10-22
+
 - **Notifications from programs.** A program that posts one (OSC 9 or OSC 777, as killi,
   Claude Code and others do when a long job ends) shows a macOS notification when its tab
   isn't in view, and the tab gets the finished dot. Clicking the notification brings Kil
