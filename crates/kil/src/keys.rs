@@ -57,6 +57,16 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// Bytes for Paste: the clipboard's text, or for an image (no text) an empty bracketed paste,
+/// so a program that asked for bracketed paste, such as a coding agent, knows Cmd-V was
+/// pressed and reads the image from the clipboard itself. Nothing for an image otherwise.
+pub fn paste_clipboard(text: Option<&str>, bracketed: bool) -> Option<Vec<u8>> {
+    match text {
+        Some(text) => Some(paste(text, bracketed)),
+        None => bracketed.then(|| paste("", true)),
+    }
+}
+
 /// One wheel notch at viewport `col`, `row` (0-based), reported to a program that turned
 /// mouse reporting on: button 64 (up) or 65 (down) plus modifier bits, in SGR encoding when it
 /// asked for that, else xterm's byte encoding. `None` where the byte encoding can't reach.
@@ -335,5 +345,15 @@ mod tests {
     #[test]
     fn paste_should_turn_newlines_into_returns_when_unbracketed() {
         assert_eq!(paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+    }
+
+    #[test]
+    fn paste_should_send_an_empty_bracket_for_an_image() {
+        assert_eq!(
+            paste_clipboard(None, true),
+            Some(b"\x1b[200~\x1b[201~".to_vec())
+        );
+        assert_eq!(paste_clipboard(None, false), None);
+        assert_eq!(paste_clipboard(Some("ls"), false), Some(b"ls".to_vec()));
     }
 }

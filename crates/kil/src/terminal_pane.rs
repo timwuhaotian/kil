@@ -656,11 +656,14 @@ impl TerminalPane {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
         let Some(session) = &self.session else { return };
-        let bytes = keys::paste(&text, session.input_mode().bracketed_paste());
+        let bracketed = session.input_mode().bracketed_paste();
+        let Some(bytes) = keys::paste_clipboard(item.text().as_deref(), bracketed) else {
+            return;
+        };
         self.send(bytes, cx);
     }
 
