@@ -4,6 +4,7 @@ mod config;
 mod keymap;
 mod keys;
 mod motion;
+mod notify;
 mod pane_tree;
 mod restore;
 mod settings;

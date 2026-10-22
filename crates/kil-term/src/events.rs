@@ -30,6 +30,8 @@ pub enum SessionEvent {
     ClipboardStore(String),
     /// The program toggled cursor blinking.
     CursorBlinkingChange,
+    /// The program posted a notification (OSC 9 or OSC 777).
+    Notify(crate::notify::Notification),
     /// The child exited with this status.
     ChildExited(ExitStatus),
     /// The session is over: the child is gone or handed to the reaper. Always the last event.

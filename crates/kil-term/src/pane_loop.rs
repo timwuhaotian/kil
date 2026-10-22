@@ -121,6 +121,7 @@ pub(crate) fn spawn(
         term,
         events,
         parser: Processor::new(),
+        notifications: crate::notify::Scanner::default(),
         writes: VecDeque::new(),
         writing: 0,
         interest: Event::readable(READ_WRITE_TOKEN),
@@ -141,6 +142,8 @@ struct PaneLoop {
     term: Arc<FairMutex<Term<EventProxy>>>,
     events: EventProxy,
     parser: Processor<StdSyncHandler>,
+    /// Picks OSC 9 and 777 notifications out of the output, which the parser drops.
+    notifications: crate::notify::Scanner,
     /// Input for the program; `writing` bytes of the front one are already written.
     writes: VecDeque<Cow<'static, [u8]>>,
     writing: usize,
@@ -302,6 +305,9 @@ impl PaneLoop {
             {
                 let mut term = self.term.lock();
                 self.parser.advance(&mut *term, bytes);
+            }
+            for notification in self.notifications.scan(bytes) {
+                self.events.emit(SessionEvent::Notify(notification));
             }
             synced = self.parser.sync_bytes_count();
             if let Some(client) = &mut self.client {

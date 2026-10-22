@@ -47,6 +47,8 @@ pub enum PaneEvent {
     JobFinished,
     /// The user clicked into the pane.
     Focused,
+    /// The program posted a notification (OSC 9 or 777).
+    Notified(kil_term::Notification),
     /// The pane should be removed (clean exit, or the user dismissed the exit banner).
     Closed,
     /// The screen changed since it was last taken for saving ([`TerminalPane::take_screen`]).
@@ -496,6 +498,7 @@ impl TerminalPane {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
                 SessionEvent::ChildExited(status) => self.exit_status = Some(status),
+                SessionEvent::Notify(notification) => cx.emit(PaneEvent::Notified(notification)),
                 SessionEvent::Ended => self.ended(cx),
                 SessionEvent::Bell | SessionEvent::CursorBlinkingChange => {}
             }

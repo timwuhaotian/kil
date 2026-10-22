@@ -20,6 +20,7 @@ use kil_term::Client;
 use crate::{
     config,
     motion::{self, Ease, Tween},
+    notify,
     pane_tree::{Axis, Close, Direction, Node, PaneTree, Split, SplitId},
     restore::{self, PaneIds, Restored, SavedPane, SavedTab, SavedWindow, SavedWorkspace, Store},
     settings::Settings,
@@ -74,6 +75,8 @@ const TITLE_INSET: f32 = STATUS_SLOT + 6.;
 const STOPPED: &str = "will be stopped";
 /// While anything changes, the session is saved at most this often: what a crash can lose.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
+/// How long after a pane's notification an activation of the window still goes to it.
+const NOTIFICATION_FOCUS: Duration = Duration::from_secs(30);
 /// While output continues, screens are saved at most this often. A saved screen is for when
 /// the session server is lost too (a restart, or the server crashing): a crash of Kil or a
 /// quit leaves the jobs and their screens in the server, and quitting saves screens at once.
@@ -368,6 +371,9 @@ pub struct Workspace {
     notices: Vec<SharedString>,
     config: config::Stamp,
     pane_subscriptions: HashMap<EntityId, Subscription>,
+    /// The last notification a pane posted while not in view: where to go when the window
+    /// is next activated, as a click on the notification does.
+    pending_notification: Option<(TabId, Entity<TerminalPane>, Instant)>,
     close_confirmed: bool,
     /// The session server, which runs every pane's program (DESIGN.md §14).
     client: Arc<Client>,
@@ -409,6 +415,7 @@ impl Workspace {
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.reload_config_if_changed(window, cx);
+                this.go_to_notification(window, cx);
                 if let Some(tab) = this.tabs.get_mut(this.active) {
                     tab.finished = false;
                     cx.notify();
@@ -455,6 +462,7 @@ impl Workspace {
             notices,
             config: config::stamp(),
             pane_subscriptions: HashMap::new(),
+            pending_notification: None,
             close_confirmed: false,
             client,
             store: None,
@@ -821,6 +829,20 @@ impl Workspace {
         }
     }
 
+    /// Goes to the pane whose notification was posted last, when the window is activated
+    /// within [`NOTIFICATION_FOCUS`] of it: the click on the notification brought Kil
+    /// forward, and this finishes the trip.
+    fn go_to_notification(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tab, pane, when)) = self.pending_notification.take() else {
+            return;
+        };
+        if when.elapsed() > NOTIFICATION_FOCUS {
+            return;
+        }
+        self.activate_id(tab, window, cx);
+        window.focus(&pane.focus_handle(cx));
+    }
+
     fn activate_id(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
             self.activate(index, window, cx);
@@ -1011,6 +1033,22 @@ impl Workspace {
                     && !(watching && index == active)
                 {
                     tab.finished = true;
+                    cx.notify();
+                }
+            }
+            PaneEvent::Notified(notification) => {
+                let watching = window.is_window_active();
+                let active = self.active;
+                if let Some((index, tab)) = self
+                    .tabs
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, tab)| tab.tree.contains(pane))
+                    && !(watching && index == active)
+                {
+                    tab.finished = true;
+                    self.pending_notification = Some((tab.id, pane.clone(), Instant::now()));
+                    notify::post(&notification.title, &notification.body);
                     cx.notify();
                 }
             }
@@ -2924,6 +2962,45 @@ mod tests {
         assert_eq!(first_status(&workspace, cx), TabStatus::Done);
         cx.dispatch_action(SelectTab1);
         assert_eq!(first_status(&workspace, cx), TabStatus::Idle);
+    }
+
+    #[gpui::test]
+    fn a_notification_from_a_background_tab_marks_it_and_the_next_activation_goes_to_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(NewTab);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        let notified = || kil_term::Notification {
+            title: "killi".into(),
+            body: "Done".into(),
+        };
+        cx.deactivate_window();
+        pane.update(cx, |_, cx| cx.emit(PaneEvent::Notified(notified())));
+        cx.run_until_parked();
+        assert_eq!(first_status(&workspace, cx), TabStatus::Done);
+        assert!(workspace.read_with(cx, |this, _| this.active == 1
+            && this.pending_notification.is_some()));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |this, _| this.active == 0
+            && this.pending_notification.is_none()));
+        assert_eq!(first_status(&workspace, cx), TabStatus::Idle);
+    }
+
+    #[gpui::test]
+    fn a_notification_from_the_tab_in_view_is_not_shown(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.update(|window, _| window.activate_window());
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        let notification = kil_term::Notification {
+            title: String::new(),
+            body: "Done".into(),
+        };
+        pane.update(cx, |_, cx| cx.emit(PaneEvent::Notified(notification)));
+        cx.run_until_parked();
+        assert_eq!(first_status(&workspace, cx), TabStatus::Idle);
+        assert!(workspace.read_with(cx, |this, _| this.pending_notification.is_none()));
     }
 
     #[gpui::test]

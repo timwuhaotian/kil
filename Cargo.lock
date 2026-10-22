@@ -3086,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "kil"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -3100,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "kil-term"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "alacritty_terminal",
  "libc",

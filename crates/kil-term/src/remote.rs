@@ -236,6 +236,7 @@ fn mirror(
         term: Arc::clone(&term),
         events: events.clone(),
         parser: Processor::new(),
+        notifications: crate::notify::Scanner::default(),
         inbox: Inbox::default(),
         out: Vec::new(),
         writable: false,
@@ -287,6 +288,7 @@ struct Feed {
     term: Arc<FairMutex<Term<EventProxy>>>,
     events: EventProxy,
     parser: Processor<StdSyncHandler>,
+    notifications: crate::notify::Scanner,
     inbox: Inbox,
     out: Vec<u8>,
     writable: bool,
@@ -383,6 +385,9 @@ impl Feed {
             let frame = match self.inbox.next_raw() {
                 Ok(Some((wire::OUTPUT, bytes))) => {
                     self.parser.advance(&mut *self.term.lock(), bytes);
+                    for notification in self.notifications.scan(bytes) {
+                        self.events.emit(SessionEvent::Notify(notification));
+                    }
                     parsed += bytes.len();
                     continue;
                 }

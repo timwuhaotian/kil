@@ -13,6 +13,7 @@
 mod child;
 mod error;
 mod events;
+mod notify;
 mod pane_loop;
 mod proc_info;
 mod pty;
@@ -31,6 +32,7 @@ mod wire;
 pub use child::{live_children, wait_for_children};
 pub use error::SpawnError;
 pub use events::SessionEvent;
+pub use notify::Notification;
 pub use proc_info::{ForegroundProcess, Job, Pid, ProcIdentity, TtyId};
 pub use reaper::expedite_reaping;
 pub use remote::Client;
