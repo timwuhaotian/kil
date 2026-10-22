@@ -84,7 +84,9 @@ Download [`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
 From then on it keeps itself up to date: a new release is installed when you quit Kil, and
 **Kil ▸ Check for Updates…** checks right away, in a small window that shows the download
-and offers **Restart Now** or **Later** (turn automatic updates off in **Settings ▸ Updates**). `releases/` also holds the DMG's `.sha256`:
+and offers **Restart Now** or **Later**; once a release is ready, the menu item reads
+**Restart to Update** (turn automatic updates off in **Settings ▸ Updates**). `releases/`
+also holds the DMG's `.sha256`:
 
 ```sh
 shasum -a 256 -c Kil-arm64.dmg.sha256

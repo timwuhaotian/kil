@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.12 — 2026-10-22
+
 - **Restart to Update works from the Kil menu.** Choosing it with the terminal window in
   front did nothing; it now quits, installs the update and reopens Kil, as the update
   window's Restart Now button already did.
