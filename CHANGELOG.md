@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Restart to Update works from the Kil menu.** Choosing it with the terminal window in
+  front did nothing; it now quits, installs the update and reopens Kil, as the update
+  window's Restart Now button already did.
+- Quitting no longer installs a staged update over a newer Kil that was put in Applications
+  by hand since the download.
+
 ## 0.0.11 — 2026-10-22
 
 - **Notifications from programs.** A program that posts one (OSC 9 or OSC 777, as killi,

@@ -1698,9 +1698,12 @@ impl Workspace {
     }
 }
 
-/// Runs `Quit` in the terminal window, for when another window (Settings) has focus.
+/// Runs `Quit` in the terminal window, for when another window (Settings) has focus. With the
+/// terminal window in front, its own handler takes the action, and this does nothing.
 pub fn quit_app(cx: &mut App) {
-    in_terminal_window(cx, |this, window, cx| this.quit(&Quit, window, cx));
+    if !terminal_window_is_active(cx) {
+        in_terminal_window(cx, |this, window, cx| this.quit(&Quit, window, cx));
+    }
 }
 
 /// Quits without asking about running jobs: they keep running, and the next launch is back
@@ -1712,30 +1715,47 @@ pub fn detach_and_quit(cx: &mut App) {
     });
 }
 
-/// Runs `QuitAndStopJobs` in the terminal window, for when another window has focus.
+/// Runs `QuitAndStopJobs` in the terminal window, for when another window has focus. With the
+/// terminal window in front, its own handler takes the action, and this does nothing.
 pub fn quit_and_stop_app(cx: &mut App) {
-    in_terminal_window(cx, |this, window, cx| {
-        this.quit_and_stop(&QuitAndStopJobs, window, cx);
-    });
+    if !terminal_window_is_active(cx) {
+        in_terminal_window(cx, |this, window, cx| {
+            this.quit_and_stop(&QuitAndStopJobs, window, cx);
+        });
+    }
 }
 
+fn terminal_window_is_active(cx: &App) -> bool {
+    cx.active_window()
+        .is_some_and(|window| window.downcast::<Workspace>().is_some())
+}
+
+/// Runs `run` in the terminal window, once the current update is over: a menu action is
+/// dispatched inside the active window's update, and a window can't be updated again from
+/// inside its own (GPUI takes it out of the app meanwhile), so done at once from the terminal
+/// window's own menu, `run` ran on no window at all.
 fn in_terminal_window(
     cx: &mut App,
-    run: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>),
+    run: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) {
-    match cx
-        .windows()
-        .iter()
-        .find_map(AnyWindowHandle::downcast::<Workspace>)
-    {
-        Some(workspace) => {
-            let _ = workspace.update(cx, |this, window, cx| {
-                window.activate_window();
-                run(this, window, cx);
-            });
+    cx.defer(move |cx| {
+        match cx
+            .windows()
+            .iter()
+            .find_map(AnyWindowHandle::downcast::<Workspace>)
+        {
+            Some(workspace) => {
+                let updated = workspace.update(cx, |this, window, cx| {
+                    window.activate_window();
+                    run(this, window, cx);
+                });
+                if let Err(err) = updated {
+                    log::error!("terminal window: {err:#}");
+                }
+            }
+            None => cx.quit(),
         }
-        None => cx.quit(),
-    }
+    });
 }
 
 /// Re-applies the config files in the terminal window after the Settings window wrote one.
@@ -3226,6 +3246,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the pane's session never started");
+    }
+
+    /// Restart to Update is a global action: from the terminal window's own menu it arrives
+    /// inside that window's update, where the window can't be updated again.
+    #[gpui::test]
+    fn restart_to_update_should_quit_from_the_terminal_windows_own_menu(cx: &mut TestAppContext) {
+        let dir = scratch_dir("restart");
+        let (workspace, cx) = workspace_saving_to(Some(Store::at(dir.clone())), cx);
+        cx.update(|_, cx| {
+            cx.on_action(|_: &crate::update::RestartToUpdate, cx| detach_and_quit(cx));
+        });
+        workspace.update(cx, |this, _| this.tabs[0].name = Some("dev".into()));
+        cx.dispatch_action(crate::update::RestartToUpdate);
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |this, _| this.ended));
+        assert_eq!(saved_layout(&dir).tabs[0].name.as_deref(), Some("dev"));
     }
 
     #[gpui::test]

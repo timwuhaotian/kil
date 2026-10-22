@@ -212,17 +212,22 @@ fn team_of(app: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Checks that `app` is Kil `version`, signed by `team` and notarized by Apple.
-fn verify(app: &Path, version: &str, team: &str) -> Result<(), String> {
+/// The version `app`'s Info.plist shows.
+fn bundle_version(app: &Path) -> Result<String, String> {
     let plist = app.join("Contents/Info.plist");
-    let shown = run(
+    run(
         "/usr/libexec/PlistBuddy",
         &[
             "-c".as_ref(),
             "Print :CFBundleShortVersionString".as_ref(),
             plist.as_os_str(),
         ],
-    )?;
+    )
+}
+
+/// Checks that `app` is Kil `version`, signed by `team` and notarized by Apple.
+fn verify(app: &Path, version: &str, team: &str) -> Result<(), String> {
+    let shown = bundle_version(app)?;
     if shown != version {
         return Err(format!("the download is Kil {shown}, not {version}"));
     }
@@ -558,7 +563,19 @@ fn install_on_quit(cx: &mut App) {
         return;
     };
     let reopen = updater.reopen;
-    if let Err(err) = install(&ready.app, &ready.bundle) {
+    // The bundle may have been replaced by hand since the update was staged (a maintainer
+    // installing a release); a newer app there stays, and the stale download goes.
+    let on_disk = bundle_version(&ready.bundle).ok();
+    let stale = on_disk
+        .as_deref()
+        .is_some_and(|on_disk| !is_newer(&ready.version, on_disk));
+    if stale {
+        log::info!(
+            "Kil {} is installed already; not replacing it with {}",
+            on_disk.unwrap_or_default(),
+            ready.version
+        );
+    } else if let Err(err) = install(&ready.app, &ready.bundle) {
         log::error!("installing Kil {}: {err}", ready.version);
         return;
     }
