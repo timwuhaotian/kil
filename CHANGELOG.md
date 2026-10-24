@@ -6,6 +6,13 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.16 — 2026-10-24
+
+- **The New Tab button lines up with the tabs.** Its plus is drawn centered in the status
+  column where the rows' ring and dot go, and "New Tab" starts where the tab titles do, so
+  the button reads as the row that would come next. Hovering it shows the keys that do the
+  same (`⌘T`, or whatever `keymap.toml` binds).
+
 ## 0.0.15 — 2026-10-24
 
 - **A `/kil-config` skill for coding agents working in the repo.** Asked where Kil's config

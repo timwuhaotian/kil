@@ -412,7 +412,7 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 **Sidebar** (220 px)
 - 44 px rows with a title (13 pt semibold) and the cwd (11 pt, middle-truncated).
 - A 10 px status slot before the title (A17): an accent **ring** while a pane runs a job, an accent **dot** for a job that ended out of view, and a red **!** for an exit banner. The marks differ in shape as well as color. They are static, because a spinner would redraw the window every frame for as long as a dev server runs. There is an `×` on hover.
-- A footer `+ New Tab` button. Double-clicking empty sidebar space also opens a tab; double-clicking the strip above the rows zooms the window (A26).
+- A footer **New Tab** button, 36 px: a plus drawn from two bars in the status column (a font's `+` sits where the typeface puts it, not mid-line), the label in line with the titles above, and the keys bound to New Tab (`⌘T` by default, read from the live keymap) at the right on hover. Double-clicking empty sidebar space also opens a tab; double-clicking the strip above the rows zooms the window (A26).
 - Rows drag up and down to reorder the tabs (A25).
 - Split Right and Split Down buttons sit at the top right of the tab, over the terminal, at 45% opacity until hovered (A27); notices start below them.
 - Right-click on a row opens a menu: Rename Tab…, Reset Name, Close Tab. A rename edits the title in place in a `TextField`. The user's name overrides the pane's title in the row, in the closing ghost and in the window title.

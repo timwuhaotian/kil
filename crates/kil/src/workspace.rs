@@ -12,14 +12,14 @@ use futures::{StreamExt, channel::mpsc};
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, AnyWindowHandle, App, ClickEvent, Context,
     CursorStyle, Div, DragMoveEvent, ElementId, Entity, EntityId, FocusHandle, Focusable,
-    FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
-    SharedString, Stateful, StyleRefinement, Subscription, Task, WeakEntity, Window, actions,
-    anchored, deferred, div, prelude::*, px, relative,
+    FontWeight, Hsla, KeyContext, KeyDownEvent, KeybindingKeystroke, MouseButton, MouseDownEvent,
+    Pixels, Point, PromptLevel, SharedString, Stateful, StyleRefinement, Subscription, Task,
+    WeakEntity, Window, actions, anchored, deferred, div, prelude::*, px, relative,
 };
 use kil_term::Client;
 
 use crate::{
-    config,
+    config, keymap,
     motion::{self, Ease, Tween},
     notify,
     pane_tree::{Axis, Close, Direction, Node, PaneTree, Split, SplitId},
@@ -65,6 +65,8 @@ actions!(
 const SIDEBAR_WIDTH: f32 = 220.;
 const SIDEBAR_TOP: f32 = 52.;
 const ROW_HEIGHT: f32 = 44.;
+/// The New Tab button: one line, so it is lighter than the two-line rows above it.
+const NEW_TAB_HEIGHT: f32 = 36.;
 /// The rows' inset from the sidebar's edges.
 const ROWS_INSET: f32 = 8.;
 /// The split buttons at the top right of the tab.
@@ -1503,27 +1505,7 @@ impl Workspace {
                     .children(rows),
             )
             .child(memory_footer(self.memory, chrome))
-            .child(
-                div()
-                    .id("new-tab")
-                    .mx_2()
-                    .mb_2()
-                    .h(px(36.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded_lg()
-                    .text_size(px(13.))
-                    .text_color(chrome.muted)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(chrome.hover).text_color(chrome.text))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.new_tab(&NewTab, window, cx);
-                    }))
-                    .child("+")
-                    .child("New Tab"),
-            )
+            .child(new_tab_button(new_tab_keys(window), chrome, cx))
     }
 
     fn render_row(
@@ -2214,6 +2196,80 @@ fn memory_footer(memory: MemoryState, chrome: Chrome) -> Div {
     row
 }
 
+/// The keys bound to New Tab, as a menu writes them (`⌘T`), or `None` if it has none.
+fn new_tab_keys(window: &Window) -> Option<String> {
+    let context = KeyContext::parse("Workspace").ok()?;
+    let binding = window.highest_precedence_binding_for_action_in_context(&NewTab, context)?;
+    let keys: Vec<String> = binding
+        .keystrokes()
+        .iter()
+        .map(KeybindingKeystroke::unparse)
+        .collect();
+    Some(keymap::display(&keys.join(" ")))
+}
+
+/// The sidebar's footer button. Its plus sits in the status column and "New Tab" in line
+/// with the titles above it, so it reads as the row that would come next; the keys that do
+/// the same show at the right while the pointer is over it, the way the rows' × does.
+fn new_tab_button(
+    keys: Option<String>,
+    chrome: Chrome,
+    cx: &mut Context<Workspace>,
+) -> Stateful<Div> {
+    div()
+        .id("new-tab")
+        .debug_selector(|| "new-tab".to_owned())
+        .group("new-tab")
+        .mx(px(ROWS_INSET))
+        .mb(px(ROWS_INSET))
+        .h(px(NEW_TAB_HEIGHT))
+        .px_3()
+        .flex()
+        .items_center()
+        .gap(px(TITLE_INSET - STATUS_SLOT))
+        .rounded_lg()
+        .text_size(px(13.))
+        .text_color(chrome.muted)
+        .cursor_pointer()
+        .hover(|style| style.bg(chrome.hover).text_color(chrome.text))
+        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.new_tab(&NewTab, window, cx);
+        }))
+        .child(plus_mark(chrome))
+        .child(div().flex_1().child("New Tab"))
+        .when_some(keys, |button, keys| {
+            button.child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(chrome.muted)
+                    .opacity(0.)
+                    .group_hover("new-tab", |style| style.opacity(1.))
+                    .child(keys),
+            )
+        })
+}
+
+/// A plus drawn from two bars, so it is centered in its slot: a font's `+` sits where the
+/// typeface puts it, which is not the middle of the line.
+fn plus_mark(chrome: Chrome) -> Div {
+    const BAR: f32 = 1.5;
+    let bar = |chrome: Chrome| {
+        div()
+            .absolute()
+            .rounded(px(BAR / 2.))
+            .bg(chrome.muted)
+            .group_hover("new-tab", move |style| style.bg(chrome.text))
+    };
+    let inset = (STATUS_SLOT - BAR) / 2.;
+    div()
+        .flex_none()
+        .relative()
+        .size(px(STATUS_SLOT))
+        .child(bar(chrome).left_0().right_0().top(px(inset)).h(px(BAR)))
+        .child(bar(chrome).top_0().bottom_0().left(px(inset)).w(px(BAR)))
+}
+
 /// Static on purpose: a spinner would redraw the window every frame for as long as a job
 /// (say, a dev server) runs, and idle CPU must stay at zero (DESIGN.md A12).
 fn status_mark(status: TabStatus, chrome: Chrome) -> Div {
@@ -2796,6 +2852,25 @@ mod tests {
         let down = cx.debug_bounds("split-down").expect("split down drawn");
         click(cx, down.center(), MouseButton::Left, 1);
         assert_eq!(axes(cx), [Axis::Horizontal, Axis::Vertical]);
+    }
+
+    #[gpui::test]
+    fn the_new_tab_button_should_open_a_tab_and_show_its_keys(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.update(|_, cx| {
+            let (table, _) = crate::keymap::resolve(None);
+            cx.bind_keys(crate::keymap::bindings(&table));
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|window, _| new_tab_keys(window)),
+            Some("⌘T".into())
+        );
+        let button = cx.debug_bounds("new-tab").expect("new tab button drawn");
+        click(cx, button.center(), MouseButton::Left, 1);
+        cx.run_until_parked();
+        assert_eq!(workspace.read_with(cx, |this, _| this.tabs.len()), 2);
     }
 
     #[gpui::test]

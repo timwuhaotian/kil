@@ -149,10 +149,11 @@ copies read to find the update.
 
 Double-click a tab to rename it (Enter or clicking away saves, Esc cancels), right-click it
 for Rename / Close, drag it up or down to reorder, and double-click empty sidebar space for a
-new tab. Double-click the top of the sidebar, beside the window buttons, to fill the screen
-and again to go back (it does what **System Settings ▸ Desktop & Dock** says a title-bar
-double-click does). Programs that report the mouse, like Claude Code's full-screen view, get
-the scroll wheel; elsewhere it scrolls Kil's scrollback.
+new tab (the **New Tab** button at the bottom shows its shortcut when you hover it).
+Double-click the top of the sidebar, beside the window buttons, to fill the screen and again
+to go back (it does what **System Settings ▸ Desktop & Dock** says a title-bar double-click
+does). Programs that report the mouse, like Claude Code's full-screen view, get the scroll
+wheel; elsewhere it scrolls Kil's scrollback.
 
 **Rebinding is in the app.** **Settings ▸ Keyboard** lists every command and the keys it runs on.
 Click a shortcut, press the new one, and it is saved and applied at once — the old keys stop
