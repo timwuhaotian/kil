@@ -117,6 +117,13 @@ ditto target/release/Kil.app /Applications/Kil.app
 fine on the machine that built it, except that macOS refuses notifications from an app that is
 not properly signed, so a program's notifications show only in the released Kil.
 
+### Working on Kil with a coding agent
+
+The repo carries a `/kil-config` skill (`.claude/skills/kil-config/`) for Claude Code and
+compatible agents. Asked where the config lives, which keys, themes or commands exist, or how
+to rebind a key, it reads `settings.rs`, `keymap.rs` and your own `config.toml` and
+`keymap.toml` instead of answering from memory, so it stays right as Kil changes.
+
 ### Making a release (maintainers)
 
 Releases are built, signed and notarized locally and committed under `releases/`; CI only

@@ -6,6 +6,15 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.15 — 2026-10-24
+
+- **A `/kil-config` skill for coding agents working in the repo.** Asked where Kil's config
+  lives, what a key accepts or how to rebind a key, an agent used to answer from memory. The
+  skill reads `settings.rs`, `keymap.rs` and the user's own `config.toml`, `keymap.toml` and
+  Application Support files, and reports paths, every key with its default, range and current
+  value, the keymap, how changes apply, and the repo version against the installed app. No
+  change to the app itself.
+
 ## 0.0.14 — 2026-10-22
 
 - **Clicking a notification goes to the tab and pane that sent it.** It used to open Script
