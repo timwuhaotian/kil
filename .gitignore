@@ -1,3 +1,5 @@
 /target
 /dist
 .DS_Store
+docs/kil-launch-video/node_modules
+docs/kil-launch-video/out
