@@ -119,15 +119,42 @@ pub fn init() -> Option<mpsc::UnboundedReceiver<String>> {
     Some(heard)
 }
 
-/// Shows `body` under `title` for `pane` (the pane's id); clicking it names the pane to
-/// [`init`]'s receiver. The first one asks macOS for permission, and none shows if it's
-/// refused.
-pub fn post(pane: &str, title: &str, body: &str) {
+/// What a pane's notification says, from what the program sent and what Kil knows about
+/// the pane: `(title, subtitle, body)`. The program's own text stays the body — OSC 9 has
+/// nothing else, and a bare "Done" says nothing about where it finished — so the title
+/// falls back to the foreground job's name, then the tab's name, and the subtitle names
+/// the tab and the folder the pane is in. A part that only repeats the title is dropped.
+pub fn describe(
+    title: &str,
+    body: &str,
+    job: Option<&str>,
+    tab: &str,
+    cwd: &str,
+) -> (String, String, String) {
+    let title = [title, job.unwrap_or(""), tab]
+        .into_iter()
+        .find(|part| !part.is_empty())
+        .unwrap_or("Kil");
+    let subtitle = [tab, cwd]
+        .into_iter()
+        .filter(|part| !part.is_empty() && *part != title)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    (title.to_owned(), subtitle, body.to_owned())
+}
+
+/// Shows `body` under `title` and `subtitle` for `pane` (the pane's id); clicking it names
+/// the pane to [`init`]'s receiver. The first one asks macOS for permission, and none shows
+/// if it's refused.
+pub fn post(pane: &str, title: &str, subtitle: &str, body: &str) {
     if !available() {
         return;
     }
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(title));
+    if !subtitle.is_empty() {
+        content.setSubtitle(&NSString::from_str(subtitle));
+    }
     content.setBody(&NSString::from_str(body));
     let identifier = format!(
         "{IDENTIFIER_PREFIX}{pane}.{}",
@@ -181,6 +208,26 @@ mod tests {
     fn a_posted_identifier_should_name_its_pane_back() {
         let identifier = format!("{IDENTIFIER_PREFIX}{}.{}", "19f3a2b-4", 0);
         assert_eq!(pane_of(&identifier), Some("19f3a2b-4"));
+    }
+
+    #[test]
+    fn a_bare_done_gains_the_job_tab_and_folder() {
+        assert_eq!(
+            describe("", "Done", Some("killi"), "kil", "~/code/kil"),
+            ("killi".into(), "kil · ~/code/kil".into(), "Done".into())
+        );
+    }
+
+    #[test]
+    fn the_programs_own_title_stays_and_repeats_drop() {
+        assert_eq!(
+            describe("killi", "Fixed", Some("killi"), "killi", "~/code/killi"),
+            ("killi".into(), "~/code/killi".into(), "Fixed".into())
+        );
+        assert_eq!(
+            describe("", "Done", None, "", ""),
+            ("Kil".into(), String::new(), "Done".into())
+        );
     }
 
     #[test]

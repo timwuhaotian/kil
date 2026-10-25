@@ -35,6 +35,22 @@ fn attach(client: &Client, id: &str) -> Session {
 }
 
 #[test]
+fn a_pane_sees_the_clients_term_program_version() {
+    // The server stamps its own version, and a server started by an older Kil keeps
+    // stamping that; the client stamps over it, so a program gating OSC 9 notifications
+    // on the version doesn't fall back to osascript after an upgrade.
+    let (_dir, client) = server("version");
+    let mut config = sh("printf 'ver=%s\\n' \"$TERM_PROGRAM_VERSION\"; exec /bin/sleep 600");
+    config.env = vec![("TERM_PROGRAM_VERSION".into(), "0.0.8".into())];
+    let session = spawn(&client, "a-1", &config);
+    assert!(wait_for_text(
+        &session,
+        &format!("ver={}", env!("CARGO_PKG_VERSION"))
+    ));
+    client.stop_all().unwrap();
+}
+
+#[test]
 fn detach_should_keep_the_job_running() {
     let (_dir, client) = server("detach");
     let session = spawn(&client, "a-1", &sh("exec /bin/sleep 600"));

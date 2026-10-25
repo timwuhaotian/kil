@@ -6,6 +6,18 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.18 — 2026-10-25
+
+- **Clicking a killi notification no longer opens Script Editor after an upgrade.** The
+  session server outlives app upgrades, and it kept stamping new shells with its own old
+  `TERM_PROGRAM_VERSION`, so killi judged Kil too old for OSC 9 and fell back to
+  `osascript` — whose notifications belong to Script Editor. The app now stamps its own
+  name and version into every spawn, over whatever server runs it, so new panes get Kil's
+  own notifications again (shells already running keep their env until restarted).
+- **Notifications say where they came from.** A program's bare "Done" now shows with the
+  foreground job as its title and the tab and folder as a subtitle, instead of a lone
+  "Done" with no clue which pane finished.
+
 ## 0.0.17 — 2026-10-25
 
 - **Drag a file onto a pane.** Its path is typed where it lands, shell-escaped with a space

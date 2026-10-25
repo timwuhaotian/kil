@@ -1066,7 +1066,15 @@ impl Workspace {
                     && !(watching && index == active)
                 {
                     tab.finished = true;
-                    notify::post(pane.read(cx).id(), &notification.title, &notification.body);
+                    let info = pane.read(cx).info().clone();
+                    let (title, subtitle, body) = notify::describe(
+                        &notification.title,
+                        &notification.body,
+                        info.job.as_deref().map(|job| &**job),
+                        &tab.title(cx),
+                        &info.cwd,
+                    );
+                    notify::post(pane.read(cx).id(), &title, &subtitle, &body);
                     cx.notify();
                 }
             }

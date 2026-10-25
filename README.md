@@ -32,9 +32,10 @@ owns every process, PID and file descriptor it creates.
   it to rename it (IME works, Chinese included). A new tab is named for its folder. How much
   of the blurred desktop shows through the sidebar is a setting.
 - **Notifications from programs.** When a program posts one (OSC 9 or 777: killi, Claude
-  Code and others do when a long job ends) and its tab isn't in view, macOS shows it and the
-  tab gets the dot; clicking the notification brings Kil forward and goes to the pane that
-  sent it. The first one asks macOS for permission.
+  Code and others do when a long job ends) and its tab isn't in view, macOS shows it —
+  naming the job, tab and folder it came from — and the tab gets the dot; clicking the
+  notification brings Kil forward and goes to the pane that sent it. The first one asks
+  macOS for permission.
 - **Split panes** that animate open and closed, with the keys or the two buttons at the top
   right of the tab. A new pane opens where the pane it split is. They share the tab evenly
   whenever a pane comes or goes. Drag the dividers; the focused pane is the bright one.

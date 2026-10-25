@@ -133,6 +133,7 @@ impl Client {
         config: &SessionConfig,
         sink: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> Result<Session, SpawnError> {
+        let config = stamped(config);
         let mut stream = self.connection().map_err(SpawnError::Server)?;
         let request = Frame::Spawn {
             id: id.to_owned(),
@@ -172,6 +173,29 @@ impl Client {
             None => Err(ErrorKind::UnexpectedEof.into()),
         }
     }
+}
+
+/// `config` with this client's own name and version in its env. The server stamps
+/// `TERM_PROGRAM{,_VERSION}` from the binary that started it, and a server outlives app
+/// upgrades (DESIGN.md §14.3), so its stamp can claim an old Kil long after the app moved
+/// on — and a program deciding from that version whether Kil shows OSC 9 notifications
+/// itself (killi from 0.0.11) falls back to `osascript`, whose notifications open Script
+/// Editor when clicked. What a pane can do is set by the app mirroring it, which is this
+/// client: the scanner that picks notifications out of the output runs in the mirror feed.
+/// Env in the config is applied after the server's own stamp, so this wins on old servers
+/// too, without a protocol change.
+fn stamped(config: &SessionConfig) -> SessionConfig {
+    let mut config = config.clone();
+    for (name, value) in [
+        ("TERM_PROGRAM", "kil"),
+        ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
+    ] {
+        config
+            .env
+            .retain(|(key, _)| key.as_os_str() != std::ffi::OsStr::new(name));
+        config.env.push((name.into(), value.into()));
+    }
+    config
 }
 
 fn unexpected(frame: &Frame) -> io::Error {
@@ -432,5 +456,38 @@ impl Feed {
         let _ = self.stream.set_nonblocking(false);
         let _ = self.stream.set_write_timeout(Some(FLUSH_ON_DROP));
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::GridSize;
+
+    #[test]
+    fn a_spawned_pane_is_stamped_with_the_clients_version_not_the_servers() {
+        let mut config = SessionConfig::new(GridSize {
+            rows: 24,
+            cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        });
+        // As if an older layer already put a stale stamp in: the client's replaces it.
+        config.env = vec![
+            ("TERM_PROGRAM_VERSION".into(), "0.0.8".into()),
+            ("OTHER".into(), "kept".into()),
+        ];
+        let config = stamped(&config);
+        let get = |name: &str| {
+            config
+                .env
+                .iter()
+                .filter(|(key, _)| key.as_os_str() == std::ffi::OsStr::new(name))
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("TERM_PROGRAM"), ["kil"]);
+        assert_eq!(get("TERM_PROGRAM_VERSION"), [env!("CARGO_PKG_VERSION")]);
+        assert_eq!(get("OTHER"), ["kept"]);
     }
 }
