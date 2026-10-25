@@ -142,6 +142,7 @@ copies read to find the update.
 | `⌘1`…`⌘9`, `⌘⇧[` / `⌘⇧]` | Select a tab, previous / next tab |
 | `⇧↩` | New line without sending, in Claude Code, kimi and other TUIs (sends ESC CR, like `⌥↩`) |
 | `⌘C` / `⌘V` | Copy / paste (bracketed paste when the program asks for it; with an image on the clipboard such a program gets an empty paste, so killi attaches the image) |
+| drag a file in | Its path is typed where it lands, shell-escaped; killi attaches an image or names any other file with `@` |
 | `⌘K` | Clear scrollback |
 | `⌘=` / `⌘-` / `⌘0` | Font bigger / smaller / reset |
 | `⌘,` | Settings |

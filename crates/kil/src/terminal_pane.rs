@@ -11,10 +11,10 @@ use std::{
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    App, AsyncApp, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, Task, UTF16Selection, WeakEntity,
-    Window, actions, div, point, prelude::*,
+    App, AsyncApp, Bounds, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size,
+    Task, UTF16Selection, WeakEntity, Window, actions, div, point, prelude::*,
 };
 use kil_term::{
     Client, Frame, GridSize, Palette, SelectionKind, Session, SessionConfig, SessionEvent,
@@ -672,6 +672,13 @@ impl TerminalPane {
         self.send(bytes, cx);
     }
 
+    /// Files dropped on the pane are typed as their paths, the way Terminal.app does it.
+    fn drop_files(&mut self, paths: &ExternalPaths, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        let bracketed = session.input_mode().bracketed_paste();
+        self.send(keys::drop(paths.paths(), bracketed), cx);
+    }
+
     fn clear_scrollback(&mut self, _: &ClearScrollback, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = &self.session {
             session.clear_history();
@@ -757,6 +764,7 @@ impl Render for TerminalPane {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_drop(cx.listener(Self::drop_files))
             .child(TerminalElement::new(cx.entity()))
             .children(banner)
     }

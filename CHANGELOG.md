@@ -6,6 +6,13 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.17 — 2026-10-25
+
+- **Drag a file onto a pane.** Its path is typed where it lands, shell-escaped with a space
+  after it, as Terminal.app does; several files come as a run. A program in bracketed-paste
+  mode gets them as one paste, so killi 0.4.10 attaches a dropped image as `[Image #N]` and
+  names any other file with `@`. Before, a drop did nothing.
+
 ## 0.0.16 — 2026-10-24
 
 - **The New Tab button lines up with the tabs.** Its plus is drawn centered in the status

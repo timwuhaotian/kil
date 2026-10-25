@@ -67,6 +67,24 @@ pub fn paste_clipboard(text: Option<&str>, bracketed: bool) -> Option<Vec<u8>> {
     }
 }
 
+/// Bytes for files dropped on a pane: each path as the shell reads it, a backslash before
+/// every character that isn't plain, with a space after each, as Terminal.app types them.
+/// A program in bracketed-paste mode, such as killi, gets them as one paste and can tell a
+/// drop from typing.
+pub fn drop(paths: &[std::path::PathBuf], bracketed: bool) -> Vec<u8> {
+    let mut text = String::new();
+    for path in paths {
+        for c in path.to_string_lossy().chars() {
+            if !(c.is_alphanumeric() || "/._-~+,:@=".contains(c)) {
+                text.push('\\');
+            }
+            text.push(c);
+        }
+        text.push(' ');
+    }
+    paste(&text, bracketed)
+}
+
 /// One wheel notch at viewport `col`, `row` (0-based), reported to a program that turned
 /// mouse reporting on: button 64 (up) or 65 (down) plus modifier bits, in SGR encoding when it
 /// asked for that, else xterm's byte encoding. `None` where the byte encoding can't reach.
@@ -345,6 +363,22 @@ mod tests {
     #[test]
     fn paste_should_turn_newlines_into_returns_when_unbracketed() {
         assert_eq!(paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+    }
+
+    #[test]
+    fn drop_should_escape_each_path_for_the_shell() {
+        let paths = [
+            std::path::PathBuf::from("/Users/me/My Shot (1).png"),
+            std::path::PathBuf::from("/tmp/a.rs"),
+        ];
+        assert_eq!(
+            drop(&paths, false),
+            b"/Users/me/My\\ Shot\\ \\(1\\).png /tmp/a.rs ".to_vec()
+        );
+        assert_eq!(
+            drop(&paths[1..], true),
+            b"\x1b[200~/tmp/a.rs \x1b[201~".to_vec()
+        );
     }
 
     #[test]
