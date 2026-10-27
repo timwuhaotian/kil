@@ -155,7 +155,9 @@ new tab (the **New Tab** button at the bottom shows its shortcut when you hover 
 Double-click the top of the sidebar, beside the window buttons, to fill the screen and again
 to go back (it does what **System Settings ▸ Desktop & Dock** says a title-bar double-click
 does). Programs that report the mouse, like Claude Code's full-screen view, get the scroll
-wheel; elsewhere it scrolls Kil's scrollback.
+wheel; programs that ask for drags, like killi's fullscreen mode, also get the press, drags
+and release and own their selection (Shift-drag stays Kil's). Elsewhere the wheel scrolls
+Kil's scrollback.
 
 **Rebinding is in the app.** **Settings ▸ Keyboard** lists every command and the keys it runs on.
 Click a shortcut, press the new one, and it is saved and applied at once — the old keys stop

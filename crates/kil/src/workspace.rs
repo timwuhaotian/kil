@@ -3016,6 +3016,125 @@ mod tests {
     }
 
     #[gpui::test]
+    fn drag_reports_should_reach_a_program_that_asks_for_them(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        // killi's fullscreen mode asks for drags (1002) in SGR (1006); each report is read up
+        // to its final byte, then shown. Byte by byte with `dd`, so any login shell does it.
+        cx.simulate_input(
+            "printf '\\033[?1002h\\033[?1006h'; stty raw -echo; \
+             r=; while [ ${#r} -lt 12 ]; do c=$(dd bs=1 count=1 2>/dev/null); r=\"$r$c\"; \
+             case \"$r\" in *M|*m) break;; esac; done; echo \"PRESS:$r\" | cat -v; \
+             r=; while [ ${#r} -lt 12 ]; do c=$(dd bs=1 count=1 2>/dev/null); r=\"$r$c\"; \
+             case \"$r\" in *M|*m) break;; esac; done; echo \"DRAG:$r\" | cat -v; \
+             r=; while [ ${#r} -lt 12 ]; do c=$(dd bs=1 count=1 2>/dev/null); r=\"$r$c\"; \
+             case \"$r\" in *M|*m) break;; esac; done; echo \"UP:$r\" | cat -v\n",
+        );
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| {
+                pane.input_mode()
+                    .is_some_and(kil_term::InputMode::mouse_drag)
+            })
+        });
+        let start = point(px(SIDEBAR_WIDTH + 200.), px(300.));
+        let moved = start + point(px(0.), px(60.));
+        cx.simulate_event(MouseDownEvent {
+            position: start,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| pane.screen_text().contains("PRESS:^[[<0;"))
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: moved,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::none(),
+        });
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| pane.screen_text().contains("DRAG:^[[<32;"))
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: moved,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| pane.screen_text().contains("UP:^[[<0;"))
+        });
+        let screen = pane.read_with(cx, |pane, _| pane.screen_text());
+        let up = screen
+            .lines()
+            .find(|line| line.contains("UP:^[[<0;"))
+            .unwrap_or("");
+        // The shell's `%` marks the missing newline; the report itself ends in lowercase m.
+        let report = up.split("UP:").nth(1).unwrap_or("");
+        assert!(
+            report.starts_with("^[[<0;") && report.contains('m'),
+            "the release names button 0 and ends in lowercase m: {screen}"
+        );
+    }
+
+    #[gpui::test]
+    fn shift_drag_should_keep_kils_selection_under_1002(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        cx.simulate_input(
+            "printf '\\033[?1002h\\033[?1006h'; stty raw -echo; \
+             r=; while [ ${#r} -lt 12 ]; do c=$(dd bs=1 count=1 2>/dev/null); r=\"$r$c\"; \
+             case \"$r\" in *M|*m) break;; esac; done; echo \"GOT:$r\" | cat -v\n",
+        );
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| {
+                pane.input_mode()
+                    .is_some_and(kil_term::InputMode::mouse_drag)
+            })
+        });
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let start = point(px(SIDEBAR_WIDTH + 200.), px(300.));
+        let moved = start + point(px(0.), px(60.));
+        cx.simulate_event(MouseDownEvent {
+            position: start,
+            button: MouseButton::Left,
+            modifiers: shift,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: moved,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: shift,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: moved,
+            button: MouseButton::Left,
+            modifiers: shift,
+            click_count: 1,
+        });
+        // No button bytes may have leaked: the next bytes the shell reads are a wheel notch's.
+        cx.simulate_event(ScrollWheelEvent {
+            position: moved,
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        wait_for(cx, |cx| {
+            pane.read_with(cx, |pane, _| pane.screen_text().contains("GOT:^[[<"))
+        });
+        let screen = pane.read_with(cx, |pane, _| pane.screen_text());
+        assert!(
+            screen.contains("GOT:^[[<64;"),
+            "Shift keeps the native selection, the wheel still reports: {screen}"
+        );
+    }
+
+    #[gpui::test]
     fn a_pane_split_off_below_should_start_its_prompt_at_the_top(cx: &mut TestAppContext) {
         let (workspace, cx) = workspace(cx);
         cx.dispatch_action(SplitDown);

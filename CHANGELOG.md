@@ -6,6 +6,14 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.19 — 2026-10-27
+
+- **Programs that ask for drag reports own the selection.** Under 1002/1003
+  (killi's fullscreen mode, killi 0.6.7), the press, drags and release reach
+  the program as reports — clamped to the grid past the pane's edge, so its
+  edge autoscroll keeps moving — and Kil selects nothing. Shift+drag stays
+  Kil's own selection, as in xterm; 1000-only programs are untouched.
+
 ## 0.0.18 — 2026-10-25
 
 - **Clicking a killi notification no longer opens Script Editor after an upgrade.** The

@@ -12,7 +12,7 @@ use std::{
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
     App, AsyncApp, Bounds, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent,
+    FocusHandle, Focusable, InputHandler, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size,
     Task, UTF16Selection, WeakEntity, Window, actions, div, point, prelude::*,
 };
@@ -121,6 +121,12 @@ pub struct TerminalPane {
     last_input: Instant,
     scroll_remainder: f32,
     selecting: bool,
+    /// A drag belongs to the program (it asked for 1002/1003): its press, drags and release go
+    /// to it as reports, and Kil selects nothing.
+    pub(crate) forwarding: bool,
+    /// The cell the last report named, so a drag the platform re-emits without moving sends
+    /// nothing.
+    last_cell: Option<(usize, usize)>,
     info: PaneInfo,
     info_refresh: Option<Task<()>>,
     /// While the tab's layout animates, keep the grid: one resize when it settles, not one
@@ -221,6 +227,8 @@ impl TerminalPane {
             last_input: Instant::now(),
             scroll_remainder: 0.,
             selecting: false,
+            forwarding: false,
+            last_cell: None,
             info: PaneInfo {
                 title: start
                     .as_deref()
@@ -594,6 +602,23 @@ impl TerminalPane {
         let (Some(session), Some(cell)) = (&self.session, self.cell_at(event.position)) else {
             return;
         };
+        let mode = session.input_mode();
+        if mode.mouse_drag() && !event.modifiers.shift {
+            // The program owns the selection (e.g. killi in fullscreen mode): it gets the
+            // press, the drags and the release as reports, and Kil selects nothing.
+            session.clear_selection();
+            let (col, row) = self.clamp_cell(cell);
+            if let Some(report) =
+                keys::button_report(0, false, true, col, row, event.modifiers, mode)
+            {
+                session.write(report);
+            }
+            self.forwarding = true;
+            self.last_cell = Some((col, row));
+            return;
+        }
+        self.forwarding = false;
+        self.last_cell = None;
         let kind = match event.click_count {
             0 | 1 => SelectionKind::Cells,
             2 => SelectionKind::Words,
@@ -604,7 +629,58 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// A viewport cell inside the grid: a drag past the pane's edge names its first or last
+    /// cell, so the program's edge autoscroll keeps moving until the button is let go.
+    fn clamp_cell(&self, cell: ViewportCell) -> (usize, usize) {
+        (
+            cell.col.min(self.frame.cols.saturating_sub(1)),
+            cell.row.min(self.frame.rows.saturating_sub(1)),
+        )
+    }
+
+    /// A drag the program owns: its cell as a drag report, unless the pointer hasn't left the
+    /// last reported cell (the platform re-emits the position while the button is held).
+    pub(crate) fn forward_drag(&mut self, position: Point<Pixels>, modifiers: Modifiers) {
+        let (Some(session), Some(cell)) = (&self.session, self.cell_at(position)) else {
+            return;
+        };
+        let mode = session.input_mode();
+        if !mode.mouse_drag() {
+            self.forwarding = false;
+            self.last_cell = None;
+            return;
+        }
+        let cell = self.clamp_cell(cell);
+        if self.last_cell == Some(cell) {
+            return;
+        }
+        self.last_cell = Some(cell);
+        if let Some(report) = keys::button_report(0, true, true, cell.0, cell.1, modifiers, mode) {
+            session.write(report);
+        }
+    }
+
+    /// The release of a drag the program owns, at its (clamped) position.
+    pub(crate) fn forward_up(&mut self, position: Point<Pixels>, modifiers: Modifiers) {
+        self.forwarding = false;
+        self.last_cell = None;
+        let (Some(session), Some(cell)) = (&self.session, self.cell_at(position)) else {
+            return;
+        };
+        let (col, row) = self.clamp_cell(cell);
+        let mode = session.input_mode();
+        if let Some(report) = keys::button_report(0, false, false, col, row, modifiers, mode) {
+            session.write(report);
+        }
+    }
+
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.forwarding {
+            if event.dragging() {
+                self.forward_drag(event.position, event.modifiers);
+            }
+            return;
+        }
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
@@ -614,7 +690,13 @@ impl TerminalPane {
         }
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        if self.forwarding {
+            if event.button == MouseButton::Left {
+                self.forward_up(event.position, event.modifiers);
+            }
+            return;
+        }
         self.selecting = false;
     }
 

@@ -2,11 +2,11 @@
 //! view of its own, the pane's cursor (DESIGN.md §6.2).
 
 use gpui::{
-    App, BorderStyle, Bounds, Context, Element, ElementId, Entity, Focusable, Font, FontStyle,
-    FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
-    PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, StrikethroughStyle, Style,
-    Subscription, TextRun, UnderlineStyle, WeakEntity, Window, fill, outline, point, px, relative,
-    size,
+    App, BorderStyle, Bounds, Context, DispatchPhase, Element, ElementId, Entity, Focusable, Font,
+    FontStyle, FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement,
+    LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
+    ShapedLine, SharedString, StrikethroughStyle, Style, Subscription, TextRun, UnderlineStyle,
+    WeakEntity, Window, fill, outline, point, px, relative, size,
 };
 use kil_term::{CellFlags, CursorShape, Frame, GridSize, RenderCell, Rgba};
 
@@ -207,6 +207,29 @@ impl Element for TerminalElement {
         }
         for (origin, line) in &layout.overlays {
             let _ = line.paint(*origin, layout.line_height, window, cx);
+        }
+        // While a drag belongs to the program, the pointer may leave the pane, where the pane's
+        // own handlers stop firing: moves and the release are caught at window level instead
+        // (capture phase, once per event), so the program's edge autoscroll doesn't stall and
+        // the release always arrives. The listeners live one frame; each paint while forwarding
+        // registers them again.
+        if self.pane.read(cx).forwarding {
+            let pane = self.pane.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture && event.dragging() {
+                    pane.update(cx, |pane, _| {
+                        pane.forward_drag(event.position, event.modifiers);
+                    });
+                }
+            });
+            let pane = self.pane.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                    pane.update(cx, |pane, _| {
+                        pane.forward_up(event.position, event.modifiers);
+                    });
+                }
+            });
         }
         let focus = self.pane.read(cx).focus_handle(cx);
         window.handle_input(

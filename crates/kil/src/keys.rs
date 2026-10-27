@@ -99,9 +99,41 @@ pub fn wheel_report(
         + 4 * u32::from(modifiers.shift)
         + 8 * u32::from(modifiers.alt)
         + 16 * u32::from(modifiers.control);
+    report(button, b'M', col, row, mode)
+}
+
+/// Bytes for a button press, drag or release at viewport `col`, `row` (0-based), for a program
+/// that asked for drag reports (1002/1003): button 0 (left), 1 or 2, plus 32 while dragging and
+/// modifier bits, in SGR encoding when it asked for that (`…M` for a press or drag, `…m` for a
+/// release), else xterm's byte encoding with button 3 for a release. `None` where the byte
+/// encoding can't reach.
+pub fn button_report(
+    button: u32,
+    drag: bool,
+    press: bool,
+    col: usize,
+    row: usize,
+    modifiers: Modifiers,
+    mode: InputMode,
+) -> Option<Vec<u8>> {
+    let modifier_bits = 4 * u32::from(modifiers.shift)
+        + 8 * u32::from(modifiers.alt)
+        + 16 * u32::from(modifiers.control);
+    // A release is button 3, except in SGR, which names the button and says so with `m`.
+    let code = if press || mode.sgr_mouse() {
+        button + 32 * u32::from(drag)
+    } else {
+        3
+    } + modifier_bits;
+    report(code, if press { b'M' } else { b'm' }, col, row, mode)
+}
+
+/// `button` at `col`, `row` (0-based) in the encoding `mode` asks for: SGR with `final_byte`,
+/// else xterm's bytes. `None` where the byte encoding can't reach.
+fn report(button: u32, final_byte: u8, col: usize, row: usize, mode: InputMode) -> Option<Vec<u8>> {
     let (x, y) = (u32::try_from(col).ok()? + 1, u32::try_from(row).ok()? + 1);
     if mode.sgr_mouse() {
-        return Some(format!("\x1b[<{button};{x};{y}M").into_bytes());
+        return Some(format!("\x1b[<{button};{x};{y}{}", final_byte as char).into_bytes());
     }
     let mut bytes = b"\x1b[M".to_vec();
     for value in [button, x, y] {
@@ -325,6 +357,49 @@ mod tests {
         );
         let modifiers = Keystroke::parse("a").unwrap().modifiers;
         assert_eq!(wheel_report(true, 223, 0, modifiers, plain), None);
+    }
+
+    #[test]
+    fn button_report_should_send_press_drag_and_release_under_1002() {
+        let drag = mode_after("\\033[?1002h\\033[?1006h");
+        assert!(drag.mouse_drag() && drag.mouse_reporting() && drag.sgr_mouse());
+        let plain = Keystroke::parse("a").unwrap().modifiers;
+        assert_eq!(
+            button_report(0, false, true, 0, 0, plain, drag),
+            Some(b"\x1b[<0;1;1M".to_vec())
+        );
+        assert_eq!(
+            button_report(0, true, true, 9, 4, plain, drag),
+            Some(b"\x1b[<32;10;5M".to_vec())
+        );
+        assert_eq!(
+            button_report(0, false, false, 9, 4, plain, drag),
+            Some(b"\x1b[<0;10;5m".to_vec())
+        );
+        let ctrl = Keystroke::parse("ctrl-a").unwrap().modifiers;
+        assert_eq!(
+            button_report(0, true, true, 0, 0, ctrl, drag),
+            Some(b"\x1b[<48;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn button_report_should_use_xterm_bytes_without_sgr_with_3_for_a_release() {
+        let plain = mode_after("\\033[?1002h");
+        assert!(plain.mouse_drag() && !plain.sgr_mouse());
+        let modifiers = Keystroke::parse("a").unwrap().modifiers;
+        assert_eq!(
+            button_report(0, false, true, 9, 4, modifiers, plain),
+            Some(vec![0x1b, b'[', b'M', 32, 42, 37])
+        );
+        assert_eq!(
+            button_report(0, false, false, 9, 4, modifiers, plain),
+            Some(vec![0x1b, b'[', b'M', 35, 42, 37])
+        );
+        assert_eq!(
+            button_report(0, false, true, 223, 0, modifiers, plain),
+            None
+        );
     }
 
     #[test]

@@ -166,6 +166,13 @@ impl InputMode {
         self.0.intersects(TermMode::MOUSE_MODE)
     }
 
+    /// The program wants button press, drag and release reports (modes 1002/1003).
+    #[must_use]
+    pub fn mouse_drag(self) -> bool {
+        self.0
+            .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+    }
+
     /// Mouse reports use SGR encoding (`CSI < … M`, mode 1006).
     #[must_use]
     pub fn sgr_mouse(self) -> bool {
