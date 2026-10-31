@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.20 — 2026-10-31
+
+- **The focused pane gets a thin accent border.** With several panes, the focused one is
+  outlined by a 1px line in the theme's accent color, fading in as focus moves, so it
+  shows even on dark themes where the dim alone is faint.
+
 ## 0.0.19 — 2026-10-27
 
 - **Programs that ask for drag reports own the selection.** Under 1002/1003

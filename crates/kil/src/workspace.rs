@@ -1801,6 +1801,19 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
             move |overlay, t| overlay.opacity(if focused { 1. - t } else { t }),
         )
     });
+    // A 1px accent hairline on the focused pane: the dim alone is faint on dark themes.
+    let ring = (several && focused).then(|| {
+        div()
+            .absolute()
+            .inset_0()
+            .border_1()
+            .border_color(chrome.accent.opacity(0.75))
+            .with_animation(
+                ElementId::NamedInteger("focus-ring".into(), pane.entity_id().as_u64()),
+                Animation::new(motion::FOCUS_DIM),
+                gpui::Styled::opacity,
+            )
+    });
     div()
         .relative()
         .size_full()
@@ -1813,6 +1826,7 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
                 .cached(StyleRefinement::default().absolute().inset_0()),
         )
         .children(dim)
+        .children(ring)
         .into_any_element()
 }
 

@@ -38,7 +38,8 @@ owns every process, PID and file descriptor it creates.
   macOS for permission.
 - **Split panes** that animate open and closed, with the keys or the two buttons at the top
   right of the tab. A new pane opens where the pane it split is. They share the tab evenly
-  whenever a pane comes or goes. Drag the dividers; the focused pane is the bright one.
+  whenever a pane comes or goes. Drag the dividers; the focused pane is the bright one, with
+  a thin accent border.
 - **Jobs outlive the window.** A small session server (`kil --server`, the same binary) holds
   every pane's terminal. `⌘Q` and closing the window only detach from it, and so does a crash.
   The next launch goes back on the same processes, with the full screen, scrollback and input
