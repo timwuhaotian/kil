@@ -1801,13 +1801,14 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
             move |overlay, t| overlay.opacity(if focused { 1. - t } else { t }),
         )
     });
-    // A 1px accent hairline on the focused pane: the dim alone is faint on dark themes.
+    // Inset the hairline so dividers painted above the panes cannot cover it.
     let ring = (several && focused).then(|| {
         div()
             .absolute()
-            .inset_0()
+            .inset(px(1.))
             .border_1()
             .border_color(chrome.accent.opacity(0.75))
+            .debug_selector(|| "focus-ring".to_owned())
             .with_animation(
                 ElementId::NamedInteger("focus-ring".into(), pane.entity_id().as_u64()),
                 Animation::new(motion::FOCUS_DIM),
@@ -2938,6 +2939,46 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         assert_eq!(panes(cx), 2);
+    }
+
+    fn assert_focus_ring_clears_divider(axis: Axis, cx: &mut TestAppContext) {
+        let (_, cx) = workspace(cx);
+        match axis {
+            Axis::Horizontal => cx.dispatch_action(SplitRight),
+            Axis::Vertical => cx.dispatch_action(SplitDown),
+        }
+        std::thread::sleep(motion::SPLIT + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let divider = cx.debug_bounds("divider").expect("divider drawn");
+        let ring = cx.debug_bounds("focus-ring").expect("focus ring drawn");
+        match axis {
+            Axis::Horizontal => {
+                assert!(ring.left() >= divider.left() + px(4.));
+                cx.dispatch_action(FocusLeft);
+            }
+            Axis::Vertical => {
+                assert!(ring.top() >= divider.top() + px(4.));
+                cx.dispatch_action(FocusUp);
+            }
+        }
+        cx.run_until_parked();
+        let ring = cx.debug_bounds("focus-ring").expect("focus ring drawn");
+        match axis {
+            Axis::Horizontal => assert!(ring.right() <= divider.left() + px(3.)),
+            Axis::Vertical => assert!(ring.bottom() <= divider.top() + px(3.)),
+        }
+    }
+
+    #[gpui::test]
+    fn focused_panes_should_clear_a_vertical_divider(cx: &mut TestAppContext) {
+        assert_focus_ring_clears_divider(Axis::Horizontal, cx);
+    }
+
+    #[gpui::test]
+    fn focused_panes_should_clear_a_horizontal_divider(cx: &mut TestAppContext) {
+        assert_focus_ring_clears_divider(Axis::Vertical, cx);
     }
 
     #[gpui::test]
