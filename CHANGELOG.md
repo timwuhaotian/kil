@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.21 — 2026-10-31
+
+- **The focused pane's border stays visible beside split dividers.** In side-by-side or
+  stacked splits, dividers no longer cover its left or top edge. The border sits 1px
+  inward, keeping the same color and thickness and leaving divider drag areas unchanged.
+
 ## 0.0.20 — 2026-10-31
 
 - **The focused pane gets a thin accent border.** With several panes, the focused one is
