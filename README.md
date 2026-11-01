@@ -53,8 +53,9 @@ owns every process, PID and file descriptor it creates.
 - **Updates itself, quietly.** Kil checks for a new release at launch and every six hours,
   downloads it in the background, checks its checksum, Developer ID signature and Apple
   notarization, and installs it when you quit. Jobs keep running across the update.
-- **Five themes**: Night, Paper (light), Fjord, Ember and Dusk. Programs that ask for the
-  terminal's colors, like vim deciding between light and dark, are told the theme's.
+- **Five themes**: Night, Batman, Fjord, Ember and Dusk. Batman is black, with the yellow
+  of the logo as its accent. Programs that ask for the terminal's colors, like vim deciding
+  between light and dark, are told the theme's.
 - **A default directory** for new tabs, if you want one. Splits still open where their pane
   is.
 - **Rebindable keys** in `~/.config/kil/keymap.toml` (**Kil ▸ Keyboard Shortcuts…** opens it),
@@ -179,7 +180,7 @@ regains focus, and the menu bar then shows the new keys.
 **`~/.config/kil/config.toml`** (`$XDG_CONFIG_HOME` is respected):
 
 ```toml
-theme = "night"                  # night, paper, fjord, ember or dusk
+theme = "night"                  # night, batman, fjord, ember or dusk
 font_family = "Menlo"
 font_size = 13.0
 default_directory = "~/code"     # where new tabs open; leave out to follow the focused pane

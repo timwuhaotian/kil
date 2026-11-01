@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.22 — 2026-11-01
+
+- **Batman replaces the Paper theme.** Black background, cream text and the logo's palette,
+  with the logo yellow (`#ffff36`) as the accent: the focused pane's border, tab marks and
+  Settings controls now use it. `theme = "paper"` no longer parses; use `theme = "batman"`.
+
 ## 0.0.21 — 2026-10-31
 
 - **The focused pane's border stays visible beside split dividers.** In side-by-side or
