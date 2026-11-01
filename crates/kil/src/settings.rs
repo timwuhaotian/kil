@@ -194,11 +194,11 @@ mod tests {
     #[test]
     fn parse_should_read_the_theme_and_expand_the_default_directory() {
         let settings =
-            Settings::parse("theme = \"paper\"\ndefault_directory = \"~/code\"").unwrap();
+            Settings::parse("theme = \"batman\"\ndefault_directory = \"~/code\"").unwrap();
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         assert_eq!(
             (settings.theme, settings.default_directory),
-            (ThemeName::Paper, Some(home.join("code")))
+            (ThemeName::Batman, Some(home.join("code")))
         );
     }
 

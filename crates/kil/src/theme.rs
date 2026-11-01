@@ -11,7 +11,7 @@ use serde::Deserialize;
 pub enum ThemeName {
     #[default]
     Night,
-    Paper,
+    Batman,
     Fjord,
     Ember,
     Dusk,
@@ -20,7 +20,7 @@ pub enum ThemeName {
 impl ThemeName {
     pub const ALL: [Self; 5] = [
         Self::Night,
-        Self::Paper,
+        Self::Batman,
         Self::Fjord,
         Self::Ember,
         Self::Dusk,
@@ -30,7 +30,7 @@ impl ThemeName {
     pub fn key(self) -> &'static str {
         match self {
             Self::Night => "night",
-            Self::Paper => "paper",
+            Self::Batman => "batman",
             Self::Fjord => "fjord",
             Self::Ember => "ember",
             Self::Dusk => "dusk",
@@ -40,7 +40,7 @@ impl ThemeName {
     pub fn label(self) -> &'static str {
         match self {
             Self::Night => "Night",
-            Self::Paper => "Paper",
+            Self::Batman => "Batman",
             Self::Fjord => "Fjord",
             Self::Ember => "Ember",
             Self::Dusk => "Dusk",
@@ -103,7 +103,7 @@ impl Theme {
     pub fn named(name: ThemeName) -> Self {
         match name {
             ThemeName::Night => Self::night(),
-            ThemeName::Paper => Self::paper(),
+            ThemeName::Batman => Self::batman(),
             ThemeName::Fjord => Self::fjord(),
             ThemeName::Ember => Self::ember(),
             ThemeName::Dusk => Self::dusk(),
@@ -148,30 +148,30 @@ impl Theme {
         )
     }
 
-    /// Light: inactive panes fade toward the paper instead of darkening.
-    fn paper() -> Self {
+    /// Batman: black, and the yellow of the logo as the accent (the focus ring).
+    fn batman() -> Self {
         Self::build(
             palette(
                 [
-                    0x24292f, 0xc4242f, 0x1a7f37, 0x845600, 0x0550ae, 0x8250df, 0x1b7c83, 0x6e7781,
-                    0x57606a, 0xa40e26, 0x116329, 0x633c01, 0x1a71d0, 0x835dc7, 0x297b8f, 0x8c959f,
+                    0x2a2a2a, 0xff5f5f, 0x66dd88, 0xffff36, 0x0fc3ff, 0xc79bff, 0x5ce1e6, 0xc7c7c7,
+                    0x5f5f5f, 0xff8a8a, 0x9be89b, 0xffff7a, 0x5fd4ff, 0xd9b8ff, 0x8beef0, 0xffeac9,
                 ],
-                0x2e3138,
-                0xfbfaf7,
-                0x3a3f4b,
+                0xffeac9,
+                0x000000,
+                0xffff36,
             ),
             &Chrome {
-                selection: 0xb6d4fecc,
-                sidebar: 0xf1efeac8,
-                text: 0x23262c,
-                muted: 0x7a7f88,
-                hover: 0x0000000d,
-                selected: 0x00000017,
-                accent: 0x2f6fde,
-                failure: 0xcf3a3a,
-                divider: 0xdcd9d2,
-                dim: 0xfbfaf780,
-                banner: 0xe9e7e2f2,
+                selection: 0x0fc3ff4d,
+                sidebar: 0x0b0b0bb8,
+                text: 0xffeac9,
+                muted: 0x8a8a8a,
+                hover: 0xffffff12,
+                selected: 0xffffff24,
+                accent: 0xffff36,
+                failure: 0xff5f5f,
+                divider: 0x333333,
+                dim: 0x00000080,
+                banner: 0x111111f2,
             },
         )
     }
@@ -304,11 +304,11 @@ mod tests {
 
     #[test]
     fn sidebar_opacity_should_replace_the_themes_and_none_should_keep_it() {
-        let theme = Theme::named(ThemeName::Paper);
+        let theme = Theme::named(ThemeName::Batman);
         let own = theme.sidebar_bg.a;
         assert_eq!(
             (
-                Theme::named(ThemeName::Paper)
+                Theme::named(ThemeName::Batman)
                     .with_sidebar_opacity(None)
                     .sidebar_bg
                     .a,
