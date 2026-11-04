@@ -584,21 +584,7 @@ fn install_on_quit(cx: &mut App) {
     }
     if reopen {
         // Once this process is gone, so the new Kil finds the session server free of it.
-        let spawned = Command::new("/bin/sh")
-            .args([
-                "-c",
-                r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open "$2""#,
-                "sh",
-            ])
-            .arg(std::process::id().to_string())
-            .arg(&ready.bundle)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Err(err) = spawned {
-            log::error!("reopening Kil: {err}");
-        }
+        crate::open_after_exit(&ready.bundle);
     }
 }
 

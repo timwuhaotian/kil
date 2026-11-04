@@ -59,6 +59,7 @@ actions!(
         FontReset,
         Quit,
         QuitAndStopJobs,
+        Restart,
     ]
 );
 
@@ -1311,6 +1312,35 @@ impl Workspace {
         );
     }
 
+    /// Restart: stops every job, quits, and opens Kil again.
+    fn restart(&mut self, _: &Restart, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_close(
+            &self.all_panes(),
+            "Restart Kil and stop all jobs?",
+            "will be stopped, then run again when Kil restarts",
+            window,
+            cx,
+            |this, _, cx| {
+                // A second confirmed prompt (Restart again from another window) must not
+                // arm a second relaunch, and a relaunch that can't be armed must not cost
+                // the jobs: only stop and quit once the new Kil is on its way.
+                if this.ended {
+                    return;
+                }
+                if !crate::restart_kil() {
+                    this.notices.push(
+                        "Kil couldn't open itself again, so it stayed open and the jobs kept running."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                this.depart(Leave::Stop, cx);
+                cx.quit();
+            },
+        );
+    }
+
     // ── settings ──────────────────────────────────────────────────────────────────────
 
     /// Also called by the Settings window right after it writes `config.toml`.
@@ -1729,6 +1759,28 @@ pub fn quit_and_stop_app(cx: &mut App) {
             this.quit_and_stop(&QuitAndStopJobs, window, cx);
         });
     }
+}
+
+/// Runs `Restart` in the terminal window, for when another window has focus. With the
+/// terminal window in front, its own handler takes the action, and this does nothing.
+pub fn restart_app(cx: &mut App) {
+    if terminal_window_is_active(cx) {
+        return;
+    }
+    if cx
+        .windows()
+        .iter()
+        .any(|w| w.downcast::<Workspace>().is_some())
+    {
+        in_terminal_window(cx, |this, window, cx| this.restart(&Restart, window, cx));
+        return;
+    }
+    // No terminal window: there is nothing to stop or save, so Kil only opens again.
+    cx.defer(|cx| {
+        if crate::restart_kil() {
+            cx.quit();
+        }
+    });
 }
 
 fn terminal_window_is_active(cx: &App) -> bool {
@@ -2391,6 +2443,7 @@ fn bind_actions(root: Stateful<Div>, cx: &mut Context<Workspace>) -> Stateful<Di
         .on_action(cx.listener(Workspace::close_pane))
         .on_action(cx.listener(Workspace::quit))
         .on_action(cx.listener(Workspace::quit_and_stop))
+        .on_action(cx.listener(Workspace::restart))
         .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
             this.split(Axis::Horizontal, window, cx);
         }))
@@ -3603,6 +3656,23 @@ mod tests {
             kil_term::Pid::new(pid).unwrap()
         ));
         client.stop_all().unwrap();
+    }
+
+    #[gpui::test]
+    fn restart_should_stop_the_jobs_and_save_the_layout(cx: &mut TestAppContext) {
+        let client = test_client();
+        let dir = scratch_dir("restart-stops-jobs");
+        let (workspace, cx) = workspace_on(Arc::clone(&client), Some(Store::at(dir.clone())), cx);
+        let (_id, pid) = started(&workspace, cx);
+        workspace.update(cx, |this, _| this.tabs[0].name = Some("dev".into()));
+        cx.dispatch_action(Restart);
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |this, _| this.ended));
+        assert_eq!(client.sessions().unwrap(), Vec::<String>::new());
+        assert!(!kil_term::diagnostics::exists(
+            kil_term::Pid::new(pid).unwrap()
+        ));
+        assert_eq!(saved_layout(&dir).tabs[0].name.as_deref(), Some("dev"));
     }
 
     #[gpui::test]

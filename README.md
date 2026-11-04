@@ -43,7 +43,8 @@ owns every process, PID and file descriptor it creates.
 - **Jobs outlive the window.** A small session server (`kil --server`, the same binary) holds
   every pane's terminal. `⌘Q` and closing the window only detach from it, and so does a crash.
   The next launch goes back on the same processes, with the full screen, scrollback and input
-  modes. **Kil ▸ Quit and Stop All Jobs** ends everything.
+  modes. **Kil ▸ Quit and Stop All Jobs** ends everything, and **Kil ▸ Restart** ends it and
+  opens Kil again.
 - **Comes back after a restart, too.** The layout, each pane's directory and the window frame
   are saved within 2 s of a change, and each pane's screen and scrollback every 30 s while it
   prints, and at once when you quit. After a logout or a reboot, the processes themselves are
@@ -150,6 +151,9 @@ copies read to find the update.
 | `⌘=` / `⌘-` / `⌘0` | Font bigger / smaller / reset |
 | `⌘,` | Settings |
 | `⌘Q` | Quit; running jobs keep going |
+
+The **Kil** menu has **Restart** (stop every job, then open Kil again), **Quit and Stop All
+Jobs**, and the usual Hide, Hide Others and Show All.
 
 Double-click a tab to rename it (Enter or clicking away saves, Esc cancels), right-click it
 for Rename / Close, drag it up or down to reorder, and double-click empty sidebar space for a

@@ -18,7 +18,9 @@ mod update_window;
 mod workspace;
 
 use std::{
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
 };
 
@@ -65,6 +67,7 @@ fn menus(cx: &App) -> Vec<Menu> {
                 MenuItem::action("Hide Others", HideOthers),
                 MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
+                MenuItem::action("Restart", w::Restart),
                 MenuItem::action("Quit Kil", w::Quit),
                 MenuItem::action("Quit and Stop All Jobs", w::QuitAndStopJobs),
             ],
@@ -125,6 +128,73 @@ fn register_app_actions(cx: &mut App) {
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &workspace::Quit, cx| workspace::quit_app(cx));
     cx.on_action(|_: &workspace::QuitAndStopJobs, cx| workspace::quit_and_stop_app(cx));
+    cx.on_action(|_: &workspace::Restart, cx| workspace::restart_app(cx));
+}
+
+fn is_bundle(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.as_encoded_bytes().eq_ignore_ascii_case(b"app"))
+}
+
+/// The path that starts Kil again: the app bundle the binary is in (as `*.app/Contents/
+/// MacOS/<exe>`), or the binary itself.
+fn relaunch_target(exe: &Path) -> PathBuf {
+    exe.parent()
+        .filter(|dir| dir.ends_with("Contents/MacOS"))
+        .and_then(|dir| dir.parent()?.parent())
+        .filter(|bundle| is_bundle(bundle))
+        .map_or_else(|| exe.to_path_buf(), Path::to_path_buf)
+}
+
+/// Opens `target` again once this process has ended: a `/bin/sh` waits for the pid to go
+/// away, then `open`s the app bundle, or runs the binary again. False if the waiter
+/// couldn't be started, so callers that stop jobs for the restart can stay open instead.
+pub(crate) fn open_after_exit(target: &Path) -> bool {
+    let script = if is_bundle(target) {
+        r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open "$2""#
+    } else {
+        r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; exec "$2""#
+    };
+    // Its own process group: closing the terminal that started an unbundled Kil must not
+    // take the waiter (and the reopened Kil) down with its SIGHUP.
+    let spawned = Command::new("/bin/sh")
+        .args(["-c", script, "sh"])
+        .arg(std::process::id().to_string())
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    match spawned {
+        Ok(_) => true,
+        Err(err) => {
+            log::error!("reopening Kil: {err}");
+            false
+        }
+    }
+}
+
+/// Opens Kil again once this process has ended. False if Kil is run from a path that is
+/// gone (moved or deleted while running) or the waiter couldn't be started.
+#[cfg(not(test))]
+pub(crate) fn restart_kil() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        log::error!("reopening Kil: its own path is unknown");
+        return false;
+    };
+    let target = relaunch_target(&exe);
+    if !target.exists() {
+        log::error!("reopening Kil: {} is gone", target.display());
+        return false;
+    }
+    open_after_exit(&target)
+}
+
+/// The test build doesn't start Kil again.
+#[cfg(test)]
+pub(crate) fn restart_kil() -> bool {
+    true
 }
 
 /// `kil --server <dir>` runs the session server instead of the app (DESIGN.md §14).
@@ -251,4 +321,44 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_relaunch_target_should_be_the_bundle_the_binary_is_in() {
+        assert_eq!(
+            relaunch_target(Path::new("/Applications/Kil.app/Contents/MacOS/kil")),
+            PathBuf::from("/Applications/Kil.app")
+        );
+        assert_eq!(
+            relaunch_target(Path::new("/Users/me/code/kil/target/debug/kil")),
+            PathBuf::from("/Users/me/code/kil/target/debug/kil")
+        );
+        // A plain folder named *.app is not a bundle LaunchServices can open.
+        assert_eq!(
+            relaunch_target(Path::new("/tmp/test.app/kil")),
+            PathBuf::from("/tmp/test.app/kil")
+        );
+        assert_eq!(
+            relaunch_target(Path::new("/Applications/Kil.APP/Contents/MacOS/kil")),
+            PathBuf::from("/Applications/Kil.APP")
+        );
+    }
+
+    #[gpui::test]
+    fn the_kil_menu_should_have_a_restart_item(cx: &mut gpui::TestAppContext) {
+        let all = cx.read(menus);
+        let kil = all
+            .iter()
+            .find(|menu| menu.name == "Kil")
+            .expect("the Kil menu");
+        assert!(
+            kil.items
+                .iter()
+                .any(|item| matches!(item, MenuItem::Action { name, .. } if name == "Restart"))
+        );
+    }
 }

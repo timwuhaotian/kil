@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.23 — 2026-11-04
+
+- **Kil ▸ Restart.** The Kil menu has a **Restart** item: it stops every running job, saves
+  the layout, quits and opens Kil again, so a fresh window comes back on the same tabs. A job
+  that was running is typed into its new shell again, as after any other ending.
+
 ## 0.0.22 — 2026-11-01
 
 - **Batman replaces the Paper theme.** Black background, cream text and the logo's palette,
