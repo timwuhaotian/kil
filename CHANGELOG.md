@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.24 — 2026-11-07
+
 - **Cmd-click opens links.** A bare URL, a markdown link's span, or a program's
   OSC 8 hyperlink opens in the default browser (`http`, `https` and `file`
   only), even when a full-screen program owns the mouse. A plain click still
