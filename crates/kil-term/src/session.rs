@@ -454,6 +454,16 @@ impl Session {
         self.events.mark_dirty();
     }
 
+    /// The OSC 8 hyperlink at `cell`, if the program put one there.
+    #[must_use]
+    pub fn hyperlink_at(&self, cell: ViewportCell) -> Option<String> {
+        let term = self.term.lock();
+        let (point, _) = grid_point(&term, cell);
+        term.grid()[point.line][point.column]
+            .hyperlink()
+            .map(|link| link.uri().to_owned())
+    }
+
     /// Selected text, if any.
     #[must_use]
     pub fn selection_text(&self) -> Option<String> {

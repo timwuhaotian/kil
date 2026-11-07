@@ -3081,8 +3081,17 @@ mod tests {
     }
 
     /// Polls `done` while letting the window draw, for up to 5 s of real time.
-    fn wait_for(cx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestContext) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn wait_for(cx: &mut VisualTestContext, done: impl FnMut(&mut VisualTestContext) -> bool) {
+        wait_for_timeout(cx, 5, done);
+    }
+
+    /// Polls `done` while letting the window draw, for up to `secs` of real time.
+    fn wait_for_timeout(
+        cx: &mut VisualTestContext,
+        secs: u64,
+        mut done: impl FnMut(&mut VisualTestContext) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
         while !done(cx) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
             cx.update(|window, _| window.refresh());
@@ -3240,6 +3249,78 @@ mod tests {
             screen.contains("GOT:^[[<64;"),
             "Shift keeps the native selection, the wheel still reports: {screen}"
         );
+    }
+
+    #[gpui::test]
+    fn command_click_should_open_the_link_under_the_pointer(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        // The row holding exactly `line`: the shell echoes the command too, on its own row.
+        let find_row = |cx: &mut VisualTestContext, line: &str| {
+            pane.read_with(cx, |pane, _| {
+                (0..pane.frame.rows).find(|&row| pane.frame.row_text(row) == line)
+            })
+        };
+        let click = |cx: &mut VisualTestContext, row: usize, col: usize, modifiers: Modifiers| {
+            let position = pane.read_with(cx, |pane, _| {
+                let geometry = pane.geometry.expect("laid out");
+                point(
+                    geometry.origin.x + geometry.cell.width * col + geometry.cell.width * 0.5,
+                    geometry.origin.y + geometry.cell.height * row + geometry.cell.height * 0.5,
+                )
+            });
+            cx.simulate_event(MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers,
+                click_count: 1,
+            });
+            cx.run_until_parked();
+        };
+        let command = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+
+        // Typed before the session attaches, input is dropped: wait for the shell first.
+        wait_for(cx, |cx| pane.read_with(cx, |pane, _| pane.pid().is_some()));
+        assert!(pane.read_with(cx, |pane, _| pane.pid().is_some()));
+        // The output must arrive and the pane must redraw from it; under a full run's
+        // load each can lag, so this waits longer than `wait_for`. It only reads the
+        // drawn frame: snapshotting the session would clear its dirty flag, which is
+        // what tells the next draw to copy the output.
+        let wait_for_line = |cx: &mut VisualTestContext, line: &str| {
+            wait_for_timeout(cx, 30, |cx| find_row(cx, line).is_some());
+            find_row(cx, line).expect("echoed back")
+        };
+
+        cx.simulate_input("echo https://example.com/docs\n");
+        let row = wait_for_line(cx, "https://example.com/docs");
+        // A plain click selects; only the modified one opens.
+        click(cx, row, 10, Modifiers::none());
+        assert_eq!(cx.opened_url(), None);
+        click(cx, row, 10, command);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
+
+        cx.simulate_input("echo '[the guide](https://example.org/g)'\n");
+        let row = wait_for_line(cx, "[the guide](https://example.org/g)");
+        // On the link's text, not its target.
+        click(cx, row, 5, command);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.org/g"));
+
+        cx.simulate_input(
+            "printf '\\033]8;;https://example.net\\033\\\\linked\\033]8;;\\033\\\\\\n'\n",
+        );
+        let row = wait_for_line(cx, "linked");
+        click(cx, row, 2, command);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.net"));
     }
 
     #[gpui::test]

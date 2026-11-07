@@ -5,7 +5,9 @@ mod common;
 use std::time::Duration;
 
 use common::{screen, sh, start, wait_for_text, wait_until};
-use kil_term::{CursorShape, CursorSnapshot, Frame, GridSize, Palette, Rgba, SessionEvent};
+use kil_term::{
+    CursorShape, CursorSnapshot, Frame, GridSize, Palette, Rgba, SessionEvent, ViewportCell,
+};
 
 #[test]
 fn cursor_position_query_should_be_answered_without_ui() {
@@ -130,6 +132,31 @@ fn replay_should_paint_before_the_program_output() {
     assert!(wait_for_text(&probe.session, "NEW"));
     let text = screen(&probe.session);
     assert!(text.find("OLD") < text.find("NEW"), "{text}");
+}
+
+#[test]
+fn hyperlink_at_should_read_the_osc8_link_under_a_cell() {
+    let probe = start(&sh(
+        "printf 'go \\033]8;;https://example.org/g\\033\\\\here\\033]8;;\\033\\\\ now'; \
+         exec /bin/sleep 600",
+    ));
+    assert!(wait_for_text(&probe.session, "go here now"));
+    let on_link = ViewportCell {
+        row: 0,
+        col: 4,
+        right_half: false,
+    };
+    assert_eq!(
+        probe.session.hyperlink_at(on_link).as_deref(),
+        Some("https://example.org/g")
+    );
+    assert_eq!(
+        probe
+            .session
+            .hyperlink_at(ViewportCell { col: 0, ..on_link })
+            .as_deref(),
+        None
+    );
 }
 
 #[test]

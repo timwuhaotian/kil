@@ -3,6 +3,7 @@
 mod config;
 mod keymap;
 mod keys;
+mod links;
 mod motion;
 mod notify;
 mod pane_tree;

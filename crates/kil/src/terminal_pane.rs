@@ -22,7 +22,7 @@ use kil_term::{
 };
 
 use crate::{
-    keys,
+    keys, links,
     restore::{self, SavedPane},
     settings::{Settings, abbreviate_home},
     terminal_element::{TerminalCursor, TerminalElement, cells},
@@ -596,12 +596,33 @@ impl TerminalPane {
         })
     }
 
+    /// The link under `cell`: the program's OSC 8 hyperlink first, else a URL in the row's
+    /// text (DESIGN.md §8). The frame only carries text, so the hyperlink is read live.
+    fn link_at(&self, session: &Session, cell: ViewportCell) -> Option<String> {
+        session
+            .hyperlink_at(cell)
+            .filter(|url| links::is_openable(url))
+            .or_else(|| links::link_at(self.frame.row(cell.row), cell.col))
+    }
+
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         cx.emit(PaneEvent::Focused);
         let (Some(session), Some(cell)) = (&self.session, self.cell_at(event.position)) else {
             return;
         };
+        if event.modifiers.platform || event.modifiers.control {
+            // Cmd-click opens the link under the pointer, before the program below can
+            // claim the press: reports can't carry Cmd, so it can't belong to the program.
+            // Ctrl is honored too, though macOS delivers Ctrl-click as a right click.
+            if cell.row < self.frame.rows
+                && cell.col < self.frame.cols
+                && let Some(url) = self.link_at(session, cell)
+            {
+                cx.open_url(&url);
+                return;
+            }
+        }
         let mode = session.input_mode();
         if mode.mouse_drag() && !event.modifiers.shift {
             // The program owns the selection (e.g. killi in fullscreen mode): it gets the

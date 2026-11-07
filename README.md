@@ -163,7 +163,8 @@ to go back (it does what **System Settings ▸ Desktop & Dock** says a title-bar
 does). Programs that report the mouse, like Claude Code's full-screen view, get the scroll
 wheel; programs that ask for drags, like killi's fullscreen mode, also get the press, drags
 and release and own their selection (Shift-drag stays Kil's). Elsewhere the wheel scrolls
-Kil's scrollback.
+Kil's scrollback. Cmd-click a link — a bare URL, a markdown link's text, or a program's
+OSC 8 hyperlink — to open it in the default browser.
 
 **Rebinding is in the app.** **Settings ▸ Keyboard** lists every command and the keys it runs on.
 Click a shortcut, press the new one, and it is saved and applied at once — the old keys stop

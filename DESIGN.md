@@ -54,13 +54,14 @@ Build status:
 | A28 | A file dragged from Finder onto a pane is typed there as its shell-escaped path, several files as a run of them, bracketed when the program asked for bracketed paste. | `drop_should_escape_each_path_for_the_shell` + manual (drop onto zsh and onto killi). |
 | A26 | Double-clicking the sidebar's top strip (the title bar the window doesn't draw, where the traffic lights are) does what System Settings ▸ Desktop & Dock says a title-bar double-click does: by default the window fills the screen, and the next double-click puts it back. | Manual (CGEvent double-click, window bounds before and after). |
 | A27 | Kil updates itself (§15). Five seconds after launch and every six hours, with `auto_update` on (the default), it reads `releases/latest.toml` on `main`; for a newer version it downloads the DMG and keeps its app only if the SHA-256, the version, the Developer ID team (the running app's) and Apple's notarization all check out. Quitting Kil, however it quits, then replaces the bundle, so the next launch is the new version; running jobs keep running in the session server. **Kil ▸ Check for Updates…** (or **Check Now** in Settings) opens a window that follows the check (checking, the download's bytes against its size, verifying) and then says it is up to date, why it can't update, or offers **Restart Now** and **Later**; the menu item becomes **Restart to Update to x.y.z**, which quits without asking about jobs and reopens the new app. An ad-hoc-signed build, a bare binary and a copy run from the DMG never replace themselves. | `update` tests (the committed release passes every check, the download reports its bytes, the swap), `update_window` test (the window follows a check to **Later**) + manual: a Developer ID build labelled older updates on quit. |
+| A28 | Cmd-click on a link opens it in the default browser: a bare URL, a markdown link clicked on its text, or a program's OSC 8 hyperlink. A plain click still selects. | `command_click_should_open_the_link_under_the_pointer`, `links` unit tests, `hyperlink_at_should_read_the_osc8_link_under_a_cell`. |
 
 ### Non-goals (v1)
 These are left out and can be added later:
 - Multiple windows. Keeping a running process itself across launches: today a job is started again, not resumed (§4.9). Continuing it needs a session server; that is planned in §14.
 - SSH and tmux control mode.
 - Ligatures, image protocols (sixel, kitty) and the kitty keyboard protocol.
-- OSC 133 shell integration, OSC 8 hyperlinks, URL click.
+- OSC 133 shell integration.
 - Scrollback search and tab drag-reorder.
 - Themes beyond one built-in dark theme, a keymap editor in the Settings window (it links to `keymap.toml` instead), and plugins.
 - Auto-update.
@@ -527,6 +528,8 @@ Only single chords are recorded; multi-stroke keys stay a `keymap.toml` feature.
 - Paste uses bracketed paste when that mode is set, and strips ESC from the pasted text.
 - An image on the clipboard has no text to paste. A program in bracketed-paste mode gets an empty bracketed paste for it, so a coding agent (killi) can tell Cmd-V from nothing and read the image from the clipboard itself; Kil never hands the image over. Others get nothing, as before.
 - Files dropped on a pane are typed as their paths, each shell-escaped with a space after it, as Terminal.app does; under bracketed paste they arrive as one paste, so killi reads a drop as files to attach (an image) or name with `@` (anything else). The drop goes to the pane under the pointer, focused or not.
+
+**Links.** Cmd-click (or Ctrl-click, where the platform delivers it as one) on a link opens it in the default browser through `cx.open_url`. The link under the pointer is the program's OSC 8 hyperlink if there is one, else a URL in the row's text: a bare `http(s)://` URL, or a markdown `[text](target)` span wherever in it the pointer lands. Only `http`, `https` and `file` targets open. The click is claimed before mouse-reporting programs, which can't see Cmd; without a link under the pointer it falls through to selection or the program as before.
 
 **IME:** `TerminalPane` implements `EntityInputHandler`. Marked text is drawn at the cursor. Committed text goes to the PTY. `bounds_for_range` returns the cursor rect so the candidate window sits next to the cursor. A cursor the program hid (DECTCEM, e.g. a TUI such as `kimi` that draws its own) is not drawn but keeps its place in the snapshot (`CursorShape::Hidden`), because such programs leave it at their input; without it the candidate window fell back to the screen's bottom-left corner. The acceptance test is Pinyin input.
 
