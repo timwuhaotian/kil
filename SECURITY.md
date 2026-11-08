@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest release, [`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg)
+Only the latest release, [`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)
 and `main`, gets security fixes.
 
 ## Reporting a vulnerability

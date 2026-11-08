@@ -87,7 +87,7 @@ only one near Kil's size, and it has no tabs or split panes.
 
 ## Install
 
-Download [`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
+Download [`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
 From then on it keeps itself up to date: once a new release is downloaded and checked, a
 window asks whether to update to it, with its changelog entries — **Restart Now**, or

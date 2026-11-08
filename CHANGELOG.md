@@ -1,10 +1,18 @@
 # Changelog
 
 Notable changes to Kil. The download is always the latest build
-([`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg)); the
+([`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)); the
 versions below are how we track releases, and match `Cargo.toml` and the app's Info.plist.
 
 ## Unreleased
+
+## 0.0.27 — 2026-11-08
+
+- **Updates download again.** GitHub's `github.com/<repo>/raw/<branch>/<file>` link answers
+  **504**, so the updater could not download a release (**Kil can't update right now**), and
+  the README's download link was dead too. Every file Kil fetches now comes from
+  `raw.githubusercontent.com`, which serves the same bytes, and a failure no longer says
+  `curl: curl:`.
 
 ## 0.0.26 — 2026-11-08
 
