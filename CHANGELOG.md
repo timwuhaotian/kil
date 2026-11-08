@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.26 — 2026-11-08
+
 - **A new release now asks.** The periodic check used to download a release silently and
   install it when Kil quit, so a Kil left open for days never said anything. Once a release
   is downloaded and checked, the update window opens on its own — **Update to Kil x.y.z?** —
