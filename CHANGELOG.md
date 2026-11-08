@@ -6,6 +6,13 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **A new release now asks.** The periodic check used to download a release silently and
+  install it when Kil quit, so a Kil left open for days never said anything. Once a release
+  is downloaded and checked, the update window opens on its own — **Update to Kil x.y.z?** —
+  with the changelog entries for every version since the running one. **Restart Now**
+  updates at once; **Later** keeps the old behavior and installs on quit, and the ask comes
+  once per run, not at every check.
+
 ## 0.0.25 — 2026-11-08
 
 - **A new app icon.** Kil's icon is now the terminal tile from killi's logo, taken

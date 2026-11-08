@@ -53,7 +53,7 @@ Build status:
 | A27 | Two buttons at the top right of the tab split the focused pane right and down, as `cmd-shift-d` and `cmd-d` do. They are faint until the pointer is over them, and a click on them doesn't reach the pane below. | `the_split_buttons_should_split_the_focused_pane` + manual. |
 | A28 | A file dragged from Finder onto a pane is typed there as its shell-escaped path, several files as a run of them, bracketed when the program asked for bracketed paste. | `drop_should_escape_each_path_for_the_shell` + manual (drop onto zsh and onto killi). |
 | A26 | Double-clicking the sidebar's top strip (the title bar the window doesn't draw, where the traffic lights are) does what System Settings ▸ Desktop & Dock says a title-bar double-click does: by default the window fills the screen, and the next double-click puts it back. | Manual (CGEvent double-click, window bounds before and after). |
-| A27 | Kil updates itself (§15). Five seconds after launch and every six hours, with `auto_update` on (the default), it reads `releases/latest.toml` on `main`; for a newer version it downloads the DMG and keeps its app only if the SHA-256, the version, the Developer ID team (the running app's) and Apple's notarization all check out. Quitting Kil, however it quits, then replaces the bundle, so the next launch is the new version; running jobs keep running in the session server. **Kil ▸ Check for Updates…** (or **Check Now** in Settings) opens a window that follows the check (checking, the download's bytes against its size, verifying) and then says it is up to date, why it can't update, or offers **Restart Now** and **Later**; the menu item becomes **Restart to Update to x.y.z**, which quits without asking about jobs and reopens the new app. An ad-hoc-signed build, a bare binary and a copy run from the DMG never replace themselves. | `update` tests (the committed release passes every check, the download reports its bytes, the swap), `update_window` test (the window follows a check to **Later**) + manual: a Developer ID build labelled older updates on quit. |
+| A27 | Kil updates itself (§15). Five seconds after launch and every six hours, with `auto_update` on (the default), it reads `releases/latest.toml` on `main`; for a newer version it downloads the DMG and keeps its app only if the SHA-256, the version, the Developer ID team (the running app's) and Apple's notarization all check out. Quitting Kil, however it quits, then replaces the bundle, so the next launch is the new version; running jobs keep running in the session server. Once a periodic check has a release ready, the update window opens on its own and asks **Update to Kil x.y.z?**, listing the changelog entries for every version in between; saying **Later** leaves the install-on-quit behavior untouched, and the ask happens once per run. **Kil ▸ Check for Updates…** (or **Check Now** in Settings) opens the same window at once and follows the check (checking, the download's bytes against its size, verifying) to the same ask, or says it is up to date, or why it can't update; the menu item becomes **Restart to Update to x.y.z**, which quits without asking about jobs and reopens the new app. An ad-hoc-signed build, a bare binary and a copy run from the DMG never replace themselves. | `update` tests (the committed release passes every check, the download reports its bytes, the swap), `update_window` test (the window follows a check to **Later**) + manual: a Developer ID build labelled older updates on quit. |
 | A28 | Cmd-click on a link opens it in the default browser: a bare URL, a markdown link clicked on its text, or a program's OSC 8 hyperlink. A plain click still selects. | `command_click_should_open_the_link_under_the_pointer`, `links` unit tests, `hyperlink_at_should_read_the_osc8_link_under_a_cell`. |
 
 ### Non-goals (v1)
@@ -840,12 +840,20 @@ asks `main` what the latest release is, not GitHub's release API, because releas
   it is working. A known size fills a bar, tweened between readings; otherwise a bar sweeps.
   At the end it shows a mark and the outcome: **Restart Now** (Return) and **Later**, or **OK**.
   **Hide** closes it during the check, and the outcome opens it again. A background check
-  opens nothing. Once done it draws nothing more, so idle CPU stays at zero (A12).
+  opens nothing while it works or when there is nothing to install, but a ready release
+  opens the window on its own: **Update to Kil x.y.z?**, with the entries from `CHANGELOG.md`
+  on `main` for every version after the running one up to it (the running build predates
+  them, so they are fetched like the manifest, markdown stripped to plain text; a failed
+  fetch just asks without notes). With notes the window grows and they scroll. The ask
+  happens once per run: after **Later**, later periodic checks stop at the ready update and
+  stay silent, and quitting installs it as before. Once done it draws nothing more, so idle
+  CPU stays at zero (A12).
 - **Restart to Update** detaches like `⌘Q` without the jobs prompt (they keep running), and a
   `/bin/sh` waits for this process to exit before `open`ing the new bundle.
 - **Not updated:** a bare binary (`cargo run`), an ad-hoc-signed bundle (a local build), a copy
   running from the DMG or translocated by Gatekeeper, and a bundle in a folder Kil can't write.
   A manual check says which.
 - **Tested** by `update` tests: version order, the manifest, which bundles are replaceable, the
-  swap and its rollback, and the committed `releases/` passing every check `stage` makes (from a
-  `file://` URL, against team 43VLF3KTFZ).
+  swap and its rollback, the changelog range and its markdown stripping, a background check
+  asking once it is ready (and not again after **Later**), and the committed `releases/`
+  passing every check `stage` makes (from a `file://` URL, against team 43VLF3KTFZ).

@@ -29,6 +29,9 @@ actions!(update, [CheckForUpdates, RestartToUpdate]);
 const MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/latest.toml";
 const DMG_URL: &str = "https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg";
+/// The changelog on `main`; the running build predates the new release's entries, so they
+/// cannot be read from anything it already has.
+const CHANGELOG_URL: &str = "https://raw.githubusercontent.com/timwuhaotian/kil/main/CHANGELOG.md";
 /// After launch, so the check never competes with reopening the session.
 const FIRST_CHECK: Duration = Duration::from_secs(5);
 /// A terminal stays open for days; one wakeup in hours keeps idle CPU at zero (A12).
@@ -98,6 +101,72 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
         (parse_version(candidate), parse_version(current)),
         (Some(candidate), Some(current)) if candidate > current
     )
+}
+
+/// Changelog text without its markdown: bold markers and backticks go, a link keeps its words.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open..].find(']') else {
+            break;
+        };
+        if !rest[open + close..].starts_with("](") {
+            // Not a link (the changelog's own `[Image #N]`): keep it and scan on.
+            out.push_str(&rest[..=open]);
+            rest = &rest[open + 1..];
+            continue;
+        }
+        let Some(end) = rest[open + close..].find(')') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&rest[open + 1..open + close]);
+        rest = &rest[open + close + end + 1..];
+    }
+    out.push_str(rest);
+    out.replace("**", "").replace('`', "")
+}
+
+/// The entries for every version after `current` up to `candidate`, as plain text for the
+/// update window: a `Kil x.y.z` line per version, then its bullets unwrapped. Text that
+/// doesn't parse gives nothing, and the window asks without notes.
+fn release_notes(changelog: &str, current: &str, candidate: &str) -> String {
+    let (Some(current), Some(candidate)) = (parse_version(current), parse_version(candidate))
+    else {
+        return String::new();
+    };
+    let mut notes: Vec<String> = Vec::new();
+    let mut include = false;
+    for line in changelog.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            let version = heading.split_whitespace().next().unwrap_or_default();
+            include = parse_version(version).is_some_and(|v| v > current && v <= candidate);
+            if include {
+                if !notes.is_empty() {
+                    notes.push(String::new());
+                }
+                notes.push(format!("Kil {version}"));
+            }
+            continue;
+        }
+        if !include {
+            continue;
+        }
+        let line = line.trim();
+        if let Some(item) = line.strip_prefix("- ") {
+            notes.push(format!("• {}", plain(item)));
+        } else if !line.is_empty() {
+            match notes.last_mut().filter(|last| last.starts_with('•')) {
+                Some(last) => {
+                    last.push(' ');
+                    last.push_str(&plain(line));
+                }
+                None => notes.push(plain(line)),
+            }
+        }
+    }
+    notes.join("\n").trim().to_owned()
 }
 
 /// The `.app` that `exe` runs in, if Kil may replace it: not a bare binary (`cargo run`), not
@@ -258,12 +327,9 @@ fn verify(app: &Path, version: &str, team: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads the manifest at `url`.
-///
-/// # Errors
-/// If it can't be fetched or parsed.
-pub fn fetch_manifest(url: &str) -> Result<Manifest, String> {
-    let text = run(
+/// The text at `url`.
+fn fetch_text(url: &str) -> Result<String, String> {
+    run(
         "/usr/bin/curl",
         &[
             "-fsSL".as_ref(),
@@ -271,8 +337,23 @@ pub fn fetch_manifest(url: &str) -> Result<Manifest, String> {
             "30".as_ref(),
             url.as_ref(),
         ],
-    )?;
-    Manifest::parse(&text)
+    )
+}
+
+/// Reads the manifest at `url`.
+///
+/// # Errors
+/// If it can't be fetched or parsed.
+pub fn fetch_manifest(url: &str) -> Result<Manifest, String> {
+    Manifest::parse(&fetch_text(url)?)
+}
+
+/// What changed between `current` and `candidate`, from the changelog on `main`. Notes are
+/// decoration on the ask, so any failure is just no notes, never a failed update.
+fn fetch_notes(current: &str, candidate: &str) -> String {
+    fetch_text(CHANGELOG_URL)
+        .map(|changelog| release_notes(&changelog, current, candidate))
+        .unwrap_or_default()
 }
 
 /// Downloads the DMG at `dmg_url` into `dir`, checks it against `manifest` and `team`, and
@@ -401,6 +482,8 @@ fn cache_dir() -> Result<PathBuf, String> {
 #[derive(Clone)]
 struct Ready {
     version: String,
+    /// Its changelog entries, plain text; empty when they couldn't be fetched or parsed.
+    notes: String,
     app: PathBuf,
     bundle: PathBuf,
 }
@@ -422,8 +505,10 @@ fn find(current: &str, progress: &Progress) -> Result<Found, String> {
     }
     writable(bundle.parent().unwrap_or(&bundle))?;
     let app = stage(&manifest, DMG_URL, &cache_dir()?, &team, progress)?;
+    let notes = fetch_notes(current, &manifest.version);
     Ok(Found::Ready(Ready {
         version: manifest.version,
+        notes,
         app,
         bundle,
     }))
@@ -501,7 +586,10 @@ fn check(asked: bool, cx: &mut App) {
     let updater = cx.global_mut::<Updater>();
     if let Some(ready) = &updater.ready {
         if asked {
-            let shown = Shown::Ready(ready.version.clone());
+            let shown = Shown::Ready {
+                version: ready.version.clone(),
+                notes: ready.notes.clone(),
+            };
             update_window::show(shown, cx);
         }
         return;
@@ -539,10 +627,13 @@ fn checked(found: Result<Found, String>, cx: &mut App) {
     let shown = match found {
         Ok(Found::Ready(ready)) => {
             log::info!("Kil {} is ready to install", ready.version);
-            let version = ready.version.clone();
+            let shown = Shown::Ready {
+                version: ready.version.clone(),
+                notes: ready.notes.clone(),
+            };
             updater.ready = Some(ready);
             cx.set_menus(crate::menus(cx));
-            Shown::Ready(version)
+            shown
         }
         Ok(Found::UpToDate) => Shown::UpToDate,
         Err(err) => {
@@ -550,7 +641,10 @@ fn checked(found: Result<Found, String>, cx: &mut App) {
             Shown::Failed(err)
         }
     };
-    if asked {
+    // A ready update asks even when the check was Kil's own periodic one; nothing else
+    // from a background check is worth interrupting for. The ask happens once per run:
+    // later checks stop at the ready update in `check` and never reach here again.
+    if asked || matches!(shown, Shown::Ready { .. }) {
         update_window::show(shown, cx);
     }
 }
@@ -605,6 +699,93 @@ mod tests {
             ],
             [true, true, false, false, false, false]
         );
+    }
+
+    #[test]
+    fn release_notes_should_take_the_versions_between_current_and_candidate() {
+        let changelog = "# Changelog\n\n## Unreleased\n\n- **Not yet.**\n\n## 0.0.27 — 2026-12-01\n\n- Too new.\n\n## 0.0.26 — 2026-11-20\n\n- **Bold thing** with `code` and [a link](https://example.com)\n  wrapped onto a second line.\n- Second.\n\n## 0.0.25 — 2026-11-08\n\n- Middle.\n\n## 0.0.24 — 2026-11-07\n\n- Already have it.\n";
+        assert_eq!(
+            release_notes(changelog, "0.0.24", "0.0.26"),
+            "Kil 0.0.26\n• Bold thing with code and a link wrapped onto a second line.\n• Second.\n\nKil 0.0.25\n• Middle."
+        );
+        assert_eq!(
+            plain("Press `[x]`, then [go](https://example.com)"),
+            "Press [x], then go"
+        );
+        assert_eq!(
+            (
+                release_notes(changelog, "0.0.26", "0.0.26"),
+                release_notes(changelog, "x", "0.0.26"),
+                release_notes("no headings", "0.0.24", "0.0.26")
+            ),
+            (String::new(), String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn the_committed_changelog_should_have_notes_for_the_committed_release() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            Manifest::parse(&fs::read_to_string(root.join("releases/latest.toml")).unwrap())
+                .unwrap();
+        let changelog = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+        let notes = release_notes(&changelog, "0.0.0", &manifest.version);
+        assert!(notes.starts_with(&format!("Kil {}", manifest.version)));
+        assert!(!notes.contains("**") && !notes.contains("##"));
+    }
+
+    #[gpui::test]
+    fn a_background_check_should_ask_once_it_is_ready(cx: &mut gpui::TestAppContext) {
+        use gpui::AnyWindowHandle;
+
+        use crate::{theme::Theme, update_window::UpdateWindow};
+
+        let count = |cx: &mut gpui::TestAppContext| {
+            cx.windows()
+                .iter()
+                .filter_map(AnyWindowHandle::downcast::<UpdateWindow>)
+                .count()
+        };
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.set_global(Updater::default());
+            cx.bind_keys(update_window::bindings());
+        });
+        // Nothing to install: a background check opens nothing.
+        cx.update(|cx| checked(Ok(Found::UpToDate), cx));
+        cx.run_until_parked();
+        assert_eq!(count(cx), 0);
+
+        // Ready: the window asks on its own, notes and all.
+        let ready = Ready {
+            version: "9.9.9".into(),
+            notes: "Kil 9.9.9\n• A new thing.".into(),
+            app: PathBuf::from("/tmp/Kil.app"),
+            bundle: PathBuf::from("/Applications/Kil.app"),
+        };
+        cx.update(|cx| checked(Ok(Found::Ready(ready)), cx));
+        cx.run_until_parked();
+        assert_eq!(count(cx), 1);
+
+        // Later, then the next periodic check: no second ask this run. Asking by hand does.
+        let [window] = cx
+            .windows()
+            .iter()
+            .filter_map(AnyWindowHandle::downcast::<UpdateWindow>)
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one update window");
+        };
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| check(false, cx));
+        cx.run_until_parked();
+        assert_eq!(count(cx), 0);
+        cx.update(|cx| check(true, cx));
+        cx.run_until_parked();
+        assert_eq!(count(cx), 1);
     }
 
     #[test]

@@ -51,9 +51,11 @@ owns every process, PID and file descriptor it creates.
   gone, so each pane's last job is typed into a new shell instead.
 - **Idle means idle.** A window with nothing to draw doesn't wake: no CPU at rest, and a
   blinking cursor redraws only itself. Nothing is written to disk unless something changed.
-- **Updates itself, quietly.** Kil checks for a new release at launch and every six hours,
-  downloads it in the background, checks its checksum, Developer ID signature and Apple
-  notarization, and installs it when you quit. Jobs keep running across the update.
+- **Updates itself, and asks.** Kil checks for a new release at launch and every six hours,
+  downloads it in the background, and checks its checksum, Developer ID signature and Apple
+  notarization. Once it's ready, a window asks whether to update and lists what's new:
+  **Restart Now**, or **Later** and it installs when you quit. Jobs keep running across the
+  update.
 - **Five themes**: Night, Batman, Fjord, Ember and Dusk. Batman is black, with a yellow
   accent. Programs that ask for the terminal's colors, like vim deciding
   between light and dark, are told the theme's.
@@ -87,10 +89,11 @@ only one near Kil's size, and it has no tabs or split panes.
 
 Download [`Kil-arm64.dmg`](https://github.com/timwuhaotian/kil/raw/main/releases/Kil-arm64.dmg), always the latest Kil, open it, and drag
 **Kil** to **Applications**. The app is signed with a Developer ID and notarized by Apple.
-From then on it keeps itself up to date: a new release is installed when you quit Kil, and
-**Kil ▸ Check for Updates…** checks right away, in a small window that shows the download
-and offers **Restart Now** or **Later**; once a release is ready, the menu item reads
-**Restart to Update** (turn automatic updates off in **Settings ▸ Updates**). `releases/`
+From then on it keeps itself up to date: once a new release is downloaded and checked, a
+window asks whether to update to it, with its changelog entries — **Restart Now**, or
+**Later** and it installs when you quit Kil. **Kil ▸ Check for Updates…** checks right away
+in the same window; once a release is ready, the menu item reads **Restart to Update**
+(turn automatic updates off in **Settings ▸ Updates**). `releases/`
 also holds the DMG's `.sha256`:
 
 ```sh

@@ -1,5 +1,6 @@
-//! Kil ▸ Check for Updates…: a small window that follows the check from start to end
-//! (DESIGN.md §15), so a click is answered at once and a download shows how far it has got.
+//! The update window (DESIGN.md §15): it follows a manual check from start to end, so a
+//! click is answered at once and a download shows how far it has got, and it opens on its
+//! own when a periodic check has a release ready, to ask about it with its changelog entries.
 
 use std::{sync::Arc, time::Instant};
 
@@ -21,6 +22,9 @@ actions!(update_window, [Dismiss, Confirm]);
 
 const WIDTH: f32 = 360.;
 const HEIGHT: f32 = 156.;
+/// With release notes to show, the window grows so a few entries fit without scrolling.
+const NOTES_WIDTH: f32 = 440.;
+const NOTES_HEIGHT: f32 = 380.;
 /// Of the track, for the bar that sweeps while the size of the work isn't known.
 const SWEEP_WIDTH: f32 = 0.35;
 
@@ -36,20 +40,35 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub enum Shown {
     /// A check under way, read from its thread.
     Working(Arc<Progress>),
-    /// The version that installs when Kil quits.
-    Ready(String),
+    /// The version that installs when Kil quits, with its changelog entries (maybe empty).
+    Ready {
+        version: String,
+        notes: String,
+    },
     UpToDate,
     Failed(String),
 }
 
+/// The size `shown` needs: the compact progress window, or one big enough for the notes.
+fn dims(shown: &Shown) -> (f32, f32) {
+    match shown {
+        Shown::Ready { notes, .. } if !notes.is_empty() => (NOTES_WIDTH, NOTES_HEIGHT),
+        Shown::Ready { .. } | Shown::Working(_) | Shown::UpToDate | Shown::Failed(_) => {
+            (WIDTH, HEIGHT)
+        }
+    }
+}
+
 /// Shows `shown` in the update window, opening it if it isn't open.
 pub fn show(shown: Shown, cx: &mut App) {
+    let (width, height) = dims(&shown);
     if let Some(open) = cx
         .windows()
         .iter()
         .find_map(AnyWindowHandle::downcast::<UpdateWindow>)
     {
         let _ = open.update(cx, |this, window, cx| {
+            window.resize(size(px(width), px(height)));
             this.show(shown, cx);
             window.activate_window();
         });
@@ -58,7 +77,7 @@ pub fn show(shown: Shown, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(WIDTH), px(HEIGHT)),
+            size(px(width), px(height)),
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
@@ -151,7 +170,7 @@ impl UpdateWindow {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.shown, Shown::Ready(_)) {
+        if matches!(self.shown, Shown::Ready { .. }) {
             update::restart(cx);
         } else {
             window.remove_window();
@@ -184,9 +203,10 @@ impl UpdateWindow {
                 format!("Verifying Kil {version}…").into(),
                 "Checking its signature and Apple's notarization.".into(),
             ),
-            (Shown::Ready(version), _) => (
-                format!("Kil {version} is ready").into(),
-                "Restart now, or it installs when Kil quits. Running jobs keep going.".into(),
+            (Shown::Ready { version, .. }, _) => (
+                format!("Update to Kil {version}?").into(),
+                "It's downloaded and checked. Restart now, or it installs when Kil quits. Running jobs keep going."
+                    .into(),
             ),
             (Shown::UpToDate, _) => (
                 "Kil is up to date".into(),
@@ -239,8 +259,16 @@ impl UpdateWindow {
                         ),
                 )
                 .into_any_element(),
-            (Shown::Ready(_) | Shown::UpToDate, _) => mark("✓", c.accent, c),
+            (Shown::Ready { .. } | Shown::UpToDate, _) => mark("✓", c.accent, c),
             (Shown::Failed(_), _) => mark("!", c.error, c),
+        }
+    }
+
+    /// The changelog entries to show under the ask, if the ready update brought any.
+    fn notes(&self) -> Option<&str> {
+        match &self.shown {
+            Shown::Ready { notes, .. } if !notes.is_empty() => Some(notes),
+            _ => None,
         }
     }
 
@@ -250,7 +278,7 @@ impl UpdateWindow {
         let row = div().flex().justify_end().gap_2();
         match self.shown {
             Shown::Working(_) => row.child(dismiss("update-hide", "Hide")),
-            Shown::Ready(_) => row.child(dismiss("update-later", "Later")).child(
+            Shown::Ready { .. } => row.child(dismiss("update-later", "Later")).child(
                 primary("update-restart", "Restart Now", c)
                     .on_click(cx.listener(|_, _: &ClickEvent, _, cx| update::restart(cx))),
             ),
@@ -318,6 +346,7 @@ impl Render for UpdateWindow {
         let c = Colors::of(cx.global::<Theme>());
         let (headline, detail) = self.words();
         let working = matches!(self.shown, Shown::Working(_));
+        let notes: Option<SharedString> = self.notes().map(|notes| notes.to_owned().into());
         div()
             .key_context("UpdateWindow")
             .track_focus(&self.focus_handle)
@@ -344,13 +373,31 @@ impl Render for UpdateWindow {
             .when(working, |body| body.child(self.indicator(c, window)))
             .child(
                 div()
-                    .flex_1()
+                    .when(notes.is_none(), gpui::Styled::flex_1)
                     .min_h_0()
                     .text_size(px(11.))
                     .text_color(c.muted)
                     .line_clamp(3)
                     .child(detail),
             )
+            .when_some(notes, |body, notes| {
+                body.child(
+                    div()
+                        .id("update-notes")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(c.divider)
+                        .bg(c.card)
+                        .px_3()
+                        .py_2()
+                        .text_size(px(11.))
+                        .text_color(c.text)
+                        .child(notes),
+                )
+            })
             .child(self.buttons(c, cx))
     }
 }
@@ -403,10 +450,24 @@ mod tests {
             ("Downloading Kil 9.9.9…", "1.5 MB of 3.0 MB", 0.5)
         );
 
-        cx.update(|cx| show(Shown::Ready("9.9.9".into()), cx));
+        cx.update(|cx| {
+            show(
+                Shown::Ready {
+                    version: "9.9.9".into(),
+                    notes: "Kil 9.9.9\n• A new thing.".into(),
+                },
+                cx,
+            );
+        });
         cx.run_until_parked();
         assert_eq!(open_windows(cx).len(), 1);
-        assert_eq!(headline(window, cx), "Kil 9.9.9 is ready");
+        assert_eq!(headline(window, cx), "Update to Kil 9.9.9?");
+        assert_eq!(
+            window
+                .update(cx, |this, _, _| this.notes().map(str::to_owned))
+                .unwrap(),
+            Some("Kil 9.9.9\n• A new thing.".to_owned())
+        );
         assert!(window.update(cx, |this, _, _| this.poll.is_none()).unwrap());
 
         // Later: the window goes, and the update waits for Kil to quit.
