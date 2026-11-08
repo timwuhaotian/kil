@@ -54,8 +54,8 @@ owns every process, PID and file descriptor it creates.
 - **Updates itself, quietly.** Kil checks for a new release at launch and every six hours,
   downloads it in the background, checks its checksum, Developer ID signature and Apple
   notarization, and installs it when you quit. Jobs keep running across the update.
-- **Five themes**: Night, Batman, Fjord, Ember and Dusk. Batman is black, with the yellow
-  of the logo as its accent. Programs that ask for the terminal's colors, like vim deciding
+- **Five themes**: Night, Batman, Fjord, Ember and Dusk. Batman is black, with a yellow
+  accent. Programs that ask for the terminal's colors, like vim deciding
   between light and dark, are told the theme's.
 - **A default directory** for new tabs, if you want one. Splits still open where their pane
   is.
