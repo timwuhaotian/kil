@@ -4,7 +4,17 @@ Notable changes to Kil. The download is always the latest build
 ([`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)); the
 versions below are how we track releases, and match `Cargo.toml` and the app's Info.plist.
 
-## Unreleased
+## 0.0.30 — 2026-11-09
+
+- **Agent on Edge in the Settings window.** Settings ▸ Agent on Edge now shows the pairing
+  QR code in the app — no terminal command needed. Enable the bridge, tick Public internet
+  for a `UPnP` port mapping to the public IP, and the mapping is removed when you switch it
+  off or close the window.
+
+- **Agent on Edge over the internet, still no cloud.** `kil --remote --public` asks the
+  router (UPnP) for a port mapping to the Mac's public IP and prints a QR that pairs an
+  iPhone from anywhere. The bridge throttles failed pairing attempts, so the one-time code
+  is safe on a public port, and the mapping is removed when the bridge stops.
 
 ## 0.0.29 — 2026-11-09
 

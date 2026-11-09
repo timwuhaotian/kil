@@ -45,10 +45,13 @@ owns every process, PID and file descriptor it creates.
   The next launch goes back on the same processes, with the full screen, scrollback and input
   modes. **Kil ▸ Quit and Stop All Jobs** ends everything, and **Kil ▸ Restart** ends it and
   opens Kil again.
-- **Remote panes for Agent on Edge.** `kil --remote` prints a QR code that pairs an iPhone
-  over the LAN to the same session server through a TLS tunnel, so the panes on the phone are
-  the panes on the desk; the standalone `kil-remote` binary does the same without starting the
-  server.
+- **Remote panes for Agent on Edge.** Settings ▸ Agent on Edge shows a QR code that pairs an
+  iPhone to the same session server through a TLS tunnel, so the panes on the phone are the
+  panes on the desk; `kil --remote` does the same from a terminal, and the standalone
+  `kil-remote` binary without starting the server. Ticking Public internet asks your own
+  router (UPnP) to forward a port and prints a QR for the public IP, so the phone works from
+  anywhere — no cloud service or third party is involved, and the mapping is removed when the
+  bridge stops.
 - **Comes back after a restart, too.** The layout, each pane's directory and the window frame
   are saved within 2 s of a change, and each pane's screen and scrollback every 30 s while it
   prints, and at once when you quit. After a logout or a reboot, the processes themselves are

@@ -18,13 +18,16 @@ kil-term.workspace = true
 kil-remote.workspace = true
 gpui.workspace = true
 anyhow.workspace = true
+async-io = "2"
 block2.workspace = true
 env_logger.workspace = true
 futures.workspace = true
+image = "0.25"
 log.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-user-notifications.workspace = true
+qrcode = "0.13"
 serde.workspace = true
 toml.workspace = true
 

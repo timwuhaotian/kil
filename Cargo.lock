@@ -2897,6 +2897,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "igd-next"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c71312255fdc5364bff7eec0adf68146bc4e72aba85075261af40d234c11be99"
+dependencies = [
+ "bytes",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "rand 0.10.3",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "xml-rs",
+ "xmltree",
+]
+
+[[package]]
 name = "image"
 version = "0.24.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3142,29 +3163,33 @@ dependencies = [
 
 [[package]]
 name = "kil"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "anyhow",
+ "async-io",
  "block2",
  "env_logger",
  "futures",
  "gpui",
+ "image 0.25.10",
  "kil-remote",
  "kil-term",
  "log",
  "objc2",
  "objc2-foundation",
  "objc2-user-notifications",
+ "qrcode",
  "serde",
  "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
 name = "kil-remote"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "anyhow",
  "env_logger",
+ "igd-next",
  "kil-term",
  "log",
  "qrcode",
@@ -3177,7 +3202,7 @@ dependencies = [
 
 [[package]]
 name = "kil-term"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -5951,6 +5976,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -7319,6 +7345,21 @@ name = "xkeysym"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
+
+[[package]]
+name = "xml-rs"
+version = "0.8.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "xmltree"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7d8a75eaf6557bb84a65ace8609883db44a29951042ada9b393151532e41fcb"
+dependencies = [
+ "xml-rs",
+]
 
 [[package]]
 name = "xmlwriter"

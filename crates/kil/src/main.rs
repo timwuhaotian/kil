@@ -7,6 +7,7 @@ mod links;
 mod motion;
 mod notify;
 mod pane_tree;
+mod qr;
 mod restore;
 mod settings;
 mod settings_window;
@@ -271,8 +272,9 @@ fn server_dir() -> Option<PathBuf> {
 /// TLS tunnel, printing a QR code to scan. Keeps the same session server the
 /// app runs, so the panes on the phone are the panes on the desk.
 ///
-/// Optional flags after `--remote`: `--host <ip>` (override the QR address)
-/// and `--port <n>` (default: an OS-picked free port).
+/// Optional flags after `--remote`: `--host <ip>` (override the QR address),
+/// `--port <n>` (default: an OS-picked free port), and `--public` (set up a
+/// `UPnP` port mapping on the router and print a QR for the public IP).
 fn remote_config() -> Option<kil_remote::Config> {
     let mut args = std::env::args_os().skip(1);
     if args.next()? != "--remote" {
@@ -280,10 +282,12 @@ fn remote_config() -> Option<kil_remote::Config> {
     }
     let mut port = 0;
     let mut host = None;
+    let mut public = false;
     while let Some(arg) = args.next() {
         match arg.to_str()? {
             "--host" => host = Some(args.next()?.to_string_lossy().into_owned()),
             "--port" => port = args.next()?.to_string_lossy().parse().ok()?,
+            "--public" => public = true,
             other => {
                 eprintln!("kil --remote: ignoring unknown flag {other}");
                 return None;
@@ -300,6 +304,7 @@ fn remote_config() -> Option<kil_remote::Config> {
         host,
         ttl: std::time::Duration::from_secs(300),
         launcher: std::env::current_exe().ok(),
+        public,
     })
 }
 

@@ -2,18 +2,20 @@
 //! (DESIGN.md §9). Each change is written, then applied by the same reload that runs when
 //! the terminal window regains focus.
 
-use std::fs;
+use std::{fs, sync::Arc, time::Duration};
 
 use gpui::{
     AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, Div, ElementId, Entity,
-    FocusHandle, Focusable, Hsla, KeyBinding, Keystroke, MouseButton, MouseDownEvent,
-    PathPromptOptions, SharedString, Stateful, Subscription, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, div, point, prelude::*, px, size,
+    FocusHandle, Focusable, Hsla, ImageSource, KeyBinding, Keystroke, MouseButton, MouseDownEvent,
+    PathPromptOptions, RenderImage, SharedString, Stateful, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, img, point, prelude::*, px, size,
 };
+use kil_remote::Bridge;
 
 use crate::{
     config,
     keymap::{self, Command},
+    qr, restore,
     settings::{Settings, abbreviate_home, config_dir, expand_home},
     text_field::{FieldEvent, TextField},
     theme::{Theme, ThemeName, hsla},
@@ -82,6 +84,14 @@ pub struct SettingsWindow {
     error: Option<SharedString>,
     /// Check Now is waiting on its update check.
     checking_update: bool,
+    /// The Agent on Edge bridge shown in the Remote section, when enabled.
+    remote: Option<Arc<Bridge>>,
+    remote_qr: Option<Arc<RenderImage>>,
+    remote_code: Option<String>,
+    remote_fingerprint: Option<String>,
+    remote_public: bool,
+    remote_paired: bool,
+    remote_error: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -123,6 +133,13 @@ impl SettingsWindow {
             recorder: None,
             error,
             checking_update: false,
+            remote: None,
+            remote_qr: None,
+            remote_code: None,
+            remote_fingerprint: None,
+            remote_public: false,
+            remote_paired: false,
+            remote_error: None,
             _subscriptions: subscriptions,
         };
         this.load_keys();
@@ -939,6 +956,219 @@ impl SettingsWindow {
             ),
         ]
     }
+
+    /// The "Agent on Edge remote" section: enable the bridge, choose public
+    /// mode, and once running show the QR, pairing code and connection state.
+    fn remote_rows(&self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let on = self.remote.is_some();
+        let mut rows = vec![
+            row(
+                "Agent on Edge remote",
+                Some(if on {
+                    "Scan the QR with the iPhone app"
+                } else {
+                    "Show a QR for Agent on Edge to scan"
+                }),
+                c,
+                None,
+                toggle("agent-on-edge-remote", on, c).on_click(cx.listener(
+                    |this, _: &ClickEvent, window, cx| {
+                        this.cancel_recording(cx);
+                        if this.remote.is_some() {
+                            this.remote_stop(cx);
+                            cx.notify();
+                        } else {
+                            this.remote_start(window, cx);
+                        }
+                    },
+                )),
+            ),
+            row(
+                "Public internet",
+                Some("Set up a UPnP port mapping so the QR works away from this network"),
+                c,
+                None,
+                toggle("remote-public", self.remote_public, c).on_click(cx.listener(
+                    |this, _: &ClickEvent, window, cx| {
+                        this.remote_public = !this.remote_public;
+                        if this.remote.is_some() {
+                            this.remote_stop(cx);
+                            this.remote_start(window, cx);
+                        } else {
+                            cx.notify();
+                        }
+                    },
+                )),
+            ),
+        ];
+
+        if on {
+            if let Some(image) = self.remote_qr.as_ref() {
+                rows.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .py_2()
+                        .child(
+                            img(ImageSource::Render(image.clone()))
+                                .w(px(220.))
+                                .h(px(220.)),
+                        )
+                        .child(div().text_size(px(11.)).text_color(c.muted).child(format!(
+                            "Pairing code: {}",
+                            self.remote_code.as_deref().unwrap_or("…")
+                        )))
+                        .child(div().text_size(px(11.)).text_color(c.muted).child(format!(
+                            "Fingerprint: sha256:{}",
+                            self.remote_fingerprint.as_deref().unwrap_or("…")
+                        )))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(if self.remote_paired {
+                                    c.accent
+                                } else {
+                                    c.muted
+                                })
+                                .child(if self.remote_paired {
+                                    "● Paired — iPhone connected"
+                                } else {
+                                    "○ Waiting for scan…"
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            } else if let Some(err) = self.remote_error.as_ref() {
+                rows.push(
+                    div()
+                        .py_1()
+                        .text_size(px(11.))
+                        .text_color(c.error)
+                        .child(err.clone())
+                        .into_any_element(),
+                );
+            } else {
+                rows.push(
+                    div()
+                        .py_1()
+                        .text_size(px(11.))
+                        .text_color(c.muted)
+                        .child("Starting…")
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
+    }
+
+    fn remote_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = restore::Store::standard().map(|store| store.dir().to_owned()) else {
+            self.remote_error = Some("No session server directory available.".into());
+            cx.notify();
+            return;
+        };
+        let config = kil_remote::Config {
+            dir,
+            port: 0,
+            host: None,
+            ttl: Duration::from_secs(300),
+            launcher: std::env::current_exe().ok(),
+            public: self.remote_public,
+        };
+        match Bridge::start(&config) {
+            Ok(bridge) => {
+                self.remote = Some(bridge);
+                self.remote_qr = None;
+                self.remote_code = None;
+                self.remote_fingerprint = None;
+                self.remote_error = None;
+                self.remote_paired = false;
+                cx.notify();
+
+                let weak = cx.entity().downgrade();
+                window
+                    .spawn(cx, async move |async_cx| {
+                        loop {
+                            let keep = async_cx
+                                .update(|_, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        if this.remote.is_none() {
+                                            return false;
+                                        }
+                                        this.remote_poll(cx);
+                                        true
+                                    })
+                                    .unwrap_or(false)
+                                })
+                                .unwrap_or(false);
+                            if !keep {
+                                break;
+                            }
+                            async_io::Timer::after(Duration::from_millis(500)).await;
+                        }
+                    })
+                    .detach();
+            }
+            Err(err) => {
+                self.remote_error = Some(format!("{err:#}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn remote_stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(bridge) = self.remote.take() {
+            bridge.stop();
+        }
+        self.remote_qr = None;
+        self.remote_code = None;
+        self.remote_fingerprint = None;
+        self.remote_error = None;
+        self.remote_paired = false;
+        cx.notify();
+    }
+
+    /// Called on a timer while the bridge runs: materialize the QR once it is
+    /// ready and refresh the paired indicator.
+    fn remote_poll(&mut self, cx: &mut Context<Self>) {
+        let Some(bridge) = self.remote.as_ref() else {
+            return;
+        };
+        if self.remote_qr.is_none()
+            && let Some(qr) = bridge.qr()
+        {
+            match qr::qr_render_image(&qr.url) {
+                Ok(image) => {
+                    self.remote_qr = Some(image);
+                    self.remote_code = Some(qr.code);
+                    self.remote_fingerprint = Some(qr.fingerprint);
+                }
+                Err(err) => self.remote_error = Some(err),
+            }
+            cx.notify();
+        }
+        if let Some(err) = bridge.error()
+            && self.remote_error.is_none()
+        {
+            self.remote_error = Some(err.into());
+            cx.notify();
+        }
+        let paired = bridge.paired();
+        if paired != self.remote_paired {
+            self.remote_paired = paired;
+            cx.notify();
+        }
+    }
+}
+
+impl Drop for SettingsWindow {
+    fn drop(&mut self) {
+        if let Some(bridge) = self.remote.take() {
+            bridge.stop();
+        }
+    }
 }
 
 impl Render for SettingsWindow {
@@ -949,6 +1179,7 @@ impl Render for SettingsWindow {
         let appearance = self.appearance_rows(c, cx);
         let keyboard = self.keyboard_rows(c, cx);
         let updates = self.update_rows(c, cx);
+        let remote = self.remote_rows(c, cx);
         let files = vec![row(
             "Config files",
             Some("config.toml, keymap.toml"),
@@ -1000,6 +1231,7 @@ impl Render for SettingsWindow {
                     .child(section("FONT", c, font))
                     .child(section("KEYBOARD", c, keyboard))
                     .child(section("TERMINAL", c, terminal))
+                    .child(section("AGENT ON EDGE", c, remote))
                     .child(section("UPDATES", c, updates))
                     .child(section("FILES", c, files)),
             )

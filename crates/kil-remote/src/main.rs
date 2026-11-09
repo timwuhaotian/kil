@@ -1,6 +1,6 @@
 //! The standalone bridge binary: `kil-remote [--dir <dir>] [--port <port>]
-//! [--host <ip>] [--launcher <exe>]`. Prefer `kil --remote`, which also knows
-//! how to start the session server.
+//! [--host <ip>] [--launcher <exe>] [--public]`. Prefer `kil --remote`, which
+//! also knows how to start the session server.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -20,6 +20,7 @@ fn main() -> Result<()> {
     let mut port = 0;
     let mut host = None;
     let mut launcher = None;
+    let mut public = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -31,9 +32,10 @@ fn main() -> Result<()> {
                     args.next().context("--launcher needs a value")?,
                 ));
             }
+            "--public" => public = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>]"
+                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>] [--public]"
                 );
                 return Ok(());
             }
@@ -47,6 +49,7 @@ fn main() -> Result<()> {
         host,
         ttl: Duration::from_secs(300),
         launcher,
+        public,
     })?;
     Ok(())
 }
