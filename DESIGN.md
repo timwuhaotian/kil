@@ -413,7 +413,7 @@ Always measure with `--release`. Release profile: `opt-level=3`, `lto="thin"`, `
 - `WindowBackgroundAppearance::Blurred` behind the sidebar. The terminal area stays opaque for readability and to avoid overdraw.
 
 **Sidebar** (220 px)
-- 44 px rows with a title (13 pt semibold) and the cwd (11 pt, middle-truncated).
+- 44 px rows with a title (13 pt semibold) and the cwd (11 pt, shortened from the front so the leaf folder stays).
 - A 10 px status slot before the title (A17): an accent **ring** while a pane runs a job, an accent **dot** for a job that ended out of view, and a red **!** for an exit banner. The marks differ in shape as well as color. They are static, because a spinner would redraw the window every frame for as long as a dev server runs. There is an `×` on hover.
 - A footer **New Tab** button, 36 px: a plus drawn from two bars in the status column (a font's `+` sits where the typeface puts it, not mid-line), the label in line with the titles above, and the keys bound to New Tab (`⌘T` by default, read from the live keymap) at the right on hover. Double-clicking empty sidebar space also opens a tab; double-clicking the strip above the rows zooms the window (A26).
 - Rows drag up and down to reorder the tabs (A25).
@@ -433,7 +433,9 @@ ratios it was saved with (A18).
 `retarget(to, now)` restarts from the *current* value, so pressing a key repeatedly never makes the
 UI jump. Animations are driven by `request_animation_frame()` only while a tween is active, so they
 cost nothing at rest. A global `Motion::scale` set to 0 turns animation off; that is the
-reduce-motion hook.
+reduce-motion hook. *As built:* the hook exists (`Motion::set_scale`, thread-local,
+default 1): it scales every `Tween` and renders one-shot `with_animation` sites at their
+end state when 0. Nothing sets it yet; reading the system setting stays a non-goal (§1).
 
 | Event | Property | Duration | Easing (GPUI) |
 |---|---|---|---|
@@ -445,9 +447,11 @@ reduce-motion hook.
 | Split | ratio 1.0→0.5 | 200 ms | `ease_out_quint` |
 | Panes changed | every other split's ratio →0.5 | 200 ms | `ease_out_quint` |
 | Pane closed | sibling ratio →1.0, then collapse node | 160 ms | `ease_in_out` |
-| Tab switch | content cross-fade plus 6 px slide | 140 ms | `ease_out_quint` |
+| Tab switch | content fade-in plus 6 px slide | 140 ms | `ease_out_quint` |
 | Focus change | inactive dim | 120 ms | linear |
 | Cursor blink | opacity | 100 ms fades, 530 ms period, paused while typing or when the window is inactive | `ease_in_out` |
+| Download bar | fill 0→1 between readings | 240 ms | `ease_out_quint` |
+| Unknown-size sweep | bar position, repeating | 1200 ms | linear |
 
 `PaneTree<T>` is a binary tree:
 ```rust
@@ -503,21 +507,21 @@ on. Clicking a shortcut puts that row in *Press keys…* and reads the next chor
 `keymap.toml` and applied at once, and the menus follow. **Reset** drops the user's entry so the
 default runs again. Two rules keep the file honest:
 
-- **Rebinding moves a command.** Every line naming that command goes, and its default is left in
+- **Rebinding moves a command.** Every line naming that command goes, and every default it had is left in
   the file as `"keys" = "unbind"`, so the old keys stop working instead of coming back.
 - **A key already taken is refused**, with a message naming the command that has it.
 
 Recording uses an `App::intercept_keystrokes` subscription, armed only while a row is listening.
 It runs before GPUI resolves any binding, so `cmd-w` is read as data instead of closing the
 Settings window, and it only swallows keys in that window, so typing in a terminal still works.
-Only single chords are recorded; multi-stroke keys stay a `keymap.toml` feature.
+Only single chords are recorded; multi-stroke keys stay a `keymap.toml` feature. Escape cancels the recording, a chord without a modifier (other than a function key) is refused, and tapping Fn alone is ignored.
 
 **Parsing**
 - Commands come from `enum Command` with serde `snake_case`, so an unknown name is a typed error.
 - Keys are checked with GPUI `Keystroke::parse`.
 - Errors are collected as `Vec<KeymapError { key, reason }>` and shown in a banner. Valid entries still apply.
 - The merged set is applied with `cx.clear_key_bindings()` and then `cx.bind_keys(defaults ⊕ user)`, in the `Workspace` key context. Bindings therefore win over terminal input, and unbound keys fall through.
-- Text field editing keys (`TextField` context: arrows, home/end, backspace, delete, `cmd-a`, `cmd-v`, enter, escape) and the Settings window's `cmd-w` are fixed. They are bound after the merged set and can't be changed in `keymap.toml`.
+- Text field editing keys (`TextField` context: arrows with shift-select, drag-select and double-click word select, home/end, backspace, delete, `cmd-a`, `cmd-c`, `cmd-x`, `cmd-v`, enter, escape) and the Settings window's `cmd-w` are fixed. They are bound after the merged set and can't be changed in `keymap.toml`.
 - **Menus follow the keymap.** GPUI writes a menu item's key equivalent only when the menus are set. `config::apply` therefore sets them again after every bind, or a rebound `split_right` would still show, and trigger, its old key.
 
 **Fallthrough to the PTY** (`keys.rs`, written from xterm ctlseqs):

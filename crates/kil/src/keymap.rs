@@ -96,14 +96,19 @@ const DEFAULTS: &[(&str, &str)] = &[
 ];
 
 impl Command {
-    /// Every command the Settings window lists, in menu order.
+    /// Every command the Settings window lists; the tab selectors sit after the tab cyclers.
     pub fn all() -> Vec<Self> {
-        NAMED
-            .iter()
-            .map(|(_, command)| *command)
-            .filter(|command| *command != Self::Unbind)
-            .chain((1..=9).map(Self::SelectTab))
-            .collect()
+        let mut all = Vec::new();
+        for (_, command) in NAMED {
+            if *command == Self::Unbind {
+                continue;
+            }
+            all.push(*command);
+            if *command == Self::PrevTab {
+                all.extend((1..=9).map(Self::SelectTab));
+            }
+        }
+        all
     }
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -143,7 +148,10 @@ impl Command {
             Self::SelectTab(6) => KeyBinding::new(keys, w::SelectTab6, cx),
             Self::SelectTab(7) => KeyBinding::new(keys, w::SelectTab7, cx),
             Self::SelectTab(8) => KeyBinding::new(keys, w::SelectTab8, cx),
-            Self::SelectTab(_) => KeyBinding::new(keys, w::SelectTab9, cx),
+            Self::SelectTab(n) => {
+                debug_assert!((1..=9).contains(&n), "SelectTab({n}) has no binding");
+                KeyBinding::new(keys, w::SelectTab9, cx)
+            }
             Self::Copy => KeyBinding::new(keys, terminal_pane::Copy, cx),
             Self::Paste => KeyBinding::new(keys, terminal_pane::Paste, cx),
             Self::ClearScrollback => KeyBinding::new(keys, terminal_pane::ClearScrollback, cx),
@@ -175,19 +183,19 @@ impl Command {
             Self::ClosePane => "Close pane".into(),
             Self::SplitRight => "Split right".into(),
             Self::SplitDown => "Split down".into(),
-            Self::FocusLeft => "Focus left".into(),
-            Self::FocusRight => "Focus right".into(),
-            Self::FocusUp => "Focus up".into(),
-            Self::FocusDown => "Focus down".into(),
+            Self::FocusLeft => "Focus Left Pane".into(),
+            Self::FocusRight => "Focus Right Pane".into(),
+            Self::FocusUp => "Focus Upper Pane".into(),
+            Self::FocusDown => "Focus Lower Pane".into(),
             Self::NextTab => "Next tab".into(),
             Self::PrevTab => "Previous tab".into(),
             Self::SelectTab(n) => format!("Select tab {n}"),
             Self::Copy => "Copy".into(),
             Self::Paste => "Paste".into(),
             Self::ClearScrollback => "Clear scrollback".into(),
-            Self::FontBigger => "Bigger text".into(),
-            Self::FontSmaller => "Smaller text".into(),
-            Self::FontReset => "Reset text size".into(),
+            Self::FontBigger => "Bigger Text".into(),
+            Self::FontSmaller => "Smaller Text".into(),
+            Self::FontReset => "Actual Size".into(),
             Self::OpenSettings => "Settings…".into(),
             Self::Hide => "Hide Kil".into(),
             Self::HideOthers => "Hide Others".into(),
@@ -207,12 +215,13 @@ impl Command {
         }
     }
 
-    /// The keys it runs on by default, as written in `keymap.toml`.
-    pub fn default_keys(self) -> Option<&'static str> {
+    /// Every default it runs on; some commands have two (`next_tab`, `prev_tab`).
+    pub fn all_default_keys(self) -> Vec<&'static str> {
         DEFAULTS
             .iter()
-            .find(|(_, name)| Command::parse(name) == Some(self))
+            .filter(|(_, name)| Command::parse(name) == Some(self))
             .map(|(keys, _)| *keys)
+            .collect()
     }
 }
 
@@ -322,44 +331,78 @@ pub fn keystroke_of(event: &Keystroke) -> Option<String> {
     // Releasing a lone modifier arrives as a keystroke named after it; that is not a shortcut.
     let alone = matches!(
         keys.as_str(),
-        "shift" | "control" | "alt" | "platform" | "fn"
+        "shift" | "control" | "alt" | "platform" | "fn" | "function"
     );
     (!alone).then_some(keys)
 }
 
-/// The same keys as macOS writes them in a menu: `cmd-shift-d` → `⌘⇧D`.
+/// The same keys as macOS writes them in a menu: `cmd-shift-d` → `⇧⌘D`.
 pub fn display(keys: &str) -> String {
     keys.split(' ')
         .map(|stroke| {
-            let (modifiers, key) = stroke.rsplit_once('-').unwrap_or(("", stroke));
-            let symbols: String = modifiers
+            // A trailing `-` is the key itself (`cmd--`), not a separator.
+            let (modifiers, key) = if stroke.ends_with('-') && stroke.len() > 1 {
+                (
+                    stroke[..stroke.len() - 1].strip_suffix('-').unwrap_or(""),
+                    "-",
+                )
+            } else {
+                stroke.rsplit_once('-').unwrap_or(("", stroke))
+            };
+            let written: Vec<&str> = modifiers
                 .split('-')
                 .filter(|modifier| !modifier.is_empty())
-                .map(|modifier| match modifier {
-                    "cmd" => "⌘",
-                    "shift" => "⇧",
-                    "ctrl" => "⌃",
-                    "alt" => "⌥",
-                    "fn" => "fn",
-                    _ => "",
-                })
                 .collect();
+            let has = |name: &str| written.contains(&name);
+            let mut symbols = String::new();
+            if has("fn") {
+                symbols.push_str("fn");
+            }
+            if has("ctrl") {
+                symbols.push('^');
+            }
+            if has("alt") {
+                symbols.push('⌥');
+            }
+            if has("shift") {
+                symbols.push('⇧');
+            }
+            if has("cmd") {
+                symbols.push('⌘');
+            }
             let key = match key {
                 "left" => "←",
                 "right" => "→",
                 "up" => "↑",
                 "down" => "↓",
-                "enter" => "↩",
-                "space" => "␣",
+                "enter" | "return" => "↩",
+                "space" => "Space",
                 "tab" => "⇥",
-                "escape" => "esc",
+                "escape" => "⎋",
+                "backspace" => "⌫",
+                "delete" => "⌦",
+                "home" => "↖",
+                "end" => "↘",
+                "pageup" | "page_up" => "⇞",
+                "pagedown" | "page_down" => "⇟",
+                "insert" => "Insert",
+                "shift" => "⇧",
+                "control" | "ctrl" => "^",
+                "alt" => "⌥",
+                "platform" => "⌘",
                 _ if key.chars().count() == 1 => return format!("{symbols}{}", key.to_uppercase()),
+                _ if key.strip_prefix('f').is_some_and(|rest| {
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                }) =>
+                {
+                    return format!("{symbols}{}", key.to_uppercase());
+                }
                 _ => key,
             };
             format!("{symbols}{key}")
         })
         .collect::<Vec<_>>()
-        .join(" then ")
+        .join(", ")
 }
 
 /// Drops every line in `[bindings]` that gives `command` its keys, so it runs on its default
@@ -370,10 +413,11 @@ pub fn clear_command(text: &str, command: Command) -> String {
     for line in text.lines() {
         let header = line.trim();
         if header.starts_with('[') {
-            in_bindings = header == "[bindings]";
+            in_bindings = is_bindings_header(line);
         }
         let mine = parses(line).is_some_and(|(keys, name)| {
-            name == command.key() || (name == "unbind" && Some(keys) == command.default_keys())
+            name == command.key()
+                || (name == "unbind" && command.all_default_keys().contains(&keys))
         });
         if !(in_bindings && mine) {
             out.push_str(line);
@@ -387,11 +431,15 @@ pub fn clear_command(text: &str, command: Command) -> String {
 /// goes, and its default is unbound unless it is the key pressed.
 pub fn rebind(text: &str, command: Command, keys: &str) -> String {
     let text = clear_command(text, command);
-    match command.default_keys() {
-        Some(default) if default == keys => text,
-        Some(default) => set_binding(&set_binding(&text, default, "unbind"), keys, &command.key()),
-        None => set_binding(&text, keys, &command.key()),
+    let defaults = command.all_default_keys();
+    if defaults.contains(&keys) {
+        return text;
     }
+    let mut text = text;
+    for default in &defaults {
+        text = set_binding(&text, default, "unbind");
+    }
+    set_binding(&text, keys, &command.key())
 }
 
 /// Binds `keys` to `name` in `[bindings]`: an existing line for those keys is replaced, else
@@ -403,10 +451,13 @@ pub fn set_binding(text: &str, keys: &str, name: &str) -> String {
     for line in text.lines() {
         let header = line.trim();
         if header.starts_with('[') {
-            in_bindings = header == "[bindings]";
+            in_bindings = is_bindings_header(line);
         }
         if in_bindings && !found && parses(line).is_some_and(|(written, _)| written == keys) {
             out.push_str(&assignment(keys, name));
+            if let Some(comment) = trailing_comment(line) {
+                out.push_str(comment);
+            }
             found = true;
         } else {
             out.push_str(line);
@@ -431,16 +482,39 @@ fn assignment(keys: &str, name: &str) -> String {
     format!("\"{keys}\" = \"{name}\"")
 }
 
+/// Whether `line` opens the `[bindings]` table; a trailing comment is ignored.
+fn is_bindings_header(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix('[') else {
+        return false;
+    };
+    rest.split_once(']')
+        .is_some_and(|(name, _)| name.trim() == "bindings")
+}
+
 /// A `[bindings]` line as its keys and command name, when it is one. A trailing comment
 /// after the value is ignored.
 fn parses(line: &str) -> Option<(&str, &str)> {
-    let (keys, rest) = line.trim_start().strip_prefix('"')?.split_once('"')?;
-    let name = rest
-        .trim_start()
-        .strip_prefix('=')?
-        .trim_start()
-        .strip_prefix('"')?;
-    Some((keys, name.split_once('"')?.0))
+    let (keys, rest) = quoted(line.trim_start())?;
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let (name, _) = quoted(rest)?;
+    Some((keys, name))
+}
+
+/// A quoted TOML string as its contents and the rest after its closing quote.
+fn quoted(quoted: &str) -> Option<(&str, &str)> {
+    let quote = quoted.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    quoted[quote.len_utf8()..].split_once(quote)
+}
+
+/// The `# …` tail after a `[bindings]` entry's value, or empty when it has none.
+fn trailing_comment(line: &str) -> Option<&str> {
+    let (_, rest) = quoted(line.trim_start())?;
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let (_, rest) = quoted(rest)?;
+    Some(rest.trim_end())
 }
 
 #[cfg(test)]
@@ -547,7 +621,7 @@ mod tests {
             ["cmd-d", "cmd-shift-]", "ctrl-tab", "cmd-alt-left"]
                 .map(display)
                 .join(" "),
-            "⌘D ⌘⇧] ⌃⇥ ⌘⌥←"
+            "⌘D ⇧⌘] ^⇥ ⌥⌘←"
         );
     }
 
@@ -556,7 +630,7 @@ mod tests {
         let text = "# mine\n[bindings]\n\"cmd-x\" = \"new_tab\" # note\nfont_size = 1\n";
         assert_eq!(
             set_binding(text, "cmd-x", "split_right"),
-            "# mine\n[bindings]\n\"cmd-x\" = \"split_right\"\nfont_size = 1\n"
+            "# mine\n[bindings]\n\"cmd-x\" = \"split_right\" # note\nfont_size = 1\n"
         );
     }
 
@@ -639,5 +713,47 @@ mod tests {
             ),
             (Some(Command::SplitRight), None)
         );
+    }
+
+    #[test]
+    fn all_default_keys_should_have_two_entries_when_next_tab() {
+        assert_eq!(
+            Command::NextTab.all_default_keys(),
+            vec!["cmd-shift-]", "ctrl-tab"]
+        );
+    }
+
+    #[test]
+    fn rebind_should_unbind_both_defaults_when_command_has_two() {
+        let rebound = rebind(TEMPLATE, Command::NextTab, "cmd-y");
+        let (table, errors) = resolve(Some(&rebound));
+        assert_eq!(
+            (
+                errors,
+                command_for(&table, "cmd-shift-]"),
+                command_for(&table, "ctrl-tab"),
+                command_for(&table, "cmd-y")
+            ),
+            (vec![], None, None, Some(Command::NextTab))
+        );
+    }
+
+    #[test]
+    fn display_should_show_the_dash_when_key_is_dash() {
+        assert_eq!(display("cmd--"), "⌘-");
+    }
+
+    #[test]
+    fn set_binding_should_replace_single_quotes_when_header_has_comment() {
+        let text = "[bindings] # comment\n'cmd-x' = 'new_tab'\n";
+        assert_eq!(
+            set_binding(text, "cmd-x", "split_right"),
+            "[bindings] # comment\n\"cmd-x\" = \"split_right\"\n"
+        );
+    }
+
+    #[test]
+    fn display_should_join_with_comma_when_multi_stroke() {
+        assert_eq!(display("ctrl-a |"), "^A, |");
     }
 }

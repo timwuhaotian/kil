@@ -2,15 +2,17 @@
 //! view of its own, the pane's cursor (DESIGN.md §6.2).
 
 use gpui::{
-    App, BorderStyle, Bounds, Context, DispatchPhase, Element, ElementId, Entity, Focusable, Font,
-    FontStyle, FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
-    ShapedLine, SharedString, StrikethroughStyle, Style, Subscription, TextRun, UnderlineStyle,
-    WeakEntity, Window, fill, outline, point, px, relative, size,
+    Animation, AnimationExt, App, BorderStyle, Bounds, Context, DispatchPhase, Element, ElementId,
+    Entity, Focusable, Font, FontStyle, FontWeight, Global, GlobalElementId, Hsla,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, StrikethroughStyle, Style,
+    Subscription, TextRun, UnderlineStyle, WeakEntity, Window, fill, outline, point, px, relative,
+    size,
 };
 use kil_term::{CellFlags, CursorShape, Frame, GridSize, RenderCell, Rgba};
 
 use crate::{
+    motion::{self, Ease, Motion},
     settings::Settings,
     terminal_pane::{Geometry, TerminalInput, TerminalPane},
     theme::{Theme, hsla},
@@ -40,6 +42,7 @@ pub struct Layout {
 /// Colors the element needs, copied out of the theme so `cx` is free for the pane update.
 struct Colors {
     default_bg: Rgba,
+    foreground: Rgba,
     selection: Hsla,
 }
 
@@ -73,7 +76,7 @@ impl RunStyle {
             .any(|flag| self.flags.contains(*flag))
     }
 
-    fn run(self, len: usize, base: &Font) -> TextRun {
+    fn run(self, len: usize, base: &Font, font_size: Pixels) -> TextRun {
         let color = hsla(self.fg);
         let mut font = base.clone();
         if self.flags.contains(CellFlags::BOLD) {
@@ -92,7 +95,7 @@ impl RunStyle {
                 .contains(CellFlags::UNDERLINE)
                 .then(|| UnderlineStyle {
                     color: Some(color),
-                    thickness: px(1.),
+                    thickness: hairline(font_size),
                     wavy: false,
                 }),
             strikethrough: self
@@ -100,7 +103,7 @@ impl RunStyle {
                 .contains(CellFlags::STRIKEOUT)
                 .then(|| StrikethroughStyle {
                     color: Some(color),
-                    thickness: px(1.),
+                    thickness: hairline(font_size),
                 }),
         }
     }
@@ -155,6 +158,7 @@ impl Element for TerminalElement {
         let palette = theme.terminal.clone();
         let colors = Colors {
             default_bg: palette.background,
+            foreground: palette.foreground,
             selection: theme.selection_bg,
         };
 
@@ -180,6 +184,7 @@ impl Element for TerminalElement {
                     text,
                     &font,
                     font_size,
+                    &colors,
                     window,
                 ));
             }
@@ -208,6 +213,15 @@ impl Element for TerminalElement {
         for (origin, line) in &layout.overlays {
             let _ = line.paint(*origin, layout.line_height, window, cx);
         }
+        // A lost release (dragged out of the window, the window blurred) leaves forwarding
+        // stuck: clear it when the window or the pane lost focus, sending the release the
+        // program still waits for.
+        let forwarding = self.pane.read(cx).forwarding;
+        let guarded = self.pane.read(cx).forwarding_guarded;
+        let focused = self.pane.read(cx).focus_handle(cx).is_focused(window);
+        if forwarding && guarded && (!window.is_window_active() || !focused) {
+            self.pane.update(cx, |pane, _| pane.cancel_forwarding());
+        }
         // While a drag belongs to the program, the pointer may leave the pane, where the pane's
         // own handlers stop firing: moves and the release are caught at window level instead
         // (capture phase, once per event), so the program's edge autoscroll doesn't stall and
@@ -228,6 +242,25 @@ impl Element for TerminalElement {
                     pane.update(cx, |pane, _| {
                         pane.forward_up(event.position, event.modifiers);
                     });
+                }
+            });
+        }
+        // A selection drag stalls past the pane's edge for the same reason: moves (which
+        // scroll while held outside) and the release are caught at window level too.
+        if self.pane.read(cx).selecting {
+            let pane = self.pane.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture && event.dragging() {
+                    pane.update(cx, |pane, cx| {
+                        pane.select_drag(event.position);
+                        cx.notify();
+                    });
+                }
+            });
+            let pane = self.pane.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                    pane.update(cx, |pane, _| pane.select_up());
                 }
             });
         }
@@ -339,7 +372,7 @@ fn build(
                 continue;
             }
             let advance = if wide { cell.width * 2. } else { cell.width };
-            let run = style.run(text.len(), font);
+            let run = style.run(text.len(), font, font_size);
             let line = window.text_system().shape_line(
                 SharedString::from(text.clone()),
                 font_size,
@@ -389,16 +422,37 @@ impl TerminalCursor {
 
 impl Render for TerminalCursor {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // DESIGN.md §7: a blink fades the cursor over 100ms, ease-in-out. One id per phase
+        // restarts the animation on every toggle, as the focus dim does.
+        let visible = self.visible;
+        if !Motion::enabled() {
+            return CursorElement {
+                pane: self.pane.clone(),
+                opacity: if visible { 1. } else { 0. },
+            }
+            .into_any_element();
+        }
+        let id = if visible { "cursor-in" } else { "cursor-out" };
         CursorElement {
             pane: self.pane.clone(),
-            visible: self.visible,
+            opacity: 1.,
         }
+        .with_animation(
+            ElementId::Name(id.into()),
+            Animation::new(motion::BLINK_FADE).with_easing(|t| Ease::InOut.apply(t)),
+            move |mut cursor, delta| {
+                cursor.opacity = if visible { delta } else { 1. - delta };
+                cursor
+            },
+        )
+        .into_any_element()
     }
 }
 
 struct CursorElement {
     pane: WeakEntity<TerminalPane>,
-    visible: bool,
+    /// The blink's fade phase: 1 draws the cursor, 0 draws nothing.
+    opacity: f32,
 }
 
 impl IntoElement for CursorElement {
@@ -444,12 +498,25 @@ impl Element for CursorElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let color = hsla(cx.global::<Theme>().terminal.cursor);
+        let font_size = cx.global::<Settings>().font_size;
         let pane = self.pane.upgrade()?;
         let focused = pane.focus_handle(cx).is_focused(window);
         // The pane's own prepaint, earlier in this frame, laid out the grid and took the
         // frame this reads.
         let pane = pane.read(cx);
-        cursor(&pane.frame, pane.geometry?, color, focused, self.visible)
+        // A dead pane keeps its last screen, not its cursor.
+        if pane.ended_badly() {
+            return None;
+        }
+        cursor(
+            &pane.frame,
+            pane.geometry?,
+            color,
+            focused,
+            pane.marked_text.is_some(),
+            hairline(font_size),
+            self.opacity,
+        )
     }
 
     fn paint(
@@ -473,11 +540,18 @@ fn cursor(
     geometry: Geometry,
     color: Hsla,
     focused: bool,
-    visible: bool,
+    composing: bool,
+    bar: Pixels,
+    opacity: f32,
 ) -> Option<PaintQuad> {
     let cursor = frame
         .cursor
         .filter(|cursor| cursor.shape != CursorShape::Hidden)?;
+    // A steady cursor ignores the blink phase: always drawn.
+    let opacity = if frame.cursor_blinking { opacity } else { 1. };
+    if opacity <= 0. {
+        return None;
+    }
     let Geometry { origin, cell } = geometry;
     let wide = frame
         .row(cursor.row)
@@ -489,45 +563,56 @@ fn cursor(
         origin.y + cell.height * cells(cursor.row),
     );
     let block = Bounds::new(at, size(width, cell.height));
-    if !focused || cursor.shape == CursorShape::HollowBlock {
-        return Some(outline(block, color, BorderStyle::Solid));
+    // Unfocused cursors are hollow; so is a block under composition text, which would
+    // otherwise paint over the first character being composed.
+    if !focused
+        || cursor.shape == CursorShape::HollowBlock
+        || (composing && cursor.shape == CursorShape::Block)
+    {
+        return Some(outline(block, color.opacity(opacity), BorderStyle::Solid));
     }
-    if !visible {
-        return None;
-    }
-    let bar = px(2.);
     Some(match cursor.shape {
-        CursorShape::Beam => fill(Bounds::new(at, size(bar, cell.height)), color),
+        CursorShape::Beam => fill(
+            Bounds::new(at, size(bar, cell.height)),
+            color.opacity(opacity),
+        ),
         CursorShape::Underline => fill(
             Bounds::new(point(at.x, at.y + cell.height - bar), size(width, bar)),
-            color,
+            color.opacity(opacity),
         ),
         // Translucent so the glyph underneath stays readable without a second text pass.
-        CursorShape::Block | CursorShape::HollowBlock => fill(block, color.opacity(0.7)),
+        CursorShape::Block | CursorShape::HollowBlock => fill(block, color.opacity(0.7 * opacity)),
         CursorShape::Hidden => return None,
     })
 }
 
-/// IME composition text drawn over the cursor cell, underlined.
+/// A hairline scaled from the font size: 1px at 13pt and up from there.
+fn hairline(font_size: Pixels) -> Pixels {
+    px((f32::from(font_size) / 13.).round().max(1.))
+}
+
+/// IME composition text drawn over the cursor cell, underlined. A long composition shifts
+/// left so it stays inside the grid instead of overflowing the pane's right edge.
 fn marked(
     frame: &Frame,
     geometry: Geometry,
     text: &str,
     font: &Font,
     font_size: Pixels,
+    colors: &Colors,
     window: &Window,
 ) -> Option<(Point<Pixels>, ShapedLine)> {
     let cursor = frame.cursor?;
     let Geometry { origin, cell } = geometry;
-    let color = hsla(Rgba::hex(0xf2_f3_f5));
+    let color = hsla(colors.foreground);
     let run = TextRun {
         len: text.len(),
         font: font.clone(),
         color,
-        background_color: Some(hsla(Rgba::hex(0x2a_2e_36))),
+        background_color: Some(colors.selection),
         underline: Some(UnderlineStyle {
             color: Some(color),
-            thickness: px(1.),
+            thickness: hairline(font_size),
             wavy: false,
         }),
         strikethrough: None,
@@ -538,10 +623,20 @@ fn marked(
         &[run],
         None,
     );
-    let at = point(
+    let right = origin.x + cell.width * cells(frame.cols);
+    let mut at = point(
         origin.x + cell.width * cells(cursor.col),
         origin.y + cell.height * cells(cursor.row),
     );
+    let over = at.x + line.width - right;
+    if over > px(0.) {
+        let shifted = at.x - over;
+        at.x = if shifted > origin.x {
+            shifted
+        } else {
+            origin.x
+        };
+    }
     Some((at, line))
 }
 
@@ -570,4 +665,60 @@ fn count(available: Pixels, cell: Pixels) -> u16 {
 )]
 fn pixels_u16(pixels: Pixels) -> u16 {
     f32::from(pixels).round().clamp(0., f32::from(u16::MAX)) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use kil_term::CursorSnapshot;
+
+    use super::*;
+
+    fn frame(blinking: bool) -> Frame {
+        Frame {
+            cursor: Some(CursorSnapshot {
+                row: 0,
+                col: 0,
+                shape: CursorShape::Block,
+            }),
+            cursor_blinking: blinking,
+            ..Frame::default()
+        }
+    }
+
+    fn geometry() -> Geometry {
+        Geometry {
+            origin: point(px(0.), px(0.)),
+            cell: size(px(8.), px(16.)),
+        }
+    }
+
+    #[test]
+    fn cursor_should_stay_visible_when_steady_during_blink_off_phase() {
+        let frame = frame(false);
+        let quad = cursor(
+            &frame,
+            geometry(),
+            hsla(Rgba::hex(0xff_ff_ff)),
+            true,
+            false,
+            px(1.),
+            0.,
+        );
+        assert!(quad.is_some());
+    }
+
+    #[test]
+    fn cursor_should_hide_when_blinking_during_blink_off_phase() {
+        let frame = frame(true);
+        let quad = cursor(
+            &frame,
+            geometry(),
+            hsla(Rgba::hex(0xff_ff_ff)),
+            true,
+            false,
+            px(1.),
+            0.,
+        );
+        assert!(quad.is_none());
+    }
 }

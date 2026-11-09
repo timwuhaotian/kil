@@ -26,14 +26,27 @@ use std::{
 };
 
 use gpui::{
-    App, Application, Bounds, Menu, MenuItem, SharedString, SystemMenuType, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point, prelude::*, px, size,
+    App, Application, Bounds, KeyBinding, Menu, MenuItem, SharedString, SystemMenuType,
+    TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point,
+    prelude::*, px, size,
 };
 use kil_term::Client;
 
 use crate::workspace::Workspace;
 
-actions!(kil, [OpenSettings, OpenKeymap, Hide, HideOthers, ShowAll]);
+actions!(
+    kil,
+    [
+        OpenSettings,
+        OpenKeymap,
+        Hide,
+        HideOthers,
+        ShowAll,
+        About,
+        Minimize,
+        Zoom
+    ]
+);
 
 /// An unbundled binary started from another terminal inherits that app's
 /// `__CFBundleIdentifier`, and `AppKit` then names and badges kil as that app (e.g. "Otty").
@@ -58,6 +71,8 @@ fn menus(cx: &App) -> Vec<Menu> {
         Menu {
             name: "Kil".into(),
             items: vec![
+                MenuItem::action("About Kil", About),
+                MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::action("Keyboard Shortcuts…", OpenKeymap),
                 update::menu_item(cx),
@@ -69,8 +84,8 @@ fn menus(cx: &App) -> Vec<Menu> {
                 MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
                 MenuItem::action("Restart", w::Restart),
-                MenuItem::action("Quit Kil", w::Quit),
                 MenuItem::action("Quit and Stop All Jobs", w::QuitAndStopJobs),
+                MenuItem::action("Quit Kil", w::Quit),
             ],
         },
         Menu {
@@ -96,8 +111,8 @@ fn menus(cx: &App) -> Vec<Menu> {
         Menu {
             name: "View".into(),
             items: vec![
-                MenuItem::action("Bigger", w::FontBigger),
-                MenuItem::action("Smaller", w::FontSmaller),
+                MenuItem::action("Bigger Text", w::FontBigger),
+                MenuItem::action("Smaller Text", w::FontSmaller),
                 MenuItem::action("Actual Size", w::FontReset),
             ],
         },
@@ -107,13 +122,23 @@ fn menus(cx: &App) -> Vec<Menu> {
                 MenuItem::action("Next Tab", w::NextTab),
                 MenuItem::action("Previous Tab", w::PrevTab),
                 MenuItem::separator(),
+                MenuItem::action("Minimize", Minimize),
+                MenuItem::action("Zoom", Zoom),
+                MenuItem::separator(),
                 MenuItem::action("Focus Left Pane", w::FocusLeft),
                 MenuItem::action("Focus Right Pane", w::FocusRight),
-                MenuItem::action("Focus Pane Above", w::FocusUp),
-                MenuItem::action("Focus Pane Below", w::FocusDown),
+                MenuItem::action("Focus Upper Pane", w::FocusUp),
+                MenuItem::action("Focus Lower Pane", w::FocusDown),
             ],
         },
     ]
+}
+
+/// Fixed window bindings, bound after the merged keymap set (see `config::apply`):
+/// they survive every keymap reload, as the `TextField` and Settings bindings do.
+#[must_use]
+pub fn bindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new("cmd-m", Minimize, None)]
 }
 
 /// Fallbacks for actions no focused element handled, e.g. from the Settings window.
@@ -130,6 +155,41 @@ fn register_app_actions(cx: &mut App) {
     cx.on_action(|_: &workspace::Quit, cx| workspace::quit_app(cx));
     cx.on_action(|_: &workspace::QuitAndStopJobs, cx| workspace::quit_and_stop_app(cx));
     cx.on_action(|_: &workspace::Restart, cx| workspace::restart_app(cx));
+    cx.on_action(|_: &About, _| show_about_panel());
+    cx.on_action(|_: &Minimize, cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.minimize_window());
+        }
+    });
+    cx.on_action(|_: &Zoom, cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.zoom_window());
+        }
+    });
+    // config::apply already chained the fixed bindings; binding them again is harmless,
+    // and a menu shows the keys bound when it was set, so the menus are set again here.
+    cx.bind_keys(bindings());
+    cx.set_menus(menus(cx));
+}
+
+/// The standard About panel: version and copyright from the bundle, no window of our own.
+#[expect(
+    unsafe_code,
+    reason = "one standardAboutPanel call; no owned objects cross it"
+)]
+fn show_about_panel() {
+    use objc2::runtime::{AnyClass, AnyObject};
+    let Some(class) = AnyClass::get(c"NSApplication") else {
+        return;
+    };
+    // SAFETY: `sharedApplication` answers an object, and `orderFrontStandardAboutPanel:`
+    // takes any sender; both are main-thread AppKit both here and in GPUI's platform code.
+    unsafe {
+        let app: *mut AnyObject = objc2::msg_send![class, sharedApplication];
+        if !app.is_null() {
+            let _: () = objc2::msg_send![app, orderFrontStandardAboutPanel: app];
+        }
+    }
 }
 
 fn is_bundle(path: &Path) -> bool {
@@ -361,5 +421,30 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, MenuItem::Action { name, .. } if name == "Restart"))
         );
+    }
+
+    #[gpui::test]
+    fn minimize_should_stay_bound_when_keymap_reloads(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            register_app_actions(cx);
+            let _ = config::apply(cx);
+            let keymap = cx.key_bindings();
+            let bound: Vec<String> = keymap
+                .borrow()
+                .bindings_for_action(&Minimize)
+                .map(|binding| {
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(gpui::KeybindingKeystroke::unparse)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            assert!(
+                bound.iter().any(|keys| keys == "cmd-m"),
+                "cmd-m for Minimize after reload: {bound:?}"
+            );
+        });
     }
 }

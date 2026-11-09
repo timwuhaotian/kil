@@ -244,6 +244,22 @@ mod tests {
     }
 
     #[test]
+    fn render_should_keep_steady_cursor_when_program_set_steady() {
+        let mut original = term_with(b"\x1b[2 q");
+        let copy = copy_of(&mut original);
+        assert!(!original.cursor_style().blinking);
+        assert_eq!(copy.cursor_style(), original.cursor_style());
+    }
+
+    #[test]
+    fn render_should_keep_blinking_cursor_when_program_set_blinking() {
+        let mut original = term_with(b"\x1b[1 q");
+        let copy = copy_of(&mut original);
+        assert!(original.cursor_style().blinking);
+        assert_eq!(copy.cursor_style(), original.cursor_style());
+    }
+
+    #[test]
     fn render_should_keep_redefined_colors() {
         let mut original = term_with(b"\x1b]4;1;rgb:12/34/56\x07");
         let copy = copy_of(&mut original);

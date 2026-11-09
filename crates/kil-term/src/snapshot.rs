@@ -71,6 +71,8 @@ impl CellFlags {
     pub const WIDE_SPACER: Self = Self(1 << 5);
     /// Inside the selection.
     pub const SELECTED: Self = Self(1 << 6);
+    /// The row wraps into the next (`WRAPLINE` on its last cell).
+    pub const WRAPPED: Self = Self(1 << 7);
 
     /// Whether every bit of `other` is set.
     #[must_use]
@@ -228,6 +230,10 @@ pub struct Frame {
     pub cells: Vec<RenderCell>,
     /// Cursor, if in the viewport; also when hidden ([`CursorShape::Hidden`]).
     pub cursor: Option<CursorSnapshot>,
+    /// The program wants a blinking cursor (DECSCUSR odd, `?12h`): false after an even
+    /// DECSCUSR (steady, e.g. vim), when the cursor stays drawn. False until the first
+    /// snapshot; set even while the cursor is out of the viewport.
+    pub cursor_blinking: bool,
     /// Lines scrolled back from the bottom.
     pub display_offset: usize,
     /// Lines of scrollback available.
@@ -269,6 +275,7 @@ impl Frame {
         self.cols = cols;
         self.display_offset = content.display_offset;
         self.history = term.history_size();
+        self.cursor_blinking = term.cursor_style().blinking;
 
         let offset = i32::try_from(content.display_offset).unwrap_or(i32::MAX);
         // Resolved once per frame, so each cell's colors are one index instead of an
@@ -289,6 +296,7 @@ impl Frame {
                 CellFlags::WIDE_SPACER,
                 cell.flags.contains(Flags::WIDE_CHAR_SPACER),
             );
+            flags.set(CellFlags::WRAPPED, cell.flags.contains(Flags::WRAPLINE));
             let selected = content
                 .selection
                 .is_some_and(|range| range.contains(indexed.point));
@@ -354,7 +362,43 @@ impl ColorTable {
 #[cfg(test)]
 #[expect(clippy::unreadable_literal, reason = "hex colors read as #RRGGBB")]
 mod tests {
+    use alacritty_terminal::{event::VoidListener, term::Term};
+
     use super::*;
+    use crate::{
+        session::{GridSize, term_config},
+        transcript::replay,
+    };
+
+    const SIZE: GridSize = GridSize {
+        rows: 4,
+        cols: 12,
+        cell_width: 8,
+        cell_height: 16,
+    };
+
+    fn blinked_after(bytes: &[u8]) -> bool {
+        let mut term = Term::new(term_config(100), &SIZE, VoidListener);
+        replay(&mut term, bytes);
+        let mut frame = Frame::default();
+        frame.fill(&term, &Palette::default());
+        frame.cursor_blinking
+    }
+
+    #[test]
+    fn fill_should_default_to_blinking_when_cursor_never_set() {
+        assert!(blinked_after(b""));
+    }
+
+    #[test]
+    fn fill_should_carry_steady_when_decscusr_requests_steady() {
+        assert!(!blinked_after(b"\x1b[2 q"));
+    }
+
+    #[test]
+    fn fill_should_carry_blinking_when_decscusr_requests_blinking() {
+        assert!(blinked_after(b"\x1b[2 q\x1b[1 q"));
+    }
 
     #[test]
     fn indexed_should_map_cube_corner_to_white() {

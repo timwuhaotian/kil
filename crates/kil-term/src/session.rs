@@ -11,6 +11,7 @@ use alacritty_terminal::{
     selection::{Selection, SelectionType},
     sync::FairMutex,
     term::{Config as TermConfig, Osc52, Term, TermMode, cell::Cell},
+    vte::ansi::CursorStyle,
 };
 
 use crate::{
@@ -249,6 +250,12 @@ pub(crate) fn term_config(scrollback_lines: usize) -> TermConfig {
         scrolling_history: scrollback_lines,
         osc52: Osc52::OnlyCopy,
         kitty_keyboard: false,
+        // Kil blinks by default; the cursor_blink setting gates the timer, and programs
+        // override per cursor via DECSCUSR.
+        default_cursor_style: CursorStyle {
+            blinking: true,
+            ..CursorStyle::default()
+        },
         ..TermConfig::default()
     }
 }

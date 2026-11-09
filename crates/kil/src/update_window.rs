@@ -6,16 +6,17 @@ use std::{sync::Arc, time::Instant};
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context,
-    Div, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, SharedString, Stateful, Task,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, point, prelude::*, px,
-    relative, size,
+    Div, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, Pixels, Point, SharedString,
+    Stateful, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, point,
+    prelude::*, px, relative, size,
 };
 
 use crate::{
-    motion::{self, Ease, Tween},
+    motion::{self, Ease, Motion, Tween},
     settings_window::{Colors, button},
     theme::Theme,
     update::{self, Progress, Step},
+    workspace::Workspace,
 };
 
 actions!(update_window, [Dismiss, Confirm]);
@@ -61,6 +62,15 @@ fn dims(shown: &Shown) -> (f32, f32) {
 
 /// Shows `shown` in the update window, opening it if it isn't open.
 pub fn show(shown: Shown, cx: &mut App) {
+    open(shown, true, cx);
+}
+
+/// Shows `shown` without taking focus: for the background ask, which must not interrupt.
+pub fn show_passive(shown: Shown, cx: &mut App) {
+    open(shown, false, cx);
+}
+
+fn open(shown: Shown, focus: bool, cx: &mut App) {
     let (width, height) = dims(&shown);
     if let Some(open) = cx
         .windows()
@@ -70,21 +80,25 @@ pub fn show(shown: Shown, cx: &mut App) {
         let _ = open.update(cx, |this, window, cx| {
             window.resize(size(px(width), px(height)));
             this.show(shown, cx);
-            window.activate_window();
+            if focus {
+                window.activate_window();
+            }
         });
         return;
     }
+    let size = size(px(width), px(height));
+    let bounds = kil_window_center(cx).map_or_else(
+        || Bounds::centered(None, size, cx),
+        |center| Bounds::centered_at(center, size),
+    );
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(width), px(height)),
-            cx,
-        ))),
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some("Software Update".into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(14.), px(13.))),
         }),
+        focus,
         is_resizable: false,
         is_minimizable: false,
         ..Default::default()
@@ -99,13 +113,25 @@ pub fn show(shown: Shown, cx: &mut App) {
                 poll: None,
             };
             this.show(shown, cx);
-            window.focus(&this.focus_handle);
+            if focus {
+                window.focus(&this.focus_handle);
+            }
             this
         })
     });
     if let Err(err) = opened {
         log::error!("failed to open the update window: {err:#}");
     }
+}
+
+/// The Kil window's center, to open over instead of the screen's; `None` without one.
+fn kil_window_center(cx: &mut App) -> Option<Point<Pixels>> {
+    cx.windows().iter().find_map(|handle| {
+        handle.downcast::<Workspace>()?;
+        handle
+            .update(cx, |_, window, _| window.bounds().center())
+            .ok()
+    })
 }
 
 pub struct UpdateWindow {
@@ -241,24 +267,29 @@ impl UpdateWindow {
                     )
                     .into_any_element()
             }
-            (Shown::Working(_), _) => track
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .h_full()
-                        .w(relative(SWEEP_WIDTH))
-                        .rounded_full()
-                        .bg(c.accent)
-                        .with_animation(
-                            "update-sweep",
-                            Animation::new(motion::SWEEP)
-                                .repeat()
-                                .with_easing(|t| Ease::InOut.apply(t)),
-                            |bar, t| bar.left(relative(t * (1. + SWEEP_WIDTH) - SWEEP_WIDTH)),
-                        ),
-                )
-                .into_any_element(),
+            (Shown::Working(_), _) => {
+                let bar = div()
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .w(relative(SWEEP_WIDTH))
+                    .rounded_full()
+                    .bg(c.accent);
+                let bar = if Motion::enabled() {
+                    bar.with_animation(
+                        "update-sweep",
+                        Animation::new(motion::SWEEP)
+                            .repeat()
+                            .with_easing(|t| Ease::InOut.apply(t)),
+                        |bar, t| bar.left(relative(t * (1. + SWEEP_WIDTH) - SWEEP_WIDTH)),
+                    )
+                    .into_any_element()
+                } else {
+                    bar.left(relative((1. - SWEEP_WIDTH) / 2.))
+                        .into_any_element()
+                };
+                track.child(bar).into_any_element()
+            }
             (Shown::Ready { .. } | Shown::UpToDate, _) => mark("✓", c.accent, c),
             (Shown::Failed(_), _) => mark("!", c.error, c),
         }
@@ -289,7 +320,7 @@ impl UpdateWindow {
 
 /// A finished check's mark, popped in once.
 fn mark(glyph: &'static str, color: Hsla, c: Colors) -> AnyElement {
-    div()
+    let base = div()
         .size(px(22.))
         .flex()
         .items_center()
@@ -298,13 +329,17 @@ fn mark(glyph: &'static str, color: Hsla, c: Colors) -> AnyElement {
         .bg(color)
         .text_size(px(13.))
         .text_color(c.bg)
-        .child(glyph)
-        .with_animation(
+        .child(glyph);
+    if Motion::enabled() {
+        base.with_animation(
             "update-mark",
             Animation::new(motion::PILL).with_easing(|t| Ease::OutQuint.apply(t)),
             |mark, t| mark.opacity(t).size(px(22. * (0.6 + 0.4 * t))),
         )
         .into_any_element()
+    } else {
+        base.into_any_element()
+    }
 }
 
 /// The answer Return gives, filled like a switch that is on; `button`'s hover would hide it.
@@ -375,6 +410,7 @@ impl Render for UpdateWindow {
                 div()
                     .when(notes.is_none(), gpui::Styled::flex_1)
                     .min_h_0()
+                    .overflow_hidden()
                     .text_size(px(11.))
                     .text_color(c.muted)
                     .line_clamp(3)

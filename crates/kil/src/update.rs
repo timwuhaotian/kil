@@ -208,9 +208,35 @@ fn failure(program: &str, status: ExitStatus, stderr: &[u8]) -> String {
     match why.strip_prefix(&format!("{name}: ")) {
         // curl writes its own "curl: (56) …"; saying it twice helps nobody.
         Some(_) => why.to_owned(),
-        None if why.is_empty() => format!("{name}: {status}"),
+        None if why.is_empty() => {
+            curl_hint(program, status).unwrap_or_else(|| format!("{name}: {status}"))
+        }
         None => format!("{name}: {why}"),
     }
+}
+
+/// curl's silent exits in plain language: with `-sS` it prints nothing on some failures,
+/// and `curl: exit status: 1` says nothing. `None` for other programs and exits.
+fn curl_hint(program: &str, status: ExitStatus) -> Option<String> {
+    if Path::new(program)
+        .file_name()
+        .is_none_or(|name| name != "curl")
+    {
+        return None;
+    }
+    let hint = match status.code() {
+        Some(6 | 7) => {
+            format!(
+                "Couldn't reach the update server — check your connection (curl exit {})",
+                status.code().unwrap_or_default()
+            )
+        }
+        Some(28) => {
+            "The update server is taking too long — try again later (curl exit 28)".to_owned()
+        }
+        _ => return None,
+    };
+    Some(hint)
 }
 
 /// The body size the last response in a `curl -D` dump gives; redirects come before it.
@@ -529,7 +555,11 @@ struct Updater {
     ready: Option<Ready>,
     /// Restart to Update: open the new app once this one has quit.
     reopen: bool,
+    /// Completion signals for the check under way (Settings' Check Now).
+    done: Vec<DoneCallback>,
 }
+
+type DoneCallback = Box<dyn FnOnce(&mut App) + 'static>;
 
 impl Global for Updater {}
 
@@ -550,7 +580,7 @@ pub fn init(cx: &mut App) {
             wait = CHECK_EVERY;
             let checked = cx.update(|cx| {
                 if cx.global::<Settings>().auto_update {
-                    check(false, cx);
+                    check(false, None, cx);
                 }
             });
             if checked.is_err() {
@@ -563,21 +593,25 @@ pub fn init(cx: &mut App) {
 
 /// The Kil menu's update item: Check for Updates…, or Restart to Update once one is ready.
 pub fn menu_item(cx: &App) -> MenuItem {
-    match cx
+    let ready = cx
         .try_global::<Updater>()
-        .and_then(|updater| updater.ready.as_ref())
-    {
-        Some(ready) => MenuItem::action(
-            format!("Restart to Update to {}", ready.version),
-            RestartToUpdate,
-        ),
-        None => MenuItem::action("Check for Updates…", CheckForUpdates),
+        .is_some_and(|updater| updater.ready.is_some());
+    if ready {
+        MenuItem::action("Restart to Update", RestartToUpdate)
+    } else {
+        MenuItem::action("Check for Updates…", CheckForUpdates)
     }
 }
 
 /// Check for Updates…: a check whose progress and outcome the update window shows.
 pub fn check_now(cx: &mut App) {
-    check(true, cx);
+    check(true, None, cx);
+}
+
+/// As [`check_now`], running `on_done` when the check ends: at once if an update is
+/// already ready, else when the check under way (or the one it starts) resolves.
+pub fn check_now_with_callback(cx: &mut App, on_done: impl FnOnce(&mut App) + 'static) {
+    check(true, Some(Box::new(on_done)), cx);
 }
 
 /// Restart to Update: quits without asking about jobs, installs, and opens the new Kil.
@@ -588,7 +622,7 @@ pub fn restart(cx: &mut App) {
     }
 }
 
-fn check(asked: bool, cx: &mut App) {
+fn check(asked: bool, on_done: Option<DoneCallback>, cx: &mut App) {
     let updater = cx.global_mut::<Updater>();
     if let Some(ready) = &updater.ready {
         if asked {
@@ -598,9 +632,15 @@ fn check(asked: bool, cx: &mut App) {
             };
             update_window::show(shown, cx);
         }
+        if let Some(done) = on_done {
+            done(cx);
+        }
         return;
     }
     updater.asked |= asked;
+    if let Some(done) = on_done {
+        updater.done.push(done);
+    }
     let progress = match updater.checking.clone() {
         Some(progress) => progress,
         None => start(cx),
@@ -650,8 +690,15 @@ fn checked(found: Result<Found, String>, cx: &mut App) {
     // A ready update asks even when the check was Kil's own periodic one; nothing else
     // from a background check is worth interrupting for. The ask happens once per run:
     // later checks stop at the ready update in `check` and never reach here again.
-    if asked || matches!(shown, Shown::Ready { .. }) {
+    // The background ask opens passively, so it never steals focus.
+    if asked {
         update_window::show(shown, cx);
+    } else if matches!(shown, Shown::Ready { .. }) {
+        update_window::show_passive(shown, cx);
+    }
+    let done = std::mem::take(&mut cx.global_mut::<Updater>().done);
+    for run in done {
+        run(cx);
     }
 }
 
@@ -786,12 +833,62 @@ mod tests {
             .update(cx, |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
-        cx.update(|cx| check(false, cx));
+        cx.update(|cx| check(false, None, cx));
         cx.run_until_parked();
         assert_eq!(count(cx), 0);
-        cx.update(|cx| check(true, cx));
+        cx.update(|cx| check(true, None, cx));
         cx.run_until_parked();
         assert_eq!(count(cx), 1);
+    }
+
+    #[gpui::test]
+    fn check_now_should_run_on_done_at_once_when_ready(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        use crate::theme::Theme;
+
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.set_global(Updater {
+                ready: Some(Ready {
+                    version: "9.9.9".into(),
+                    notes: String::new(),
+                    app: PathBuf::from("/tmp/Kil.app"),
+                    bundle: PathBuf::from("/Applications/Kil.app"),
+                }),
+                ..Updater::default()
+            });
+            cx.bind_keys(update_window::bindings());
+        });
+        let done = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&done);
+        cx.update(|cx| check_now_with_callback(cx, move |_| flag.set(true)));
+        cx.run_until_parked();
+        assert!(done.get());
+    }
+
+    #[gpui::test]
+    fn check_now_should_run_on_done_when_check_finishes(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        use crate::theme::Theme;
+
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.set_global(Updater {
+                checking: Some(Arc::new(Progress::default())),
+                ..Updater::default()
+            });
+            cx.bind_keys(update_window::bindings());
+        });
+        let done = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&done);
+        cx.update(|cx| check_now_with_callback(cx, move |_| flag.set(true)));
+        cx.run_until_parked();
+        assert!(!done.get(), "pending until the check resolves");
+        cx.update(|cx| checked(Ok(Found::UpToDate), cx));
+        cx.run_until_parked();
+        assert!(done.get());
     }
 
     #[test]
@@ -824,6 +921,33 @@ mod tests {
         assert_eq!(
             failure("/usr/bin/codesign", status, b"bundle not signed\n"),
             "codesign: bundle not signed"
+        );
+    }
+
+    #[test]
+    fn curl_exits_should_say_what_happened_in_plain_language() {
+        let status = |code: i32| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("exit {code}")])
+                .status()
+                .unwrap()
+        };
+        assert_eq!(
+            failure("/usr/bin/curl", status(6), b""),
+            "Couldn't reach the update server — check your connection (curl exit 6)"
+        );
+        assert_eq!(
+            failure("/usr/bin/curl", status(7), b""),
+            "Couldn't reach the update server — check your connection (curl exit 7)"
+        );
+        assert_eq!(
+            failure("/usr/bin/curl", status(28), b""),
+            "The update server is taking too long — try again later (curl exit 28)"
+        );
+        // Anything else keeps the old shape.
+        assert_eq!(
+            failure("/usr/bin/curl", status(1), b""),
+            "curl: exit status: 1"
         );
     }
 
@@ -961,5 +1085,24 @@ mod tests {
         );
         assert!(verify(&staged, &manifest.version, "AAAAAAAAAA").is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn menu_item_should_say_restart_to_update_when_ready(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Updater {
+                ready: Some(Ready {
+                    version: "9.9.9".into(),
+                    notes: String::new(),
+                    app: PathBuf::from("/tmp/Kil.app"),
+                    bundle: PathBuf::from("/Applications/Kil.app"),
+                }),
+                ..Updater::default()
+            });
+            assert!(matches!(
+                menu_item(cx),
+                MenuItem::Action { name, .. } if name == "Restart to Update"
+            ));
+        });
     }
 }

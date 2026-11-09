@@ -61,6 +61,7 @@ pub struct Theme {
     pub accent: Hsla,
     pub failure: Hsla,
     pub divider: Hsla,
+    pub field_border: Hsla,
     pub inactive_dim: Hsla,
     pub banner_bg: Hsla,
 }
@@ -94,6 +95,7 @@ struct Chrome {
     accent: u32,
     failure: u32,
     divider: u32,
+    field_border: u32,
     dim: u32,
     banner: u32,
 }
@@ -134,12 +136,13 @@ impl Theme {
                 selection: 0x3d5a80cc,
                 sidebar: 0x16181db8,
                 text: 0xe3e6eb,
-                muted: 0x7d8490,
+                muted: 0x848b97,
                 hover: 0xffffff0f,
                 selected: 0xffffff1f,
                 accent: 0x6ca8ff,
                 failure: 0xf06c6c,
                 divider: 0x262930,
+                field_border: 0x6d6f74,
                 // Half: on a near-black background a lighter dim moves the background by
                 // ~2/255 and leaves only the text to show which pane has focus.
                 dim: 0x05060880,
@@ -170,6 +173,7 @@ impl Theme {
                 accent: 0xffff36,
                 failure: 0xff5f5f,
                 divider: 0x333333,
+                field_border: 0x666666,
                 dim: 0x00000080,
                 banner: 0x111111f2,
             },
@@ -191,12 +195,13 @@ impl Theme {
                 selection: 0x3e5679cc,
                 sidebar: 0x191d26b8,
                 text: 0xdde3ee,
-                muted: 0x7c8698,
+                muted: 0x8f98a7,
                 hover: 0xffffff0f,
                 selected: 0xffffff1f,
                 accent: 0x88b4e6,
                 failure: 0xe07a84,
                 divider: 0x2a313d,
+                field_border: 0x767a83,
                 dim: 0x0b0e1480,
                 banner: 0x232936f2,
             },
@@ -218,12 +223,13 @@ impl Theme {
                 selection: 0x5a4632cc,
                 sidebar: 0x1a1612b8,
                 text: 0xece2d0,
-                muted: 0x8f8170,
+                muted: 0x9b8f7f,
                 hover: 0xffffff0f,
                 selected: 0xffffff1c,
                 accent: 0xe8a15a,
                 failure: 0xea6b55,
                 divider: 0x2f2822,
+                field_border: 0x797471,
                 dim: 0x0d0a0880,
                 banner: 0x2a241ef2,
             },
@@ -245,12 +251,13 @@ impl Theme {
                 selection: 0x4b3d6ecc,
                 sidebar: 0x15121cb8,
                 text: 0xe3def0,
-                muted: 0x8a8199,
+                muted: 0x928aa0,
                 hover: 0xffffff0f,
                 selected: 0xffffff1f,
                 accent: 0xb48cff,
                 failure: 0xef7591,
                 divider: 0x2b2638,
+                field_border: 0x72707b,
                 dim: 0x0a080f80,
                 banner: 0x221e2df2,
             },
@@ -272,10 +279,17 @@ impl Theme {
             accent: opaque(chrome.accent),
             failure: opaque(chrome.failure),
             divider: opaque(chrome.divider),
+            field_border: opaque(chrome.field_border),
             inactive_dim: translucent(chrome.dim),
             banner_bg: translucent(chrome.banner),
         }
     }
+}
+
+/// Near-black foreground for use ON accent backgrounds (menu hover text, toggle knob).
+#[expect(clippy::unreadable_literal, reason = "hex color reads as #RRGGBB")]
+pub fn on_accent() -> Hsla {
+    rgb(0x14161a).into()
 }
 
 /// A terminal color as a GPUI color.
@@ -316,6 +330,78 @@ mod tests {
             ),
             (own, 0.25)
         );
+    }
+
+    /// An sRGB channel (0..=1) linearized for relative luminance (WCAG).
+    fn linear(channel: f32) -> f32 {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(color: Hsla) -> f32 {
+        let rgb = color.to_rgb();
+        0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b)
+    }
+
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// The settings card: `sidebar_hover` composited over `terminal_bg`
+    /// (see `settings_window::Colors::of`).
+    fn settings_card(theme: &Theme) -> Hsla {
+        let hover = theme.sidebar_hover.to_rgb();
+        let bg = theme.terminal_bg.to_rgb();
+        let alpha = hover.a;
+        GpuiRgba {
+            r: hover.r * alpha + bg.r * (1. - alpha),
+            g: hover.g * alpha + bg.g * (1. - alpha),
+            b: hover.b * alpha + bg.b * (1. - alpha),
+            a: 1.,
+        }
+        .into()
+    }
+
+    #[test]
+    fn on_accent_should_meet_aa_against_every_theme_accent() {
+        for name in ThemeName::ALL {
+            let theme = Theme::named(name);
+            let ratio = contrast(on_accent(), theme.accent);
+            assert!(ratio >= 4.5, "{name:?}: on_accent vs accent = {ratio:.2}");
+        }
+    }
+
+    #[test]
+    fn field_border_should_meet_three_to_one_on_settings_card_in_every_theme() {
+        for name in ThemeName::ALL {
+            let theme = Theme::named(name);
+            let ratio = contrast(theme.field_border, settings_card(&theme));
+            assert!(ratio >= 3.0, "{name:?}: field_border vs card = {ratio:.2}");
+        }
+    }
+
+    #[test]
+    fn sidebar_muted_should_meet_aa_on_card_and_terminal_bg_in_every_theme() {
+        for name in ThemeName::ALL {
+            let theme = Theme::named(name);
+            let on_card = contrast(theme.sidebar_muted, settings_card(&theme));
+            let on_bg = contrast(theme.sidebar_muted, theme.terminal_bg);
+            assert!(on_card >= 4.5, "{name:?}: muted vs card = {on_card:.2}");
+            assert!(on_bg >= 4.5, "{name:?}: muted vs terminal_bg = {on_bg:.2}");
+        }
+    }
+
+    #[test]
+    fn sidebar_text_should_keep_eleven_point_five_contrast_on_terminal_bg_in_every_theme() {
+        for name in ThemeName::ALL {
+            let theme = Theme::named(name);
+            let ratio = contrast(theme.sidebar_text, theme.terminal_bg);
+            assert!(ratio >= 11.5, "{name:?}: text vs terminal_bg = {ratio:.2}");
+        }
     }
 
     #[test]

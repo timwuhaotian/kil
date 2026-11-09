@@ -9,8 +9,6 @@
     reason = "Objective-C: a delegate class and completion blocks; every block carries a SAFETY comment"
 )]
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use block2::{DynBlock, RcBlock};
 use futures::channel::mpsc;
 use objc2::{
@@ -21,17 +19,15 @@ use objc2::{
 use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
-    UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
-    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    UNNotificationDefaultActionIdentifier, UNNotificationPresentationOptions,
+    UNNotificationRequest, UNNotificationResponse, UNUserNotificationCenter,
+    UNUserNotificationCenterDelegate,
 };
 
-/// Starts the identifier of every notification Kil posts: `kil-pane.<pane id>.<number>`.
-/// Pane ids hold only letters, digits and `-` (`restore::is_valid_id`), so the dots are
-/// unambiguous.
+/// Starts the identifier of every notification Kil posts: `kil-pane.<pane id>.0`. One pane
+/// keeps one identifier, so a repeat replaces the last instead of stacking. Pane ids hold
+/// only letters, digits and `-` (`restore::is_valid_id`), so the dots are unambiguous.
 const IDENTIFIER_PREFIX: &str = "kil-pane.";
-
-/// Makes every notification's identifier different, so one doesn't replace another.
-static POSTED: AtomicU64 = AtomicU64::new(0);
 
 /// The pane a notification identifier names. The id is the pane's own, which lasts across
 /// launches, so a notification from before a restart still goes to the same pane.
@@ -76,8 +72,9 @@ define_class!(
             ));
         }
 
-        /// Any response is a click: Kil sets no actions, so only the default one exists. The
-        /// system has brought Kil forward by now, or started it.
+        /// Only a click names a pane: a dismiss (X, swipe, Clear) answers with another
+        /// action, and must not steal focus. The system has brought Kil forward by now,
+        /// or started it.
         #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
         fn did_receive(
             &self,
@@ -85,6 +82,12 @@ define_class!(
             response: &UNNotificationResponse,
             done: &DynBlock<dyn Fn()>,
         ) {
+            // SAFETY: reading the system-provided identifier constant.
+            let default = unsafe { UNNotificationDefaultActionIdentifier.to_string() };
+            if response.actionIdentifier().to_string() != default {
+                done.call(());
+                return;
+            }
             let identifier = response.notification().request().identifier().to_string();
             if let Some(pane) = pane_of(&identifier) {
                 // The app may be gone already: nobody left to tell.
@@ -140,7 +143,27 @@ pub fn describe(
         .filter(|part| !part.is_empty() && *part != title)
         .collect::<Vec<_>>()
         .join(" · ");
-    (title.to_owned(), subtitle, body.to_owned())
+    (
+        title.to_owned(),
+        truncate_middle(&subtitle, 64),
+        body.to_owned(),
+    )
+}
+
+/// `text` capped at `max` chars, cut from the middle so both ends stay: the tab at the
+/// front, the folder at the back.
+fn truncate_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_owned();
+    }
+    let tail = max * 2 / 3;
+    let head = max - tail - 1;
+    format!(
+        "{}…{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
 }
 
 /// Shows `body` under `title` and `subtitle` for `pane` (the pane's id); clicking it names
@@ -148,6 +171,7 @@ pub fn describe(
 /// if it's refused.
 pub fn post(pane: &str, title: &str, subtitle: &str, body: &str) {
     if !available() {
+        log::debug!("not posting a notification: Kil isn't running from a bundle");
         return;
     }
     let content = UNMutableNotificationContent::new();
@@ -156,10 +180,7 @@ pub fn post(pane: &str, title: &str, subtitle: &str, body: &str) {
         content.setSubtitle(&NSString::from_str(subtitle));
     }
     content.setBody(&NSString::from_str(body));
-    let identifier = format!(
-        "{IDENTIFIER_PREFIX}{pane}.{}",
-        POSTED.fetch_add(1, Ordering::Relaxed)
-    );
+    let identifier = format!("{IDENTIFIER_PREFIX}{pane}.0");
     let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
         &NSString::from_str(&identifier),
         &content,
@@ -228,6 +249,21 @@ mod tests {
             describe("", "Done", None, "", ""),
             ("Kil".into(), String::new(), "Done".into())
         );
+    }
+
+    #[test]
+    fn a_long_subtitle_should_keep_the_tab_and_the_folder() {
+        let (_, subtitle, _) = describe(
+            "",
+            "Done",
+            Some("killi"),
+            "kil",
+            "/Users/me/code/a-very-deep-folder/with-many-levels/that-goes-on/and-on/kil",
+        );
+        assert!(subtitle.chars().count() <= 64, "{subtitle}");
+        assert!(subtitle.starts_with("kil · "), "{subtitle}");
+        assert!(subtitle.ends_with("and-on/kil"), "{subtitle}");
+        assert!(subtitle.contains('…'), "{subtitle}");
     }
 
     #[test]

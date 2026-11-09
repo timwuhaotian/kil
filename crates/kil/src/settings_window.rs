@@ -80,6 +80,8 @@ pub struct SettingsWindow {
     recorder: Option<Subscription>,
     /// Last problem reading or writing the file.
     error: Option<SharedString>,
+    /// Check Now is waiting on its update check.
+    checking_update: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -99,11 +101,17 @@ impl SettingsWindow {
         let scrollback =
             cx.new(|cx| TextField::new(&file.scrollback_lines.to_string(), window, cx));
         let directory = cx.new(|cx| TextField::new(&shown_directory(&file), window, cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&font_family, window, Self::font_family_edited),
             cx.subscribe_in(&scrollback, window, Self::scrollback_edited),
             cx.subscribe_in(&directory, window, Self::directory_edited),
         ];
+        // A field taking focus stands recording down: the next keystroke is typed text.
+        for field in [&font_family, &scrollback, &directory] {
+            subscriptions.push(cx.on_focus(&field.focus_handle(cx), window, |this, _, cx| {
+                this.cancel_recording(cx);
+            }));
+        }
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             file,
@@ -114,6 +122,7 @@ impl SettingsWindow {
             recording: None,
             recorder: None,
             error,
+            checking_update: false,
             _subscriptions: subscriptions,
         };
         this.load_keys();
@@ -121,6 +130,7 @@ impl SettingsWindow {
     }
 
     fn write(&mut self, key: &str, value: &toml::Value, cx: &mut Context<Self>) {
+        self.cancel_recording(cx);
         self.applied(config::write_setting(key, value), cx);
     }
 
@@ -176,8 +186,16 @@ impl SettingsWindow {
     fn set_directory(&mut self, dir: Option<&std::path::Path>, cx: &mut Context<Self>) {
         match dir {
             None => self.write("default_directory", &"".into(), cx),
+            // A relative dir would resolve against wherever Kil was launched, not the home
+            // it was typed in front of.
+            Some(dir) if !dir.is_absolute() => {
+                self.error = Some(format!("Use an absolute path or ~/…: {}", dir.display()).into());
+            }
             Some(dir) if dir.is_dir() => {
                 self.write("default_directory", &abbreviate_home(dir).into(), cx);
+            }
+            Some(dir) if dir.exists() => {
+                self.error = Some(format!("Not a folder: {}", dir.display()).into());
             }
             Some(dir) => self.error = Some(format!("No such folder: {}", dir.display()).into()),
         }
@@ -215,18 +233,26 @@ impl SettingsWindow {
         .detach();
     }
 
-    /// The keys `command` runs on now, resolved from `keymap.toml` over the defaults.
-    fn keys_for(&self, command: Command) -> Option<&str> {
-        self.keys
-            .iter()
-            .find(|(_, bound)| *bound == command)
-            .map(|(keys, _)| keys.as_str())
+    /// Every chord `command` runs on now, resolved from `keymap.toml` over the defaults.
+    fn keys_for(&self, command: Command) -> Vec<&str> {
+        chords_in(&self.keys, command)
     }
 
-    /// `keymap.toml` resolved over the defaults.
+    /// `keymap.toml` resolved over the defaults; bad entries show in the error line.
     fn load_keys(&mut self) {
         match config::read_keymap() {
-            Ok(text) => self.keys = keymap::resolve(text.as_deref()).0,
+            Ok(text) => {
+                let (keys, errors) = keymap::resolve(text.as_deref());
+                self.keys = keys;
+                if !errors.is_empty() {
+                    let problems = errors
+                        .iter()
+                        .map(|err| format!("keymap.toml: {}: {}", err.key, err.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    self.error = Some(problems.into());
+                }
+            }
             Err(err) => self.error = Some(err.into()),
         }
     }
@@ -256,13 +282,22 @@ impl SettingsWindow {
         }
         self.recording = Some(command);
         self.recorder = Some(cx.intercept_keystrokes(|event, window, cx| {
+            // Only this window's keys are swallowed; a terminal keeps its typing.
             if let Some(handle) = window.window_handle().downcast::<SettingsWindow>() {
                 let keystroke = event.keystroke.clone();
                 let _ = handle.update(cx, |this, _, cx| this.recorded(&keystroke, cx));
+                cx.stop_propagation();
             }
-            cx.stop_propagation();
         }));
         cx.notify();
+    }
+
+    /// Stands down from recording: a field took focus, or another control ran.
+    fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        if self.recording.take().is_some() {
+            self.recorder = None;
+            cx.notify();
+        }
     }
 
     /// A key arrived while recording.
@@ -270,11 +305,31 @@ impl SettingsWindow {
         let Some(command) = self.recording else {
             return;
         };
+        // Escape backs out instead of binding.
+        if event.key == "escape" {
+            self.recording = None;
+            self.recorder = None;
+            cx.notify();
+            return;
+        }
         // A modifier on its own arrives as a keystroke of its own; the shortcut is the key
         // pressed with it.
         let Some(keys) = keymap::keystroke_of(event) else {
             return;
         };
+        // Bare keys would fire while typing; only function keys may stand alone. Recording
+        // stays armed, so the next press can be the chord meant.
+        if !event.modifiers.modified() && !is_function_key(&event.key) {
+            self.error = Some(
+                format!(
+                    "{} needs ⌘, ⌃, ⌥ or ⇧ — bare keys can't be shortcuts.",
+                    keymap::display(&keys)
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
         self.recording = None;
         self.recorder = None;
         let taken = self
@@ -311,10 +366,12 @@ impl SettingsWindow {
     }
 
     fn unset(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.cancel_recording(cx);
         self.applied(config::unset_setting(key), cx);
     }
 
     fn open_folder(&mut self, cx: &mut Context<Self>) {
+        self.cancel_recording(cx);
         match config_dir() {
             None => self.error = Some("No home directory.".into()),
             Some(dir) => match fs::create_dir_all(&dir) {
@@ -344,6 +401,41 @@ fn step_percent(opacity: f32, up: bool) -> f32 {
     (stepped / 100.).clamp(0., 1.)
 }
 
+/// Whether `key` is a function key, the only bare keys shortcuts may use.
+fn is_function_key(key: &str) -> bool {
+    matches!(
+        key,
+        "f1" | "f2"
+            | "f3"
+            | "f4"
+            | "f5"
+            | "f6"
+            | "f7"
+            | "f8"
+            | "f9"
+            | "f10"
+            | "f11"
+            | "f12"
+            | "f13"
+            | "f14"
+            | "f15"
+            | "f16"
+            | "f17"
+            | "f18"
+            | "f19"
+            | "f20"
+    )
+}
+
+/// Every chord in `table` running `command`, in the table's order.
+fn chords_in(table: &[(String, Command)], command: Command) -> Vec<&str> {
+    table
+        .iter()
+        .filter(|(_, bound)| *bound == command)
+        .map(|(keys, _)| keys.as_str())
+        .collect()
+}
+
 /// The default directory as typed in the field: `~` for home, empty for none.
 fn shown_directory(file: &Settings) -> String {
     file.default_directory
@@ -370,6 +462,9 @@ fn swatch(name: ThemeName, chosen: bool, c: Colors) -> Stateful<Div> {
         .cursor_pointer()
         .child(
             div()
+                .id(ElementId::Name(
+                    format!("swatch-card-{}", name.key()).into(),
+                ))
                 .w(px(64.))
                 .h(px(44.))
                 .p(px(7.))
@@ -378,10 +473,12 @@ fn swatch(name: ThemeName, chosen: bool, c: Colors) -> Stateful<Div> {
                 .justify_between()
                 .rounded_md()
                 .border_2()
-                .border_color(if chosen { c.accent } else { c.divider })
+                .border_color(if chosen { c.accent } else { c.field_border })
+                .hover(|style| style.border_color(c.accent))
+                .active(|style| style.bg(pressed(theme.terminal_bg)))
                 .bg(theme.terminal_bg)
                 .child(div().w(px(26.)).h(px(4.)).rounded_full().bg(theme.accent))
-                .child(div().flex().gap(px(2.)).children(strip)),
+                .child(div().flex().gap(px(1.)).children(strip)),
         )
         .child(
             div()
@@ -402,6 +499,7 @@ pub struct Colors {
     pub off: Hsla,
     pub accent: Hsla,
     pub divider: Hsla,
+    pub field_border: Hsla,
     pub error: Hsla,
 }
 
@@ -416,6 +514,7 @@ impl Colors {
             off: theme.sidebar_selected,
             accent: theme.accent,
             divider: theme.divider,
+            field_border: theme.field_border,
             error: hsla(theme.terminal.ansi[9]),
         }
     }
@@ -444,10 +543,20 @@ fn section(title: &'static str, c: Colors, rows: Vec<AnyElement>) -> Div {
         )
 }
 
+/// `color` a step darker, for pressed controls.
+fn pressed(color: Hsla) -> Hsla {
+    Hsla {
+        l: (color.l - 0.07).max(0.),
+        ..color
+    }
+}
+
+/// A settings row; clicking `label_for`'s label focuses its field.
 fn row(
     label: &'static str,
     hint: Option<&'static str>,
     c: Colors,
+    label_for: Option<FocusHandle>,
     control: impl IntoElement,
 ) -> AnyElement {
     div()
@@ -462,7 +571,18 @@ fn row(
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
-                .child(div().truncate().child(label))
+                .child(match label_for {
+                    Some(handle) => div()
+                        .truncate()
+                        .child(label)
+                        .id(ElementId::Name(format!("label-{label}").into()))
+                        .cursor_pointer()
+                        .on_click(move |_, window, _| {
+                            window.focus(&handle);
+                        })
+                        .into_any_element(),
+                    None => div().truncate().child(label).into_any_element(),
+                })
                 .children(hint.map(|hint| {
                     div()
                         .truncate()
@@ -490,42 +610,54 @@ pub fn button(
         .justify_center()
         .rounded_md()
         .border_1()
-        .border_color(c.divider)
+        .border_color(c.field_border)
         .cursor_pointer()
-        .hover(|style| style.bg(c.hover))
+        .hover(|style| style.bg(c.hover).border_color(c.accent))
+        .active(|style| style.bg(pressed(c.hover)))
         .child(label.into())
 }
 
-/// A command and its shortcut. The key box is a button: press it, then press the keys.
+/// A command and its shortcuts. The key box is a button: press it, then press the keys.
+/// The box is fixed-width, so "Press keys…" never moves the rows around it.
 fn key_row(
     command: Command,
-    keys: Option<&str>,
+    keys: &[&str],
+    changed: bool,
     recording: Option<Command>,
     c: Colors,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     let name = command.key();
     let listening = recording == Some(command);
-    let changed = keys != command.default_keys();
+    let shown = if keys.is_empty() {
+        "None".to_owned()
+    } else {
+        keys.iter()
+            .map(|keys| keymap::display(keys))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
     let keys_box = div()
         .id(ElementId::Name(format!("keys-{name}").into()))
         .h(px(22.))
-        .min_w(px(58.))
+        .w(px(96.))
         .px_2()
         .flex()
         .items_center()
         .justify_center()
+        .overflow_hidden()
         .rounded_md()
         .border_1()
-        .border_color(if listening { c.accent } else { c.divider })
+        .border_color(if listening { c.accent } else { c.field_border })
         .cursor_pointer()
-        .hover(|style| style.bg(c.hover))
+        .hover(|style| style.bg(c.hover).border_color(c.accent))
+        .active(|style| style.bg(pressed(c.hover)))
         .text_size(px(12.))
         .text_color(if changed { c.accent } else { c.text })
-        .child(match (keys, listening) {
-            (_, true) => "Press keys…".to_owned(),
-            (Some(keys), false) => keymap::display(keys),
-            (None, false) => "None".to_owned(),
+        .child(if listening {
+            "Press keys…".to_owned()
+        } else {
+            shown
         })
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.record(command, cx)));
     let reset = button(ElementId::Name(format!("reset-{name}").into()), "Reset", c)
@@ -563,17 +695,27 @@ fn key_row(
 }
 
 fn toggle(id: &'static str, on: bool, c: Colors) -> Stateful<Div> {
+    let track = if on { c.accent } else { c.off };
     div()
         .id(id)
         .w(px(34.))
         .h(px(20.))
-        .p(px(2.))
+        .p(px(1.))
         .flex()
         .rounded_full()
         .cursor_pointer()
-        .bg(if on { c.accent } else { c.off })
+        .border_1()
+        .border_color(if on { c.accent } else { c.field_border })
+        .hover(|style| style.border_color(c.accent))
+        .active(|style| style.bg(pressed(track)))
+        .bg(track)
         .when(on, Styled::justify_end)
-        .child(div().size(px(16.)).rounded_full().bg(c.text))
+        .child(
+            div()
+                .size(px(16.))
+                .rounded_full()
+                .bg(crate::theme::on_accent()),
+        )
 }
 
 fn field_box(field: &Entity<TextField>, width: f32, window: &Window, c: Colors, cx: &App) -> Div {
@@ -586,7 +728,7 @@ fn field_box(field: &Entity<TextField>, width: f32, window: &Window, c: Colors, 
         .items_center()
         .rounded_md()
         .border_1()
-        .border_color(if focused { c.accent } else { c.divider })
+        .border_color(if focused { c.accent } else { c.field_border })
         .bg(c.bg)
         .child(field.clone())
 }
@@ -599,12 +741,14 @@ impl SettingsWindow {
                 "Family",
                 None,
                 c,
+                Some(self.font_family.focus_handle(cx)),
                 field_box(&self.font_family, 180., window, c, cx),
             ),
             row(
                 "Size",
                 None,
                 c,
+                None,
                 div()
                     .flex()
                     .items_center()
@@ -646,6 +790,7 @@ impl SettingsWindow {
                 "Sidebar opacity",
                 Some("Lower lets the desktop show through"),
                 c,
+                None,
                 div()
                     .flex()
                     .items_center()
@@ -680,7 +825,14 @@ impl SettingsWindow {
     fn keyboard_rows(&self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
         Command::all()
             .into_iter()
-            .map(|command| key_row(command, self.keys_for(command), self.recording, c, cx))
+            .map(|command| {
+                let keys = self.keys_for(command);
+                let mut bound = keys.clone();
+                let mut defaulted = command.all_default_keys();
+                bound.sort_unstable();
+                defaulted.sort_unstable();
+                key_row(command, &keys, bound != defaulted, self.recording, c, cx)
+            })
             .collect()
     }
 
@@ -689,27 +841,35 @@ impl SettingsWindow {
         vec![
             row(
                 "Default directory",
-                Some("New tabs and splits start here"),
+                Some("New tabs start here; empty follows the focused pane"),
                 c,
+                Some(self.directory.focus_handle(cx)),
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
                     .child(field_box(&self.directory, 130., window, c, cx))
-                    .child(button("choose-directory", "Choose…", c).on_click(
-                        cx.listener(|_, _: &ClickEvent, _, cx| Self::choose_directory(cx)),
-                    )),
+                    .child(
+                        button("choose-directory", "Choose…", c).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.cancel_recording(cx);
+                                Self::choose_directory(cx);
+                            },
+                        )),
+                    ),
             ),
             row(
                 "Scrollback lines",
                 Some("Applies to new tabs and panes"),
                 c,
+                Some(self.scrollback.focus_handle(cx)),
                 field_box(&self.scrollback, 100., window, c, cx),
             ),
             row(
                 "Option as Meta",
                 Some("Off to type é, ü … with Option"),
                 c,
+                None,
                 toggle("option-as-meta", file.option_as_meta, c).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
                         let on = !this.file.option_as_meta;
@@ -721,6 +881,7 @@ impl SettingsWindow {
                 "Cursor blink",
                 None,
                 c,
+                None,
                 toggle("cursor-blink", file.cursor_blink, c).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
                         let on = !this.file.cursor_blink;
@@ -739,6 +900,7 @@ impl SettingsWindow {
                 "Update automatically",
                 Some("Downloads in the background, installs when Kil quits"),
                 c,
+                None,
                 toggle("auto-update", self.file.auto_update, c).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
                         let on = !this.file.auto_update;
@@ -750,10 +912,29 @@ impl SettingsWindow {
                 concat!("Kil ", env!("CARGO_PKG_VERSION")),
                 None,
                 c,
+                None,
                 // Called, not dispatched, so it doesn't depend on which window is active.
-                button("check-for-updates", "Check Now", c).on_click(|_, _, cx| {
-                    update::check_now(cx);
-                }),
+                if self.checking_update {
+                    button("check-for-updates", "Checking…", c).opacity(0.5)
+                } else {
+                    button("check-for-updates", "Check Now", c).on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            if this.checking_update {
+                                return;
+                            }
+                            this.cancel_recording(cx);
+                            this.checking_update = true;
+                            cx.notify();
+                            let weak = cx.entity().downgrade();
+                            update::check_now_with_callback(cx, move |cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.checking_update = false;
+                                    cx.notify();
+                                });
+                            });
+                        },
+                    ))
+                },
             ),
         ]
     }
@@ -771,6 +952,7 @@ impl Render for SettingsWindow {
             "Config files",
             Some("config.toml, keymap.toml"),
             c,
+            None,
             button("open-folder", "Open Folder", c)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_folder(cx))),
         )];
@@ -818,15 +1000,18 @@ impl Render for SettingsWindow {
                     .child(section("KEYBOARD", c, keyboard))
                     .child(section("TERMINAL", c, terminal))
                     .child(section("UPDATES", c, updates))
-                    .child(section("FILES", c, files))
-                    .child(
-                        div()
-                            .min_h(px(16.))
-                            .px_1()
-                            .text_size(px(11.))
-                            .text_color(c.error)
-                            .children(self.error.clone()),
-                    ),
+                    .child(section("FILES", c, files)),
+            )
+            // The error stays pinned below the scroll body, never under the fold.
+            .child(
+                div().flex_none().px_5().pb_4().child(
+                    div()
+                        .min_h(px(16.))
+                        .px_1()
+                        .text_size(px(11.))
+                        .text_color(c.error)
+                        .children(self.error.clone()),
+                ),
             )
     }
 }
@@ -882,6 +1067,92 @@ mod tests {
         // Drops the recorder, which is armed and holds a keystroke interceptor.
         settings
             .update(cx, |this, _, _| this.recording = None)
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_should_cancel_recording_without_binding(cx: &mut TestAppContext) {
+        let settings = settings_window(cx);
+        let escape = Keystroke {
+            key: "escape".into(),
+            key_char: None,
+            modifiers: Modifiers::default(),
+        };
+        settings
+            .update(cx, |this, _, cx| {
+                this.record(Command::SplitRight, cx);
+                this.recorded(&escape, cx);
+                assert_eq!(this.recording, None);
+                assert!(this.error.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_bare_letter_should_be_refused_while_recording_stays_armed(cx: &mut TestAppContext) {
+        let settings = settings_window(cx);
+        let letter = Keystroke {
+            key: "d".into(),
+            key_char: Some("d".into()),
+            modifiers: Modifiers::default(),
+        };
+        settings
+            .update(cx, |this, _, cx| {
+                this.record(Command::SplitRight, cx);
+                this.recorded(&letter, cx);
+                assert_eq!(this.recording, Some(Command::SplitRight));
+                assert!(
+                    this.error
+                        .as_ref()
+                        .is_some_and(|err| err.contains("can't be shortcuts"))
+                );
+                this.recording = None;
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn keys_for_should_list_every_bound_chord(cx: &mut TestAppContext) {
+        let settings = settings_window(cx);
+        settings
+            .update(cx, |this, _, _| {
+                this.keys = vec![
+                    ("cmd-shift-]".to_owned(), Command::NextTab),
+                    ("ctrl-tab".to_owned(), Command::NextTab),
+                ];
+                assert_eq!(this.keys_for(Command::NextTab), ["cmd-shift-]", "ctrl-tab"]);
+                assert_eq!(this.keys_for(Command::PrevTab), Vec::<&str>::new());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn set_directory_should_reject_relative_paths_files_and_missing_folders(
+        cx: &mut TestAppContext,
+    ) {
+        let settings = settings_window(cx);
+        settings
+            .update(cx, |this, _, cx| {
+                this.set_directory(Some(std::path::Path::new("code/kil")), cx);
+                assert!(
+                    this.error
+                        .as_ref()
+                        .is_some_and(|err| err.contains("absolute"))
+                );
+                let exe = std::env::current_exe().unwrap();
+                this.set_directory(Some(&exe), cx);
+                assert!(
+                    this.error
+                        .as_ref()
+                        .is_some_and(|err| err.contains("Not a folder"))
+                );
+                this.set_directory(Some(std::path::Path::new("/no/such/kil-folder")), cx);
+                assert!(
+                    this.error
+                        .as_ref()
+                        .is_some_and(|err| err.contains("No such folder"))
+                );
+            })
             .unwrap();
     }
 

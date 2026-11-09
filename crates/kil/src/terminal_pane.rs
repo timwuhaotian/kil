@@ -120,13 +120,16 @@ pub struct TerminalPane {
     cursor: Entity<TerminalCursor>,
     last_input: Instant,
     scroll_remainder: f32,
-    selecting: bool,
+    pub(crate) selecting: bool,
     /// A drag belongs to the program (it asked for 1002/1003): its press, drags and release go
     /// to it as reports, and Kil selects nothing.
     pub(crate) forwarding: bool,
     /// The cell the last report named, so a drag the platform re-emits without moving sends
     /// nothing.
     last_cell: Option<(usize, usize)>,
+    /// The press that started this forwarding saw an active window: only then does a later
+    /// inactive paint mean the window blurred (test windows are never active).
+    pub(crate) forwarding_guarded: bool,
     info: PaneInfo,
     info_refresh: Option<Task<()>>,
     /// While the tab's layout animates, keep the grid: one resize when it settles, not one
@@ -229,6 +232,7 @@ impl TerminalPane {
             selecting: false,
             forwarding: false,
             last_cell: None,
+            forwarding_guarded: false,
             info: PaneInfo {
                 title: start
                     .as_deref()
@@ -347,6 +351,11 @@ impl TerminalPane {
             .map(|row| frame.row_text(row))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[cfg(test)]
+    pub fn selection_text(&self) -> Option<String> {
+        self.session.as_ref()?.selection_text()
     }
 
     /// The pane's id: its session's name in the server, kept across launches.
@@ -513,7 +522,13 @@ impl TerminalPane {
                 SessionEvent::ChildExited(status) => self.exit_status = Some(status),
                 SessionEvent::Notify(notification) => cx.emit(PaneEvent::Notified(notification)),
                 SessionEvent::Ended => self.ended(cx),
-                SessionEvent::Bell | SessionEvent::CursorBlinkingChange => {}
+                SessionEvent::Bell => {}
+                SessionEvent::CursorBlinkingChange => {
+                    // DECSCUSR/`?12h` change no cells, so no Wakeup follows: take a fresh
+                    // snapshot for the new blink state on the next layout.
+                    self.stale = true;
+                    cx.notify();
+                }
             }
         }
     }
@@ -602,7 +617,7 @@ impl TerminalPane {
         session
             .hyperlink_at(cell)
             .filter(|url| links::is_openable(url))
-            .or_else(|| links::link_at(self.frame.row(cell.row), cell.col))
+            .or_else(|| links::link_at_frame(&self.frame, cell.row, cell.col))
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -635,11 +650,20 @@ impl TerminalPane {
                 session.write(report);
             }
             self.forwarding = true;
+            self.forwarding_guarded = window.is_window_active();
             self.last_cell = Some((col, row));
             return;
         }
         self.forwarding = false;
         self.last_cell = None;
+        // Shift-click extends the selection from its anchor instead of starting a new one.
+        // Shift already bypassed the program above, so this never steals its drags.
+        if event.modifiers.shift && session.selection_text().is_some() {
+            session.update_selection(cell);
+            self.selecting = true;
+            cx.notify();
+            return;
+        }
         let kind = match event.click_count {
             0 | 1 => SelectionKind::Cells,
             2 => SelectionKind::Words,
@@ -695,6 +719,57 @@ impl TerminalPane {
         }
     }
 
+    /// A selection drag, possibly past the pane's edge: the clamped cell extends the
+    /// selection, and while the pointer is held outside, the viewport scrolls a few lines
+    /// per move so the selection keeps growing.
+    pub(crate) fn select_drag(&mut self, position: Point<Pixels>) {
+        let (Some(session), Some(geometry)) = (self.session.as_ref(), self.geometry) else {
+            return;
+        };
+        if self.frame.rows == 0 {
+            return;
+        }
+        let top = geometry.origin.y;
+        let bottom = geometry.origin.y + geometry.cell.height * cells(self.frame.rows);
+        let margin = geometry.cell.height * 6.;
+        if position.y < top {
+            session.scroll(if position.y + margin < top { 3 } else { 1 });
+        } else if position.y > bottom {
+            session.scroll(if position.y > bottom + margin { -3 } else { -1 });
+        }
+        if let Some(cell) = self.cell_at(position) {
+            let (col, row) = self.clamp_cell(cell);
+            session.update_selection(ViewportCell {
+                row,
+                col,
+                right_half: cell.right_half,
+            });
+        }
+    }
+
+    /// The release of a selection drag.
+    pub(crate) fn select_up(&mut self) {
+        self.selecting = false;
+    }
+
+    /// A drag the program owns, ended without its release (the window blurred or the pane
+    /// lost focus): the program gets the release at the last reported cell, so it doesn't
+    /// keep waiting for it.
+    pub(crate) fn cancel_forwarding(&mut self) {
+        self.forwarding = false;
+        let (Some(session), Some((col, row))) = (self.session.as_ref(), self.last_cell) else {
+            self.last_cell = None;
+            return;
+        };
+        self.last_cell = None;
+        let mode = session.input_mode();
+        if let Some(report) =
+            keys::button_report(0, false, false, col, row, Modifiers::default(), mode)
+        {
+            session.write(report);
+        }
+    }
+
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.forwarding {
             if event.dragging() {
@@ -705,10 +780,8 @@ impl TerminalPane {
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        if let (Some(session), Some(cell)) = (&self.session, self.cell_at(event.position)) {
-            session.update_selection(cell);
-            cx.notify();
-        }
+        self.select_drag(event.position);
+        cx.notify();
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -719,6 +792,11 @@ impl TerminalPane {
             return;
         }
         self.selecting = false;
+    }
+
+    fn right_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        cx.emit(PaneEvent::Focused);
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -792,6 +870,11 @@ impl TerminalPane {
 
     /// One blink step; the window's cursor timer calls it on the focused pane only.
     pub fn blink(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // A steady cursor (DECSCUSR even, e.g. vim) stays drawn: no blink effect.
+        if !self.frame.cursor_blinking {
+            self.show_cursor(cx);
+            return;
+        }
         let active = self.focus_handle.is_focused(window) && window.is_window_active();
         let typing = self.last_input.elapsed() < BLINK_INTERVAL;
         self.cursor.update(cx, |cursor, cx| {
@@ -818,16 +901,17 @@ impl TerminalPane {
             Status::Failed(message) => Some(format!("{message} — press any key to close").into()),
             Status::Exited(status) => {
                 let how = match status {
-                    Some(status) if status.code().is_some() => {
-                        format!("exited with status {}", status.code().unwrap_or_default())
-                    }
                     Some(status) => {
-                        use std::os::unix::process::ExitStatusExt;
-                        format!("killed by signal {}", status.signal().unwrap_or_default())
+                        if let Some(code) = status.code() {
+                            format!("exited {code}")
+                        } else {
+                            use std::os::unix::process::ExitStatusExt;
+                            format!("killed: {}", signame(status.signal().unwrap_or_default()))
+                        }
                     }
                     None => "ended".to_owned(),
                 };
-                Some(format!("Process {how} — press any key to close").into())
+                Some(format!("{how} — press any key to close").into())
             }
         }
     }
@@ -839,15 +923,23 @@ impl Render for TerminalPane {
         let banner = self.banner().map(|text| {
             div()
                 .absolute()
-                .bottom_3()
-                .left_3()
-                .right_3()
+                .top_0()
+                .left_0()
+                .right_0()
                 .px_3()
                 .py_2()
-                .rounded_md()
                 .bg(theme.banner_bg)
                 .text_color(theme.sidebar_text)
                 .text_sm()
+                .truncate()
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                        cx.emit(PaneEvent::Closed);
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(text)
         });
         div()
@@ -863,6 +955,7 @@ impl Render for TerminalPane {
             .on_action(cx.listener(Self::clear_scrollback))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::right_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -871,6 +964,45 @@ impl Render for TerminalPane {
             .child(TerminalElement::new(cx.entity()))
             .children(banner)
     }
+}
+
+/// A signal number as its name; unknown numbers stay numeric.
+fn signame(signal: i32) -> String {
+    match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGEMT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGBUS",
+        11 => "SIGSEGV",
+        12 => "SIGSYS",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        16 => "SIGURG",
+        17 => "SIGSTOP",
+        18 => "SIGTSTP",
+        19 => "SIGCONT",
+        20 => "SIGCHLD",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
+        23 => "SIGIO",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        26 => "SIGVTALRM",
+        27 => "SIGPROF",
+        28 => "SIGWINCH",
+        29 => "SIGINFO",
+        30 => "SIGUSR1",
+        31 => "SIGUSR2",
+        n => return format!("SIG{n}"),
+    }
+    .to_owned()
 }
 
 fn dir_name(dir: &std::path::Path) -> String {
@@ -1029,5 +1161,34 @@ impl InputHandler for TerminalInput {
 
     fn apple_press_and_hold_enabled(&mut self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signame_should_name_signals_and_number_the_rest() {
+        assert_eq!(signame(1), "SIGHUP");
+        assert_eq!(signame(9), "SIGKILL");
+        assert_eq!(signame(15), "SIGTERM");
+        assert_eq!(signame(16), "SIGURG");
+        assert_eq!(signame(17), "SIGSTOP");
+        assert_eq!(signame(18), "SIGTSTP");
+        assert_eq!(signame(19), "SIGCONT");
+        assert_eq!(signame(20), "SIGCHLD");
+        assert_eq!(signame(21), "SIGTTIN");
+        assert_eq!(signame(22), "SIGTTOU");
+        assert_eq!(signame(23), "SIGIO");
+        assert_eq!(signame(24), "SIGXCPU");
+        assert_eq!(signame(25), "SIGXFSZ");
+        assert_eq!(signame(26), "SIGVTALRM");
+        assert_eq!(signame(27), "SIGPROF");
+        assert_eq!(signame(28), "SIGWINCH");
+        assert_eq!(signame(29), "SIGINFO");
+        assert_eq!(signame(30), "SIGUSR1");
+        assert_eq!(signame(31), "SIGUSR2");
+        assert_eq!(signame(99), "SIG99");
     }
 }

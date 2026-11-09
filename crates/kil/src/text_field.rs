@@ -3,11 +3,12 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
-    div, fill, point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, Subscription, TextRun,
+    UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative,
+    size,
 };
 
 use crate::theme::Theme;
@@ -15,7 +16,22 @@ use crate::theme::Theme;
 actions!(
     text_field,
     [
-        Backspace, Delete, Left, Right, Home, End, SelectAll, Paste, Confirm, Cancel
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Home,
+        End,
+        SelectLeft,
+        SelectRight,
+        SelectHome,
+        SelectEnd,
+        SelectAll,
+        Copy,
+        Cut,
+        Paste,
+        Confirm,
+        Cancel
     ]
 );
 
@@ -31,7 +47,15 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-left", Home, cx),
         KeyBinding::new("end", End, cx),
         KeyBinding::new("cmd-right", End, cx),
+        KeyBinding::new("shift-left", SelectLeft, cx),
+        KeyBinding::new("shift-right", SelectRight, cx),
+        KeyBinding::new("shift-home", SelectHome, cx),
+        KeyBinding::new("shift-end", SelectEnd, cx),
+        KeyBinding::new("shift-cmd-left", SelectHome, cx),
+        KeyBinding::new("shift-cmd-right", SelectEnd, cx),
         KeyBinding::new("cmd-a", SelectAll, cx),
+        KeyBinding::new("cmd-c", Copy, cx),
+        KeyBinding::new("cmd-x", Cut, cx),
         KeyBinding::new("cmd-v", Paste, cx),
         KeyBinding::new("enter", Confirm, cx),
         KeyBinding::new("escape", Cancel, cx),
@@ -52,8 +76,10 @@ pub enum FieldEvent {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Buffer {
     text: String,
-    /// Empty means a caret.
+    /// Empty means a caret. Always ordered; [`Self::anchor`] says which end is fixed.
     selection: Range<usize>,
+    /// The end shift-select and mouse-drag extend from. `None` when collapsed.
+    anchor: Option<usize>,
     /// IME preedit.
     marked: Option<Range<usize>>,
 }
@@ -64,12 +90,18 @@ impl Buffer {
         Self {
             text: text.to_owned(),
             selection: 0..text.len(),
+            anchor: None,
             marked: None,
         }
     }
 
+    /// Where the next typed char lands: the free end of the selection.
     fn caret(&self) -> usize {
-        self.selection.end
+        match self.anchor {
+            Some(fixed) if fixed == self.selection.start => self.selection.end,
+            Some(_) => self.selection.start,
+            None => self.selection.end,
+        }
     }
 
     fn prev(&self, offset: usize) -> usize {
@@ -88,6 +120,38 @@ impl Buffer {
 
     fn move_to(&mut self, offset: usize) {
         self.selection = offset..offset;
+        self.anchor = None;
+    }
+
+    /// Moves the caret to `offset`, selecting from the anchor (shift-select, mouse-drag).
+    /// From a caret the anchor is the caret; from a selection made without one (select-all)
+    /// it is the selection's start.
+    fn shift_to(&mut self, offset: usize) {
+        let anchor = self.anchor.unwrap_or(self.selection.start);
+        self.anchor = (anchor != offset).then_some(anchor);
+        self.selection = anchor.min(offset)..anchor.max(offset);
+    }
+
+    /// Selects the word (letters, digits, `_`) at `offset`; elsewhere just a caret.
+    fn select_word(&mut self, offset: usize) {
+        let word = |ch: char| ch.is_alphanumeric() || ch == '_';
+        let at = |text: &str, index: usize| text[index..].chars().next().is_some_and(word);
+        let on_word = (offset < self.text.len() && at(&self.text, offset))
+            || (offset > 0 && at(&self.text, self.prev(offset)));
+        if !on_word {
+            self.move_to(offset);
+            return;
+        }
+        let mut start = offset;
+        while start > 0 && at(&self.text, self.prev(start)) {
+            start = self.prev(start);
+        }
+        let mut end = offset;
+        while end < self.text.len() && at(&self.text, end) {
+            end = self.next(end);
+        }
+        self.anchor = Some(start);
+        self.selection = start..end;
     }
 
     fn left(&mut self) {
@@ -140,6 +204,7 @@ impl Buffer {
             .unwrap_or_else(|| self.selection.clone());
         self.text.replace_range(range.clone(), new);
         let start = range.start;
+        self.anchor = None;
         self.marked = (!new.is_empty()).then(|| start..start + new.len());
         self.selection = selected.map_or(start + new.len()..start + new.len(), |sel| {
             start + sel.start..start + sel.end
@@ -194,6 +259,8 @@ pub struct TextField {
     /// Text as last confirmed (or set); Escape returns to it.
     confirmed: String,
     layout: Option<Layout>,
+    /// A left-drag extends the selection until the button comes up.
+    dragging: bool,
     _blur: Subscription,
 }
 
@@ -215,6 +282,7 @@ impl TextField {
             buffer: Buffer::new(text),
             confirmed: text.to_owned(),
             layout: None,
+            dragging: false,
             _blur: blur,
         }
     }
@@ -232,7 +300,11 @@ impl TextField {
     }
 
     fn blurred(&mut self, cx: &mut Context<Self>) {
-        self.buffer.marked = None;
+        // A blur cancels the composition (macOS): the preedit goes, typed text stays.
+        if let Some(marked) = self.buffer.marked.take() {
+            self.buffer.text.replace_range(marked.clone(), "");
+            self.buffer.move_to(marked.start);
+        }
         if self.buffer.text == self.confirmed {
             cx.emit(FieldEvent::Dismissed);
         } else {
@@ -252,6 +324,25 @@ impl TextField {
         cx.notify();
     }
 
+    /// The selected text, if any.
+    fn selected_text(&self) -> Option<String> {
+        (!self.buffer.selection.is_empty())
+            .then(|| self.buffer.text[self.buffer.selection.clone()].to_owned())
+    }
+
+    fn copy(&mut self, _: &Copy, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn cut(&mut self, _: &Cut, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.edit(cx, |buffer| buffer.replace(None, ""));
+        }
+    }
+
     fn paste(&mut self, _: &Paste, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let line = text.replace(['\r', '\n'], " ");
@@ -259,15 +350,40 @@ impl TextField {
         }
     }
 
+    /// The byte offset under `position`, for clicks and drags.
+    fn offset_at(&self, position: Point<Pixels>) -> Option<usize> {
+        self.layout.as_ref().map(|layout| {
+            let x = position.x - layout.bounds.left() + layout.scroll;
+            layout.line.closest_index_for_x(x)
+        })
+    }
+
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Keep the click from reaching the row or window beneath.
         cx.stop_propagation();
         window.focus(&self.focus_handle);
-        if let Some(layout) = &self.layout {
-            let x = event.position.x - layout.bounds.left() + layout.scroll;
-            let offset = layout.line.closest_index_for_x(x);
+        let Some(offset) = self.offset_at(event.position) else {
+            return;
+        };
+        if event.click_count >= 2 {
+            self.dragging = false;
+            self.edit(cx, |buffer| buffer.select_word(offset));
+        } else {
+            self.dragging = true;
             self.edit(cx, |buffer| buffer.move_to(offset));
         }
+    }
+
+    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.dragging
+            && let Some(offset) = self.offset_at(event.position)
+        {
+            self.edit(cx, |buffer| buffer.shift_to(offset));
+        }
+    }
+
+    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.dragging = false;
     }
 }
 
@@ -287,13 +403,37 @@ impl Render for TextField {
             .on_action(cx.listener(|this, _: &End, _, cx| {
                 this.edit(cx, |b| b.move_to(b.text.len()));
             }))
-            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
-                this.edit(cx, |b| b.selection = 0..b.text.len());
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
+                this.edit(cx, |b| {
+                    let to = b.prev(b.caret());
+                    b.shift_to(to);
+                });
             }))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| {
+                this.edit(cx, |b| {
+                    let to = b.next(b.caret());
+                    b.shift_to(to);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &SelectHome, _, cx| this.edit(cx, |b| b.shift_to(0))))
+            .on_action(cx.listener(|this, _: &SelectEnd, _, cx| {
+                this.edit(cx, |b| b.shift_to(b.text.len()));
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+                this.edit(cx, |b| {
+                    b.anchor = Some(0);
+                    b.selection = 0..b.text.len();
+                });
+            }))
+            .on_action(cx.listener(|this, action, _, cx| this.copy(action, cx)))
+            .on_action(cx.listener(|this, action, _, cx| this.cut(action, cx)))
             .on_action(cx.listener(|this, action, _, cx| this.paste(action, cx)))
             .on_action(cx.listener(|this, action, _, cx| this.confirm(action, cx)))
             .on_action(cx.listener(|this, action, _, cx| this.cancel(action, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .child(FieldElement { field: cx.entity() })
     }
 }
@@ -608,11 +748,63 @@ mod tests {
     }
 
     #[test]
+    fn bindings_should_parse_every_editing_key() {
+        // `KeyBinding::new` panics on a bad keystroke, so building is the check.
+        assert!(bindings().len() >= 18);
+    }
+
+    #[test]
+    fn shift_moves_should_extend_from_the_anchor_then_collapse_back() {
+        let mut buffer = caret_at("shell", 5);
+        buffer.shift_to(buffer.prev(buffer.caret()));
+        buffer.shift_to(buffer.prev(buffer.caret()));
+        assert_eq!((buffer.selection.clone(), buffer.caret()), (3..5, 3));
+        buffer.shift_to(buffer.next(buffer.caret()));
+        buffer.shift_to(buffer.next(buffer.caret()));
+        assert_eq!((buffer.selection.clone(), buffer.caret()), (5..5, 5));
+        buffer.left();
+        assert_eq!(buffer.caret(), 4);
+    }
+
+    #[test]
+    fn shift_moves_should_shrink_a_selection_from_its_free_end() {
+        let mut buffer = Buffer::new("shell");
+        let to = buffer.prev(buffer.caret());
+        buffer.shift_to(to);
+        assert_eq!(buffer.selection, 0..4);
+    }
+
+    #[test]
+    fn double_click_should_select_the_word_when_on_one() {
+        let mut buffer = caret_at("foo bar-baz", 5);
+        buffer.select_word(5);
+        assert_eq!(&buffer.text[buffer.selection.clone()], "bar");
+        let mut buffer = caret_at("a  b", 2);
+        buffer.select_word(2);
+        assert_eq!(buffer.selection, 2..2);
+    }
+
+    #[test]
     fn preedit_should_be_marked_then_committed() {
         let mut buffer = caret_at("x", 1);
         buffer.mark(None, "zhong", None);
         assert_eq!(buffer.marked, Some(1..6));
         buffer.replace(None, "中");
         assert_eq!((buffer.text.as_str(), buffer.marked), ("x中", None));
+    }
+
+    #[gpui::test]
+    fn blur_should_revert_preedit_when_marked(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::default()));
+        let (field, cx) = cx.add_window_view(|window, cx| TextField::new("ab", window, cx));
+        field.update(cx, |field, cx| {
+            field.buffer.move_to(2);
+            field.buffer.replace(None, "c");
+            field.buffer.mark(None, "zhong", None);
+            assert_eq!(field.buffer.text, "abczhong");
+            field.blurred(cx);
+            assert_eq!(field.buffer.text, "abc");
+            assert_eq!(field.buffer.marked, None);
+        });
     }
 }

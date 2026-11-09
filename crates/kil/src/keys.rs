@@ -63,7 +63,11 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
 pub fn paste_clipboard(text: Option<&str>, bracketed: bool) -> Option<Vec<u8>> {
     match text {
         Some(text) => Some(paste(text, bracketed)),
-        None => bracketed.then(|| paste("", true)),
+        None if bracketed => Some(paste("", true)),
+        None => {
+            log::debug!("ignoring an image paste: the program didn't ask for bracketed paste");
+            None
+        }
     }
 }
 
@@ -205,6 +209,14 @@ fn named_key(key: &str, pressed: Mods, mode: InputMode) -> Option<Cow<'static, [
         "f10" => tilde_key(21, pressed),
         "f11" => tilde_key(23, pressed),
         "f12" => tilde_key(24, pressed),
+        "f13" => tilde_key(25, pressed),
+        "f14" => tilde_key(26, pressed),
+        "f15" => tilde_key(28, pressed),
+        "f16" => tilde_key(29, pressed),
+        "f17" => tilde_key(31, pressed),
+        "f18" => tilde_key(32, pressed),
+        "f19" => tilde_key(33, pressed),
+        "f20" => tilde_key(34, pressed),
         _ => return None,
     };
     Some(bytes)
@@ -415,6 +427,27 @@ mod tests {
     #[test]
     fn encode_should_send_tilde_sequence_with_modifier_for_shift_f5() {
         assert_eq!(bytes("shift-f5", normal()), Some(b"\x1b[15;2~".to_vec()));
+    }
+
+    #[test]
+    fn encode_should_send_xterm_tilde_sequences_for_f13_to_f20() {
+        for (key, number) in [
+            ("f13", 25),
+            ("f14", 26),
+            ("f15", 28),
+            ("f16", 29),
+            ("f17", 31),
+            ("f18", 32),
+            ("f19", 33),
+            ("f20", 34),
+        ] {
+            assert_eq!(
+                bytes(key, normal()),
+                Some(format!("\x1b[{number}~").into_bytes()),
+                "{key}"
+            );
+        }
+        assert_eq!(bytes("shift-f13", normal()), Some(b"\x1b[25;2~".to_vec()));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! action (DESIGN.md §4.6, §4.7, §7, §8).
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
@@ -13,14 +14,15 @@ use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, AnyWindowHandle, App, ClickEvent, Context,
     CursorStyle, Div, DragMoveEvent, ElementId, Entity, EntityId, FocusHandle, Focusable,
     FontWeight, Hsla, KeyContext, KeyDownEvent, KeybindingKeystroke, MouseButton, MouseDownEvent,
-    Pixels, Point, PromptLevel, SharedString, Stateful, StyleRefinement, Subscription, Task,
-    WeakEntity, Window, actions, anchored, deferred, div, prelude::*, px, relative,
+    Pixels, Point, PromptLevel, ScrollHandle, SharedString, Stateful, StyleRefinement,
+    Subscription, Task, WeakEntity, Window, actions, anchored, deferred, div, prelude::*, px,
+    relative,
 };
 use kil_term::Client;
 
 use crate::{
     config, keymap,
-    motion::{self, Ease, Tween},
+    motion::{self, Ease, Motion, Tween},
     notify,
     pane_tree::{Axis, Close, Direction, Node, PaneTree, Split, SplitId},
     restore::{self, PaneIds, Restored, SavedPane, SavedTab, SavedWindow, SavedWorkspace, Store},
@@ -28,7 +30,7 @@ use crate::{
     terminal_element::cells,
     terminal_pane::{BLINK_INTERVAL, Launch, PaneEvent, TerminalPane},
     text_field::{FieldEvent, TextField},
-    theme::Theme,
+    theme::{Theme, on_accent},
 };
 
 actions!(
@@ -391,6 +393,11 @@ pub struct Workspace {
     /// Font size from the config file, for `font_reset`.
     base_font_size: f32,
     sidebar: Entity<Sidebar>,
+    /// Scroll state of the tab list, so the active row can be brought into view.
+    tabs_scroll: ScrollHandle,
+    /// The active row the list last scrolled to; `Cell` because the scroll is requested
+    /// while rendering the sidebar.
+    scrolled_active: Cell<usize>,
     /// The window's one cursor-blink timer; see [`Self::sync_blink`].
     blink: Option<Task<()>>,
     /// The pane it last blinked, so a pane that loses focus is left with its cursor drawn.
@@ -446,6 +453,7 @@ impl Workspace {
             renders: 0,
             _workspace_changed: cx.observe(&workspace, |_, _, cx| cx.notify()),
         });
+        let tabs_scroll = ScrollHandle::new();
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             tabs: Vec::new(),
@@ -471,6 +479,8 @@ impl Workspace {
             window_title: SharedString::default(),
             base_font_size: f32::from(cx.global::<Settings>().font_size),
             sidebar,
+            tabs_scroll,
+            scrolled_active: Cell::new(0),
             blink: None,
             blinking: None,
             memory_task: None,
@@ -1481,6 +1491,28 @@ impl Workspace {
         }
     }
 
+    /// The active row's child index in the tab list: past the leading ghosts and the
+    /// rows (with their ghosts) above it. Mirrors [`Self::render_sidebar`].
+    fn active_child_index(&self) -> usize {
+        let mut index = self
+            .ghosts
+            .iter()
+            .filter(|ghost| ghost.after.is_none())
+            .count();
+        for (position, tab) in self.tabs.iter().enumerate() {
+            if position == self.active {
+                break;
+            }
+            index += 1;
+            index += self
+                .ghosts
+                .iter()
+                .filter(|ghost| ghost.after == Some(tab.id))
+                .count();
+        }
+        index
+    }
+
     /// What [`Sidebar`] draws.
     fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
@@ -1489,11 +1521,17 @@ impl Workspace {
             window.request_animation_frame();
         }
         let chrome = Chrome::of(cx.global::<Theme>());
+        // The active row stays in view: with 15+ tabs, ⌘1-9 selects below the fold.
+        // Minimal reveal in this frame; unknown layout stays pending for the next.
+        if self.scrolled_active.get() != self.active && !self.tabs.is_empty() {
+            self.scrolled_active.set(self.active);
+            self.tabs_scroll.scroll_to_item(self.active_child_index());
+        }
         let mut rows: Vec<AnyElement> = self
             .ghosts
             .iter()
             .filter(|ghost| ghost.after.is_none())
-            .map(|ghost| render_ghost(ghost, chrome))
+            .map(|ghost| render_ghost(ghost, chrome, cx))
             .collect();
         for (index, tab) in self.tabs.iter().enumerate() {
             rows.push(self.render_row(index, tab, now, chrome, cx));
@@ -1501,7 +1539,7 @@ impl Workspace {
                 self.ghosts
                     .iter()
                     .filter(|ghost| ghost.after == Some(tab.id))
-                    .map(|ghost| render_ghost(ghost, chrome)),
+                    .map(|ghost| render_ghost(ghost, chrome, cx)),
             );
         }
         div()
@@ -1531,6 +1569,7 @@ impl Workspace {
                     .id("tabs")
                     .flex_1()
                     .overflow_y_scroll()
+                    .track_scroll(&self.tabs_scroll)
                     .px(px(ROWS_INSET))
                     .flex()
                     .flex_col()
@@ -1600,12 +1639,13 @@ impl Workspace {
                         .size_full()
                         .rounded_lg()
                         .border_1()
-                        .border_color(chrome.hover)
+                        .border_color(chrome.accent.opacity(0.5))
                         .bg(chrome.hover),
                 )
                 .into_any_element();
         }
-        row.px_3()
+        let row = row
+            .px_3()
             .flex()
             .flex_col()
             .justify_center()
@@ -1645,13 +1685,8 @@ impl Workspace {
                     })
                     .child(tab_close(id, chrome, cx)),
             )
-            .child(row_cwd(info.cwd, chrome).relative())
-            .with_animation(
-                ElementId::NamedInteger("tab-in".into(), id.0),
-                Animation::new(motion::ROW_IN).with_easing(|t| Ease::OutQuint.apply(t)),
-                |row, t| row.h(px(ROW_HEIGHT * t)).opacity(t),
-            )
-            .into_any_element()
+            .child(row_cwd(info.cwd, chrome).relative());
+        animate_row_in(row, id)
     }
 }
 
@@ -1679,7 +1714,7 @@ impl Workspace {
                 .items_center()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|style| style.bg(chrome.accent))
+                .hover(|style| style.bg(chrome.accent).text_color(on_accent()))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.close_menu(window, cx);
                     run(this, id, window, cx);
@@ -1702,6 +1737,8 @@ impl Workspace {
             .text_size(px(13.))
             .text_color(chrome.text)
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                // Like a native menu: the dismissing click goes no further.
+                cx.stop_propagation();
                 this.close_menu(window, cx);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1846,26 +1883,40 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
     let focused = *pane == tab.focused;
     let several = matches!(tab.tree.root(), Node::Split(_));
     let dim = several.then(|| {
+        let base = div().absolute().inset_0().bg(chrome.dim);
+        if !Motion::enabled() {
+            return if focused {
+                base.opacity(0.).into_any_element()
+            } else {
+                base.opacity(1.).into_any_element()
+            };
+        }
         let name = if focused { "focus-in" } else { "focus-out" };
-        div().absolute().inset_0().bg(chrome.dim).with_animation(
+        base.with_animation(
             ElementId::NamedInteger(name.into(), pane.entity_id().as_u64()),
             Animation::new(motion::FOCUS_DIM),
             move |overlay, t| overlay.opacity(if focused { 1. - t } else { t }),
         )
+        .into_any_element()
     });
     // Inset the hairline so dividers painted above the panes cannot cover it.
     let ring = (several && focused).then(|| {
-        div()
+        let base = div()
             .absolute()
             .inset(px(1.))
             .border_1()
             .border_color(chrome.accent.opacity(0.75))
-            .debug_selector(|| "focus-ring".to_owned())
-            .with_animation(
+            .debug_selector(|| "focus-ring".to_owned());
+        if Motion::enabled() {
+            base.with_animation(
                 ElementId::NamedInteger("focus-ring".into(), pane.entity_id().as_u64()),
                 Animation::new(motion::FOCUS_DIM),
                 gpui::Styled::opacity,
             )
+            .into_any_element()
+        } else {
+            base.into_any_element()
+        }
     });
     div()
         .relative()
@@ -2013,7 +2064,7 @@ fn split_buttons(chrome: Chrome, cx: &mut Context<Workspace>) -> impl IntoElemen
         .child(button(Axis::Vertical))
 }
 
-/// The 1px line plus a 7px grab area. Drawn last so the grab area sits above both panes.
+/// The 1px line plus a 6px grab area. Drawn last so the grab area sits above both panes.
 /// Dragging it moves the divider; double-clicking it shares the tab equally again.
 fn divider(
     drag: DividerDrag,
@@ -2033,13 +2084,13 @@ fn divider(
                 el.top_0()
                     .bottom_0()
                     .left(px(-3.))
-                    .w(px(7.))
+                    .w(px(6.))
                     .cursor(CursorStyle::ResizeLeftRight)
             } else {
                 el.left_0()
                     .right_0()
                     .top(px(-3.))
-                    .h(px(7.))
+                    .h(px(6.))
                     .cursor(CursorStyle::ResizeUpDown)
             }
         })
@@ -2248,7 +2299,7 @@ fn ratio_label(used: u64, total: u64) -> String {
 ///
 /// Nothing is shown while there is nothing to say: a quiet sidebar is the point.
 fn memory_footer(memory: MemoryState, chrome: Chrome) -> Div {
-    let mut row = div().mx_2().flex().gap_2().text_size(px(11.));
+    let mut row = div().mx_2().mb_1().flex().gap_2().text_size(px(11.));
     let mut shown = false;
     if let Some((label, _)) = shown_memory(memory.total) {
         row = row.child(
@@ -2265,8 +2316,10 @@ fn memory_footer(memory: MemoryState, chrome: Chrome) -> Div {
         )));
         shown = true;
     }
-    if shown {
-        row = row.mb_1();
+    if !shown {
+        // An invisible line keeps the row's height while quiet, so the New Tab button
+        // below never moves.
+        row = row.child(div().text_color(chrome.muted.opacity(0.)).child("X"));
     }
     row
 }
@@ -2307,8 +2360,10 @@ fn new_tab_button(
         .text_color(chrome.muted)
         .cursor_pointer()
         .hover(|style| style.bg(chrome.hover).text_color(chrome.text))
-        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-            this.new_tab(&NewTab, window, cx);
+        .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+            if event.click_count() == 1 {
+                this.new_tab(&NewTab, window, cx);
+            }
         }))
         .child(plus_mark(chrome))
         .child(div().flex_1().child("New Tab"))
@@ -2405,8 +2460,43 @@ fn row_cwd(cwd: SharedString, chrome: Chrome) -> Div {
         .child(cwd)
 }
 
-fn render_ghost(ghost: &Ghost, chrome: Chrome) -> AnyElement {
-    div()
+/// A new row, grown in unless motion is off (then at full height at once).
+fn animate_row_in(row: Stateful<Div>, id: TabId) -> AnyElement {
+    if Motion::enabled() {
+        row.with_animation(
+            ElementId::NamedInteger("tab-in".into(), id.0),
+            Animation::new(motion::ROW_IN).with_easing(|t| Ease::OutQuint.apply(t)),
+            |row, t| row.h(px(ROW_HEIGHT * t)).opacity(t),
+        )
+        .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
+/// The active tab's content, faded in unless motion is off.
+fn animate_tab_show(base: Div, id: TabId) -> AnyElement {
+    if Motion::enabled() {
+        base.with_animation(
+            ElementId::NamedInteger("tab-show".into(), id.0),
+            Animation::new(motion::TAB_SWITCH).with_easing(|t| Ease::OutQuint.apply(t)),
+            |el, t| el.opacity(t).top(px(6. * (1. - t))),
+        )
+        .into_any_element()
+    } else {
+        base.into_any_element()
+    }
+}
+
+fn render_ghost(ghost: &Ghost, chrome: Chrome, cx: &mut Context<Workspace>) -> AnyElement {
+    let row = div()
+        .id(ElementId::NamedInteger("tab-ghost".into(), ghost.id.0))
+        // A closing row swallows clicks: without this, the second click of a double-click
+        // on its × falls through to the list and opens a new tab.
+        .occlude()
+        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+        }))
         .flex_none()
         .h(px(ROW_HEIGHT))
         .px_3()
@@ -2422,13 +2512,17 @@ fn render_ghost(ghost: &Ghost, chrome: Chrome) -> AnyElement {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(chrome.muted)
                 .child(ghost.title.clone()),
-        )
-        .with_animation(
+        );
+    if Motion::enabled() {
+        row.with_animation(
             ElementId::NamedInteger("tab-out".into(), ghost.id.0),
             Animation::new(motion::ROW_OUT).with_easing(|t| Ease::InOut.apply(t)),
             |row, t| row.h(px(ROW_HEIGHT * (1. - t))).opacity(1. - t),
         )
         .into_any_element()
+    } else {
+        row.h(px(0.)).opacity(0.).into_any_element()
+    }
 }
 
 impl Focusable for Workspace {
@@ -2515,28 +2609,38 @@ impl Render for Workspace {
 
         let chrome = Chrome::of(cx.global::<Theme>());
         let content = self.tabs.get(self.active).map(|tab| {
-            div()
-                .relative()
-                .size_full()
-                .child(render_node(tab.tree.root(), tab, now, chrome, cx))
-                .with_animation(
-                    ElementId::NamedInteger("tab-show".into(), tab.id.0),
-                    Animation::new(motion::TAB_SWITCH).with_easing(|t| Ease::OutQuint.apply(t)),
-                    |el, t| el.opacity(t).top(px(6. * (1. - t))),
-                )
+            let base = div().relative().size_full().child(render_node(
+                tab.tree.root(),
+                tab,
+                now,
+                chrome,
+                cx,
+            ));
+            animate_tab_show(base, tab.id)
         });
         let notices = (!self.notices.is_empty()).then(|| {
+            // Wide enough for a sentence, but never over the sidebar in a narrow window.
+            let room = window.viewport_size().width - px(SIDEBAR_WIDTH + 24.);
+            let max_notice = if room < px(0.) {
+                px(0.)
+            } else if room < px(460.) {
+                room
+            } else {
+                px(460.)
+            };
             div()
                 .id("notices")
                 .absolute()
                 .top(px(SPLIT_BUTTONS_HEIGHT + 16.))
                 .right_3()
-                .max_w(px(460.))
+                .max_w(max_notice)
                 .flex()
                 .flex_col()
                 .gap_2()
                 .cursor_pointer()
+                .occlude()
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
                     this.notices.clear();
                     cx.notify();
                 }))
@@ -3792,5 +3896,257 @@ mod tests {
         click(cx, ROW, MouseButton::Right, 1);
         cx.simulate_keystrokes("escape");
         assert!(workspace.read_with(cx, |this, _| this.menu.is_none()));
+    }
+
+    fn cell_center(
+        pane: &Entity<TerminalPane>,
+        cx: &mut VisualTestContext,
+        row: usize,
+        col: usize,
+    ) -> Point<Pixels> {
+        pane.read_with(cx, |pane, _| {
+            let geometry = pane.geometry.expect("laid out");
+            point(
+                geometry.origin.x + geometry.cell.width * col + geometry.cell.width * 0.5,
+                geometry.origin.y + geometry.cell.height * row + geometry.cell.height * 0.5,
+            )
+        })
+    }
+
+    fn wait_for_row(cx: &mut VisualTestContext, pane: &Entity<TerminalPane>, line: &str) -> usize {
+        wait_for_timeout(cx, 15, |cx| {
+            pane.read_with(cx, |pane, _| {
+                (0..pane.frame.rows).any(|row| pane.frame.row_text(row) == line)
+            })
+        });
+        pane.read_with(cx, |pane, _| {
+            (0..pane.frame.rows)
+                .find(|&row| pane.frame.row_text(row) == line)
+                .expect("echoed back")
+        })
+    }
+
+    #[gpui::test]
+    fn scroll_should_keep_bottom_tab_visible_when_selecting_below_fold(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        // Thirty rows overflow the ~22-row list; they share one pane, the rows only
+        // read its title.
+        workspace.update(cx, |this, cx| {
+            let pane = this.tabs[0].focused.clone();
+            for n in 1..30u64 {
+                this.tabs.push(Tab {
+                    id: TabId(n),
+                    tree: crate::pane_tree::PaneTree::new(pane.clone()),
+                    focused: pane.clone(),
+                    name: Some(format!("t{n}").into()),
+                    finished: false,
+                    animating: false,
+                    memory: 0,
+                    shift: crate::motion::Tween::settled(0.),
+                });
+            }
+            this.next_tab = 30;
+            cx.notify();
+        });
+        // Rows grow in over `ROW_IN`; scroll from full height.
+        std::thread::sleep(motion::ROW_IN + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        workspace.update_in(cx, |this, window, cx| this.activate(29, window, cx));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        workspace.read_with(cx, |this, _| {
+            let index = this.active_child_index();
+            assert_eq!(index, 29);
+            let item = this.tabs_scroll.bounds_for_item(index).expect("laid out");
+            let offset = this.tabs_scroll.offset();
+            let viewport = this.tabs_scroll.bounds();
+            let top = item.top() + offset.y;
+            let bottom = item.bottom() + offset.y;
+            assert!(top >= viewport.top(), "{top:?} above {viewport:?}");
+            assert!(bottom <= viewport.bottom(), "{bottom:?} below {viewport:?}");
+            assert!(
+                top > viewport.top() + px(1.),
+                "yanked to top: {top:?} in {viewport:?}"
+            );
+        });
+        // Ordinary renders don't rescroll.
+        let before = workspace.read_with(cx, |this, _| this.tabs_scroll.offset());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(
+            before,
+            workspace.read_with(cx, |this, _| this.tabs_scroll.offset())
+        );
+    }
+
+    #[gpui::test]
+    fn selection_should_extend_when_dragging_outside_pane(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        wait_for(cx, |cx| pane.read_with(cx, |pane, _| pane.pid().is_some()));
+        cx.simulate_input("echo hello-selection\n");
+        let row = wait_for_row(cx, &pane, "hello-selection");
+        let start = cell_center(&pane, cx, row, 1);
+        cx.simulate_event(MouseDownEvent {
+            position: start,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(pane.read_with(cx, |pane, _| pane.selecting));
+        assert_eq!(pane.read_with(cx, |pane, _| pane.selection_text()), None);
+        // Over the sidebar: outside the pane, inside the window. The pane's own
+        // move handler never fires there; only the window capture path extends.
+        // Re-sent until it lands: the one-frame capture listener may miss the
+        // first move under load.
+        let outside = point(px(100.), px(300.));
+        wait_for(cx, |cx| {
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: outside,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::none(),
+            });
+            pane.read_with(cx, |pane, _| pane.selection_text().is_some())
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane.selection_text())
+                .is_some(),
+            "capture drag extends the selection"
+        );
+        cx.simulate_event(MouseUpEvent {
+            position: outside,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+    }
+
+    #[gpui::test]
+    fn shift_click_should_extend_selection_when_anchor_exists(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        wait_for(cx, |cx| pane.read_with(cx, |pane, _| pane.pid().is_some()));
+        cx.simulate_input("echo hello-selection\n");
+        let row = wait_for_row(cx, &pane, "hello-selection");
+        let start = cell_center(&pane, cx, row, 1);
+        let end = cell_center(&pane, cx, row, 5);
+        cx.simulate_event(MouseDownEvent {
+            position: start,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: end,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::none(),
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: end,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        let before = pane.read_with(cx, |pane, _| pane.selection_text());
+        assert!(before.is_some(), "drag selects");
+        let before_len = before.map_or(0, |text| text.len());
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let further = cell_center(&pane, cx, row, 10);
+        cx.simulate_event(MouseDownEvent {
+            position: further,
+            button: MouseButton::Left,
+            modifiers: shift,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: further,
+            button: MouseButton::Left,
+            modifiers: shift,
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        let after = pane.read_with(cx, |pane, _| pane.selection_text());
+        assert!(after.is_some(), "shift-click keeps the selection");
+        assert!(
+            after.map_or(0, |text| text.len()) > before_len,
+            "shift-click extends from the anchor"
+        );
+    }
+
+    #[gpui::test]
+    fn right_click_should_focus_pane_when_in_split(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        cx.dispatch_action(SplitRight);
+        std::thread::sleep(motion::SPLIT + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let leaves: Vec<_> = workspace.read_with(cx, |this, _| {
+            this.tabs[0].tree.leaves().into_iter().cloned().collect()
+        });
+        assert_eq!(leaves.len(), 2);
+        assert!(workspace.read_with(cx, |this, _| this.tabs[0].focused == leaves[1]));
+        cx.simulate_event(MouseDownEvent {
+            position: point(px(SIDEBAR_WIDTH + 100.), px(300.)),
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: point(px(SIDEBAR_WIDTH + 100.), px(300.)),
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |this, _| this.tabs[0].focused == leaves[0]));
+        cx.update(|window, cx| assert!(leaves[0].focus_handle(cx).is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn forwarding_should_clear_when_window_blurs(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        wait_for(cx, |cx| pane.read_with(cx, |pane, _| pane.pid().is_some()));
+        cx.simulate_input("printf '\\033[?1002h\\033[?1006h'\n");
+        wait_for_timeout(cx, 15, |cx| {
+            pane.read_with(cx, |pane, _| {
+                pane.input_mode()
+                    .is_some_and(kil_term::InputMode::mouse_drag)
+            })
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane
+                .input_mode()
+                .is_some_and(kil_term::InputMode::mouse_drag)),
+            "1002 enabled"
+        );
+        let at = point(px(SIDEBAR_WIDTH + 200.), px(300.));
+        cx.simulate_event(MouseDownEvent {
+            position: at,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        assert!(pane.read_with(cx, |pane, _| pane.forwarding));
+        assert!(pane.read_with(cx, |pane, _| pane.forwarding_guarded));
+        cx.deactivate_window();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(!pane.read_with(cx, |pane, _| pane.forwarding));
     }
 }
