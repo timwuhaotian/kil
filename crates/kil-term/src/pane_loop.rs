@@ -1,6 +1,6 @@
 //! A session's I/O thread (DESIGN.md §3, §14.4): reads the PTY into the terminal, writes
 //! input, watches the child's exit, answers the program's queries, and forwards output to
-//! the client attached through the session server.
+//! the clients attached through the session server.
 //!
 //! Not alacritty's `EventLoop`: that reads before it takes the terminal lock, so an attach
 //! landing between a read and its parse would lose or repeat those bytes. Here one thread
@@ -36,17 +36,19 @@ use crate::{
     wire::{self, Frame, Inbox, OUTPUT_CHUNK},
 };
 
-/// Poller key of the attached client.
+/// Poller key of the attached clients. They share one key: on an event every
+/// client is polled (non-blocking), so it does not matter which one fired it.
 const CLIENT_TOKEN: usize = 2;
 /// Bytes parsed per terminal lock, so the UI's snapshots are not starved.
 const MAX_LOCKED_READ: usize = 64 << 10;
 /// Bytes read before the loop goes back to the poller, so input and commands keep flowing.
 const MAX_READ: usize = 1 << 20;
-/// With this much output waiting for the client, the PTY is not read: the program waits,
-/// as it would for any terminal that falls behind (DESIGN.md §14.4).
+/// A client with this much output waiting is dropped: it fell too far behind
+/// to catch up, and the program must never wait for a terminal (DESIGN.md
+/// §14.4). A dropped app reattaches with the full state.
 const CLIENT_HIGH_WATER: usize = 1 << 20;
 /// A client that takes nothing for this long while output waits is dropped, so a stopped
-/// or hung app never stalls the program for good. It reattaches with the full state.
+/// or hung app never stalls the program. It reattaches with the full state.
 const CLIENT_STALL: Duration = Duration::from_secs(2);
 /// A full-screen program attached to is made to redraw: shrunk by a row, then this much
 /// later restored (DESIGN.md §14.5).
@@ -125,7 +127,7 @@ pub(crate) fn spawn(
         writes: VecDeque::new(),
         writing: 0,
         interest: Event::readable(READ_WRITE_TOKEN),
-        client: None,
+        clients: Vec::new(),
         nudge: None,
         palette,
     };
@@ -149,7 +151,9 @@ struct PaneLoop {
     writing: usize,
     /// What the master is registered for.
     interest: Event,
-    client: Option<Client>,
+    /// Every attached client: the Kil window's mirror feed, a phone, a test.
+    /// Output is fanned out to all of them; input is taken from any.
+    clients: Vec<Client>,
     /// When to restore the size shrunk to make a full-screen program redraw.
     nudge: Option<(Instant, WindowSize)>,
     /// What color queries are answered from, after the program's own overrides.
@@ -204,7 +208,7 @@ impl PaneLoop {
                             closed = true;
                         }
                     }
-                    CLIENT_TOKEN => closed |= self.serve_client(event),
+                    CLIENT_TOKEN => closed |= self.serve_clients(event),
                     _ => {}
                 }
             }
@@ -222,11 +226,11 @@ impl PaneLoop {
             let _ = self.read(&mut buf);
             self.term.lock().exit();
             self.events.send_event(TermEvent::Wakeup);
-            if let Some(client) = &mut self.client {
+            for client in &mut self.clients {
                 client.queue(&Frame::Exited(status));
             }
         }
-        self.detach(true);
+        self.detach_all(true);
         let _ = self.pty.deregister(&self.poller);
         // Dropping the PTY hangs the session up and hands a live child to the reaper.
     }
@@ -236,10 +240,11 @@ impl PaneLoop {
         let sync = self.parser.sync_timeout().sync_timeout();
         let nudge = self.nudge.map(|(at, _)| at);
         let stall = self
-            .client
-            .as_ref()
+            .clients
+            .iter()
             .filter(|client| client.pending() > 0)
-            .map(|client| client.progress + CLIENT_STALL);
+            .map(|client| client.progress + CLIENT_STALL)
+            .min();
         [sync, nudge, stall]
             .into_iter()
             .flatten()
@@ -287,12 +292,9 @@ impl PaneLoop {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
         let mut total = 0;
         let mut synced = 0;
-        while total < MAX_READ
-            && self
-                .client
-                .as_ref()
-                .is_none_or(|client| client.pending() < CLIENT_HIGH_WATER)
-        {
+        // The PTY is always read: a client that falls behind is dropped
+        // (`update_interest`), never waited for.
+        while total < MAX_READ {
             let read = match self.pty.master().read(buf) {
                 // macOS reports a hung-up slave as EOF; the child's exit follows.
                 Ok(0) => break,
@@ -310,7 +312,7 @@ impl PaneLoop {
                 self.events.emit(SessionEvent::Notify(notification));
             }
             synced = self.parser.sync_bytes_count();
-            if let Some(client) = &mut self.client {
+            for client in &mut self.clients {
                 client.queue_output(bytes);
             }
             total += read;
@@ -358,23 +360,35 @@ impl PaneLoop {
     }
 
     fn update_interest(&mut self) {
-        let stalled = self.client.as_ref().is_some_and(|client| {
-            client.pending() > 0 && client.progress.elapsed() >= CLIENT_STALL
-        });
-        if stalled {
-            log::warn!("client took nothing for {CLIENT_STALL:?}; detaching it");
-            self.detach(false);
-        } else if let Some(client) = &mut self.client
-            && let Err(err) = client.watch(&self.poller)
-        {
-            log::warn!("client watch failed: {err}");
-            self.detach(false);
+        // A client that stopped taking output, or fell more than a megabyte
+        // behind, is dropped on its own: the others keep their session.
+        let mut i = 0;
+        while i < self.clients.len() {
+            let client = &self.clients[i];
+            let stalled = client.pending() > 0 && client.progress.elapsed() >= CLIENT_STALL;
+            let drowned = client.pending() > CLIENT_HIGH_WATER;
+            if stalled || drowned {
+                if stalled {
+                    log::warn!("client took nothing for {CLIENT_STALL:?}; detaching it");
+                } else {
+                    log::warn!("client fell past {CLIENT_HIGH_WATER} bytes; detaching it");
+                }
+                self.drop_client(i, false);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.clients.len() {
+            let result = self.clients[i].watch(&self.poller);
+            if let Err(err) = result {
+                log::warn!("client watch failed: {err}");
+                self.drop_client(i, false);
+            } else {
+                i += 1;
+            }
         }
         let mut interest = Event::readable(READ_WRITE_TOKEN);
-        interest.readable = self
-            .client
-            .as_ref()
-            .is_none_or(|client| client.pending() < CLIENT_HIGH_WATER);
         interest.writable = !self.writes.is_empty();
         if (interest.readable, interest.writable)
             != (self.interest.readable, self.interest.writable)
@@ -387,7 +401,6 @@ impl PaneLoop {
     }
 
     fn attach(&mut self, stream: UnixStream) -> io::Result<()> {
-        self.detach(false);
         stream.set_nonblocking(true)?;
         let (bytes, alt) = {
             let mut term = self.term.lock();
@@ -400,7 +413,7 @@ impl PaneLoop {
         let mut client = Client::new(stream);
         client.queue_output(&bytes);
         client.register(&self.poller)?;
-        self.client = Some(client);
+        self.clients.push(client);
         if alt {
             self.nudge_redraw();
         }
@@ -422,15 +435,22 @@ impl PaneLoop {
         self.nudge = Some((Instant::now() + REDRAW_NUDGE, size.into()));
     }
 
-    /// Reads the client's frames and writes what is queued for it; `true` if it asked to
-    /// close the session.
-    fn serve_client(&mut self, event: Event) -> bool {
-        let Some(client) = &mut self.client else {
-            return false;
-        };
+    /// Reads every client's frames and writes what is queued for each; `true`
+    /// if any of them asked to close the session. A client that went away is
+    /// dropped on its own.
+    fn serve_clients(&mut self, event: Event) -> bool {
         let mut frames = Vec::new();
-        let alive = (!event.readable || client.receive(&mut frames))
-            && (!event.writable || client.flush().is_ok());
+        let mut i = 0;
+        while i < self.clients.len() {
+            let client = &mut self.clients[i];
+            let alive = (!event.readable || client.receive(&mut frames))
+                && (!event.writable || client.flush().is_ok());
+            if alive {
+                i += 1;
+            } else {
+                self.drop_client(i, false);
+            }
+        }
         let mut close = false;
         for frame in frames {
             match frame {
@@ -440,9 +460,6 @@ impl PaneLoop {
                 Frame::Close => close = true,
                 other => log::warn!("unexpected frame from client: {other:?}"),
             }
-        }
-        if !alive {
-            self.detach(false);
         }
         close
     }
@@ -456,11 +473,19 @@ impl PaneLoop {
         self.pty.on_resize(size.into());
     }
 
-    /// Drops the client, after a last try at sending what is queued for it if `flush`.
-    fn detach(&mut self, flush: bool) {
-        let Some(mut client) = self.client.take() else {
-            return;
-        };
+    /// Drops every client, after a last try at sending what is queued for each
+    /// if `flush`.
+    fn detach_all(&mut self, flush: bool) {
+        while !self.clients.is_empty() {
+            let last = self.clients.len() - 1;
+            self.drop_client(last, flush);
+        }
+    }
+
+    /// Drops one client, after a last try at sending what is queued for it if
+    /// `flush`.
+    fn drop_client(&mut self, index: usize, flush: bool) {
+        let mut client = self.clients.remove(index);
         let _ = self.poller.delete(&client.stream);
         if flush {
             let _ = client.stream.set_nonblocking(false);
@@ -470,7 +495,7 @@ impl PaneLoop {
     }
 }
 
-/// The connection of the attached client.
+/// The connection of an attached client.
 struct Client {
     stream: UnixStream,
     inbox: Inbox,
@@ -521,7 +546,7 @@ impl Client {
     #[expect(
         unsafe_code,
         reason = "polling requires a source to outlive its registration: the stream lives in \
-                  `self`, and `PaneLoop::detach` deletes it before dropping it"
+                  `self`, and `PaneLoop::drop_client` deletes it before dropping it"
     )]
     fn register(&mut self, poller: &Poller) -> io::Result<()> {
         let mut interest = Event::readable(CLIENT_TOKEN);

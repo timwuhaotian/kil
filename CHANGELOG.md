@@ -4,6 +4,15 @@ Notable changes to Kil. The download is always the latest build
 ([`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)); the
 versions below are how we track releases, and match `Cargo.toml` and the app's Info.plist.
 
+## 0.0.31 — 2026-11-09
+
+- **A session can have several clients at once.** Attaching a second client (Agent on
+  Edge on the phone) used to evict the first (the Kil window), which then showed an
+  exit banner for a session that was still running. Output is now fanned out to every
+  attached client and input is taken from any; a client that stops reading or falls
+  more than a megabyte behind is dropped on its own, and the program never waits for
+  a terminal. No protocol change: old and new sides interoperate.
+
 ## 0.0.30 — 2026-11-09
 
 - **Agent on Edge in the Settings window.** Settings ▸ Agent on Edge now shows the pairing

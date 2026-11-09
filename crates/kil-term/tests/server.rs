@@ -35,6 +35,33 @@ fn attach(client: &Client, id: &str) -> Session {
 }
 
 #[test]
+fn a_second_attach_should_share_the_session_not_steal_it() {
+    // The Kil window and a phone hold the same session at once: output fans
+    // out to both, input from either reaches the program, and neither is
+    // evicted with an Ended.
+    let (_dir, client) = server("fanout");
+    drop(spawn(&client, "a-1", &sh("exec /bin/cat")));
+    let (tx, rx) = mpsc::channel();
+    let first = client
+        .attach("a-1", 1_000, move |event| {
+            let _ = tx.send(event);
+        })
+        .unwrap()
+        .unwrap();
+    let second = attach(&client, "a-1");
+    second.write(b"hello\n".as_slice());
+    assert!(wait_for_text(&first, "hello"));
+    assert!(wait_for_text(&second, "hello"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        rx.try_iter()
+            .all(|event| !matches!(event, SessionEvent::Ended | SessionEvent::ChildExited(_))),
+        "the first client must not see the session end"
+    );
+    client.stop_all().unwrap();
+}
+
+#[test]
 fn a_pane_sees_the_clients_term_program_version() {
     // The server stamps its own version, and a server started by an older Kil keeps
     // stamping that; the client stamps over it, so a program gating OSC 9 notifications
