@@ -4,7 +4,7 @@ Notable changes to Kil. The download is always the latest build
 ([`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)); the
 versions below are how we track releases, and match `Cargo.toml` and the app's Info.plist.
 
-## Unreleased
+## 0.0.33 — 2026-11-09
 
 - **A phone on a pane reads at a glance.** The tab's row in the sidebar is outlined in the
   theme's accent and carries a phone badge while Agent on Edge is attached; when the phone
