@@ -295,7 +295,14 @@ fn accept(stream: UnixStream, registry: &Arc<Registry>) {
 
 /// Serves requests until the connection closes or becomes a session's.
 fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<()> {
-    let Some(Frame::Hello { protocol }) = wire::receive(&mut stream)? else {
+    let mut frame = wire::receive(&mut stream)?;
+    // The bridge declares a phone's connection before the phone says hello itself.
+    let mut remote = false;
+    while frame == Some(Frame::Remote) {
+        remote = true;
+        frame = wire::receive(&mut stream)?;
+    }
+    let Some(Frame::Hello { protocol }) = frame else {
         return Ok(());
     };
     wire::send(&mut stream, &Frame::Hello { protocol: PROTOCOL })?;
@@ -311,6 +318,27 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
                 let ids = registry.lock().keys().cloned().collect();
                 wire::send(&mut stream, &Frame::Sessions(ids))?;
             }
+            Frame::Watchers => {
+                // The app holds one client per pane it shows; any extra is a watcher.
+                let watched = registry
+                    .lock()
+                    .iter()
+                    .filter(|(_, (_, session))| session.attached_clients() > 1)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                wire::send(&mut stream, &Frame::Watching(watched))?;
+            }
+            Frame::Controllers => {
+                let controlling = registry
+                    .lock()
+                    .iter()
+                    .filter(|(_, (_, session))| session.remote_active())
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                wire::send(&mut stream, &Frame::Controlling(controlling))?;
+            }
+            // A connection of its own may declare itself remote after its hello.
+            Frame::Remote => remote = true,
             Frame::StopAll => {
                 stop_all(registry);
                 wire::send(&mut stream, &Frame::Stopped)?;
@@ -338,7 +366,7 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
                 match Session::spawn(&config, ended) {
                     Ok(session) => {
                         wire::send(&mut stream, &Frame::Attached(session.identity()))?;
-                        session.attach(stream);
+                        session.attach(stream, remote);
                         sessions.insert(id, (generation, session));
                         return Ok(());
                     }
@@ -356,7 +384,7 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
                 let sessions = registry.lock();
                 if let Some((_, session)) = sessions.get(&id) {
                     wire::send(&mut stream, &Frame::Attached(session.identity()))?;
-                    session.attach(stream);
+                    session.attach(stream, remote);
                     return Ok(());
                 }
                 drop(sessions);

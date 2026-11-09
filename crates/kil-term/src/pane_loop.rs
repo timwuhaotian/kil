@@ -12,7 +12,8 @@ use std::{
     io::{self, ErrorKind, Read, Write},
     os::unix::net::UnixStream,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
@@ -30,7 +31,7 @@ use polling::{Event, Events, PollMode, Poller};
 use crate::{
     events::{EventProxy, SessionEvent},
     pty::{CHILD_EVENT_TOKEN, Pty, READ_WRITE_TOKEN},
-    session::GridSize,
+    session::{GridSize, RemoteState},
     snapshot::{Palette, Rgba},
     state,
     wire::{self, Frame, Inbox, OUTPUT_CHUNK},
@@ -59,8 +60,12 @@ const FLUSH_ON_EXIT: Duration = Duration::from_millis(200);
 pub(crate) enum Command {
     Input(Cow<'static, [u8]>),
     Resize(WindowSize),
-    /// Hand this connection the session: its state, then its output.
-    Attach(UnixStream),
+    /// Hand this connection the session: its state, then its output. `remote` marks it a
+    /// phone's, so its input reads as driving the session.
+    Attach {
+        stream: UnixStream,
+        remote: bool,
+    },
     /// Answer color queries from this palette.
     Palette(Palette),
     Shutdown,
@@ -115,6 +120,8 @@ pub(crate) fn spawn(
     events: EventProxy,
     pty: Pty,
     palette: Palette,
+    clients: Arc<AtomicUsize>,
+    remote: Arc<Mutex<RemoteState>>,
 ) -> io::Result<()> {
     let pane_loop = PaneLoop {
         poller: Arc::clone(&channel.sender.poller),
@@ -128,6 +135,8 @@ pub(crate) fn spawn(
         writing: 0,
         interest: Event::readable(READ_WRITE_TOKEN),
         clients: Vec::new(),
+        attached: clients,
+        remote,
         nudge: None,
         palette,
     };
@@ -154,6 +163,10 @@ struct PaneLoop {
     /// Every attached client: the Kil window's mirror feed, a phone, a test.
     /// Output is fanned out to all of them; input is taken from any.
     clients: Vec<Client>,
+    /// How many are attached, for the server's `Watching` reply.
+    attached: Arc<AtomicUsize>,
+    /// The phone's presence, for the server's `Controlling` reply.
+    remote: Arc<Mutex<RemoteState>>,
     /// When to restore the size shrunk to make a full-screen program redraw.
     nudge: Option<(Instant, WindowSize)>,
     /// What color queries are answered from, after the program's own overrides.
@@ -278,8 +291,8 @@ impl PaneLoop {
                 Ok(Command::Input(bytes)) => self.writes.push_back(bytes),
                 Ok(Command::Resize(size)) => self.pty.on_resize(size),
                 Ok(Command::Palette(palette)) => self.palette = palette,
-                Ok(Command::Attach(stream)) => {
-                    if let Err(err) = self.attach(stream) {
+                Ok(Command::Attach { stream, remote }) => {
+                    if let Err(err) = self.attach(stream, remote) {
                         log::warn!("attach failed: {err}");
                     }
                 }
@@ -400,7 +413,7 @@ impl PaneLoop {
         }
     }
 
-    fn attach(&mut self, stream: UnixStream) -> io::Result<()> {
+    fn attach(&mut self, stream: UnixStream, remote: bool) -> io::Result<()> {
         stream.set_nonblocking(true)?;
         let (bytes, alt) = {
             let mut term = self.term.lock();
@@ -410,14 +423,22 @@ impl PaneLoop {
                 .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
             (state::render(&mut term, title.as_deref()), alt)
         };
-        let mut client = Client::new(stream);
+        let mut client = Client::new(stream, remote);
         client.queue_output(&bytes);
         client.register(&self.poller)?;
         self.clients.push(client);
+        self.attached.fetch_add(1, Ordering::AcqRel);
+        if remote {
+            self.remote_state().clients += 1;
+        }
         if alt {
             self.nudge_redraw();
         }
         Ok(())
+    }
+
+    fn remote_state(&self) -> std::sync::MutexGuard<'_, RemoteState> {
+        self.remote.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Makes a full-screen program redraw, which also sets its scroll region again in both
@@ -439,12 +460,16 @@ impl PaneLoop {
     /// if any of them asked to close the session. A client that went away is
     /// dropped on its own.
     fn serve_clients(&mut self, event: Event) -> bool {
-        let mut frames = Vec::new();
+        let mut fresh = Vec::new();
+        let mut frames: Vec<(Frame, bool)> = Vec::new();
         let mut i = 0;
         while i < self.clients.len() {
             let client = &mut self.clients[i];
-            let alive = (!event.readable || client.receive(&mut frames))
+            let alive = (!event.readable || client.receive(&mut fresh))
                 && (!event.writable || client.flush().is_ok());
+            // Honored even from a client going away: its last frame may be `Close`.
+            // Whose input it was matters too: a phone's reads as driving the session.
+            frames.extend(fresh.drain(..).map(|frame| (frame, client.remote)));
             if alive {
                 i += 1;
             } else {
@@ -452,9 +477,14 @@ impl PaneLoop {
             }
         }
         let mut close = false;
-        for frame in frames {
+        for (frame, remote) in frames {
             match frame {
-                Frame::Input(bytes) => self.writes.push_back(bytes.into()),
+                Frame::Input(bytes) => {
+                    if remote {
+                        self.remote_state().last_input = Some(Instant::now());
+                    }
+                    self.writes.push_back(bytes.into());
+                }
                 Frame::Resize(size) => self.resize(size),
                 Frame::Palette(palette) => self.palette = palette,
                 Frame::Close => close = true,
@@ -486,6 +516,11 @@ impl PaneLoop {
     /// `flush`.
     fn drop_client(&mut self, index: usize, flush: bool) {
         let mut client = self.clients.remove(index);
+        self.attached.fetch_sub(1, Ordering::AcqRel);
+        if client.remote {
+            let mut state = self.remote_state();
+            state.clients = state.clients.saturating_sub(1);
+        }
         let _ = self.poller.delete(&client.stream);
         if flush {
             let _ = client.stream.set_nonblocking(false);
@@ -499,6 +534,8 @@ impl PaneLoop {
 struct Client {
     stream: UnixStream,
     inbox: Inbox,
+    /// A phone's, relayed by the bridge: its input drives the session.
+    remote: bool,
     /// When it last took output, or had none waiting.
     progress: Instant,
     out: Vec<u8>,
@@ -508,10 +545,11 @@ struct Client {
 }
 
 impl Client {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, remote: bool) -> Self {
         Self {
             stream,
             inbox: Inbox::default(),
+            remote,
             progress: Instant::now(),
             out: Vec::new(),
             sent: 0,

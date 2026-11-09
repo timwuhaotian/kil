@@ -62,6 +62,89 @@ fn a_second_attach_should_share_the_session_not_steal_it() {
 }
 
 #[test]
+fn watchers_should_list_sessions_with_another_client_attached() {
+    // The app holds one client per pane it shows; a phone attaching to a session is a
+    // second one, and the app's presence mark follows this list.
+    let (_dir, client) = server("watchers");
+    let first = spawn(&client, "a-1", &sh("exec /bin/sleep 600"));
+    assert_eq!(client.watchers().unwrap(), Vec::<String>::new());
+    let second = attach(&client, "a-1");
+    assert!(wait_until(Duration::from_secs(5), || client
+        .watchers()
+        .is_ok_and(|watched| watched == ["a-1"])));
+    drop(second);
+    assert!(wait_until(Duration::from_secs(5), || client
+        .watchers()
+        .is_ok_and(|watched| watched.is_empty())));
+    drop(first);
+    client.stop_all().unwrap();
+}
+
+#[test]
+fn remote_input_should_mark_a_session_controlled_until_it_goes_quiet_or_leaves() {
+    // A phone attaches as remote (as the bridge declares it), idles, types, then leaves.
+    // While idle it only watches; its keystrokes drive the session, and land in the
+    // program like any other input; detaching clears both marks.
+    let (dir, client) = server("controlling");
+    let first = spawn(&client, "a-1", &sh("exec /bin/cat"));
+    // The desktop typing never drives: only a phone's input does.
+    first.write(b"local\n".as_slice());
+    assert!(wait_for_text(&first, "local"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(client.controlling().unwrap(), Vec::<String>::new());
+
+    let mut phone = UnixStream::connect(server::socket_path(&dir)).unwrap();
+    phone
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    // Reads what the server sent so far: the phone's output must be taken, or the server
+    // drops it as stalled.
+    let drain = |phone: &mut UnixStream| {
+        let mut buf = [0u8; 8192];
+        loop {
+            match phone.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    };
+    phone
+        .write_all(&frame(19, &[]))
+        .and_then(|()| phone.write_all(&frame(1, &2_u32.to_le_bytes())))
+        .unwrap();
+    let id = b"a-1";
+    let mut attach = u32::try_from(id.len()).unwrap().to_le_bytes().to_vec();
+    attach.extend_from_slice(id);
+    phone.write_all(&frame(5, &attach)).unwrap();
+    drain(&mut phone);
+
+    // Attached but idle: watched, not controlled.
+    assert!(wait_until(Duration::from_secs(5), || client
+        .watchers()
+        .is_ok_and(|watched| watched == ["a-1"])));
+    assert_eq!(client.controlling().unwrap(), Vec::<String>::new());
+
+    // A keystroke drives the session, and reaches the program untouched.
+    phone.write_all(&frame(6, b"hi\n")).unwrap();
+    drain(&mut phone);
+    assert!(wait_until(Duration::from_secs(5), || client
+        .controlling()
+        .is_ok_and(|controlling| controlling == ["a-1"])));
+    assert!(wait_for_text(&first, "hi"));
+
+    // It detaches: both marks clear, even within the input window.
+    drop(phone);
+    assert!(wait_until(Duration::from_secs(5), || client
+        .watchers()
+        .is_ok_and(|watched| watched.is_empty())));
+    assert!(wait_until(Duration::from_secs(5), || client
+        .controlling()
+        .is_ok_and(|controlling| controlling.is_empty())));
+    drop(first);
+    client.stop_all().unwrap();
+}
+
+#[test]
 fn a_pane_sees_the_clients_term_program_version() {
     // The server stamps its own version, and a server started by an older Kil keeps
     // stamping that; the client stamps over it, so a program gating OSC 9 notifications

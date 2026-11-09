@@ -1,7 +1,16 @@
 //! A terminal session: one PTY, one child, one VT state (DESIGN.md §3).
 
 use std::{
-    borrow::Cow, ffi::OsString, mem::size_of, os::unix::net::UnixStream, path::PathBuf, sync::Arc,
+    borrow::Cow,
+    ffi::OsString,
+    mem::size_of,
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
 };
 
 use alacritty_terminal::{
@@ -209,6 +218,26 @@ pub struct ViewportCell {
     pub right_half: bool,
 }
 
+/// How long after a phone's last keystroke its session still reads as controlled
+/// (DESIGN.md §14.4): then it falls back to watched, until the phone detaches.
+/// Hardcoded: presence is a hint, not a setting.
+pub(crate) const REMOTE_INPUT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A phone's presence on a session, kept by the pane loop for the server's `Controlling`
+/// reply: how many remote clients hold it, and when one last typed.
+#[derive(Debug, Default)]
+pub(crate) struct RemoteState {
+    pub(crate) clients: usize,
+    pub(crate) last_input: Option<Instant>,
+}
+
+/// Whether the phone is driving the session now: one is attached, and typed within
+/// [`REMOTE_INPUT_WINDOW`]. Pure, so the decay is unit-tested without waiting it out.
+fn is_remote_active(clients: usize, last_input: Option<Instant>, now: Instant) -> bool {
+    clients > 0
+        && last_input.is_some_and(|at| now.saturating_duration_since(at) < REMOTE_INPUT_WINDOW)
+}
+
 /// Memory a session holds: its grid, and the program running in it (DESIGN.md §5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryUsage {
@@ -238,6 +267,10 @@ pub struct Session {
     pid: Pid,
     shell: Option<ProcIdentity>,
     tty: TtyId,
+    /// Attached clients, kept by the pane loop; a mirror of a session elsewhere reads 0.
+    clients: Arc<AtomicUsize>,
+    /// The phone's presence, kept by the pane loop; a mirror reads none.
+    remote: Arc<Mutex<RemoteState>>,
 }
 
 enum Link {
@@ -282,6 +315,8 @@ impl Session {
         let term = Arc::new(FairMutex::new(term));
         let pty = Pty::new(master, child, events.clone());
         let io = channel.sender();
+        let clients = Arc::new(AtomicUsize::new(0));
+        let remote = Arc::new(Mutex::new(RemoteState::default()));
         // Detached on purpose: the thread ends on Shutdown or child exit and drops the PTY
         // itself, so nothing ever joins (and blocks on) it.
         pane_loop::spawn(
@@ -290,6 +325,8 @@ impl Session {
             events.clone(),
             pty,
             config.palette.clone(),
+            Arc::clone(&clients),
+            Arc::clone(&remote),
         )
         .map_err(SpawnError::EventLoop)?;
         Ok(Self {
@@ -299,6 +336,8 @@ impl Session {
             pid,
             shell,
             tty,
+            clients,
+            remote,
         })
     }
 
@@ -321,6 +360,8 @@ impl Session {
                 identity.start_usec,
             )),
             tty: TtyId(identity.tty),
+            clients: Arc::new(AtomicUsize::new(0)),
+            remote: Arc::new(Mutex::new(RemoteState::default())),
         })
     }
 
@@ -353,10 +394,23 @@ impl Session {
     }
 
     /// Gives `stream` this session: its whole state, then its output (DESIGN.md §14.5).
-    pub(crate) fn attach(&self, stream: UnixStream) {
+    /// `remote` marks the connection a phone's, so its input reads as driving.
+    pub(crate) fn attach(&self, stream: UnixStream, remote: bool) {
         if let Link::Local(io) = &self.link {
-            io.send(Command::Attach(stream));
+            io.send(Command::Attach { stream, remote });
         }
+    }
+
+    /// How many clients hold this session now (server side).
+    pub(crate) fn attached_clients(&self) -> usize {
+        self.clients.load(Ordering::Acquire)
+    }
+
+    /// Whether a phone attached to this session typed within [`REMOTE_INPUT_WINDOW`]
+    /// (server side): it is driving, not just watching.
+    pub(crate) fn remote_active(&self) -> bool {
+        let state = self.remote.lock().unwrap_or_else(PoisonError::into_inner);
+        is_remote_active(state.clients, state.last_input, Instant::now())
     }
 
     /// PID of the child (the shell).
@@ -554,5 +608,37 @@ impl Drop for Session {
         if let Link::Local(io) = &self.link {
             io.send(Command::Shutdown);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn remote_presence_needs_an_attached_phone_and_a_recent_keystroke() {
+        let now = Instant::now();
+        // Attached but idle: watching, not driving.
+        assert!(!is_remote_active(1, None, now));
+        // Detached right after typing: nothing to show.
+        assert!(!is_remote_active(
+            0,
+            now.checked_sub(Duration::from_secs(1)),
+            now
+        ));
+        // Typed just now: driving.
+        assert!(is_remote_active(
+            1,
+            now.checked_sub(Duration::from_secs(1)),
+            now
+        ));
+        // Quiet past the window: back to watching.
+        assert!(!is_remote_active(
+            1,
+            now.checked_sub(REMOTE_INPUT_WINDOW),
+            now
+        ));
     }
 }

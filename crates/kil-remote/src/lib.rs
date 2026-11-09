@@ -476,9 +476,17 @@ async fn handle_connection(
         return Ok(());
     };
 
-    let unix = UnixStream::connect(socket_path)
+    let mut unix = UnixStream::connect(socket_path)
         .await
         .context("connect to Kil's session server")?;
+    // A supporting server tags the connection a phone's from this declaration, so its
+    // input reads as driving; an older one never sees it, and the relay then behaves
+    // exactly as before.
+    if server_tags_remote(socket_path).await {
+        unix.write_all(REMOTE_DECLARATION)
+            .await
+            .context("declare the relay a phone's")?;
+    }
     reply(&mut reader, &format!("OK {token}")).await?;
 
     // The client only starts the wire protocol after reading `OK`, so nothing
@@ -497,6 +505,48 @@ async fn handle_connection(
         _ = &mut t2 => t1.abort(),
     }
     Ok(())
+}
+
+/// The wire protocol's `Remote` frame (kind 19, empty): a u32 length of 1, the kind, no
+/// payload. Sent on a relay connection before the phone's own bytes.
+const REMOTE_DECLARATION: &[u8] = &[1, 0, 0, 0, 19];
+
+/// Whether the session server understands the `Remote` declaration: a probe connection
+/// says hello, declares itself remote, and asks for the sessions. A server from before
+/// the declaration hangs up on the unknown frame instead of answering, which reads as
+/// no support.
+async fn server_tags_remote(socket_path: &Path) -> bool {
+    tokio::time::timeout(Duration::from_secs(2), probe_remote(socket_path))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false)
+}
+
+async fn probe_remote(socket_path: &Path) -> Result<bool> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    // Hello { protocol: 2 }.
+    stream.write_all(&[5, 0, 0, 0, 1, 2, 0, 0, 0]).await?;
+    if read_kind(&mut stream).await? != 1 {
+        return Ok(false);
+    }
+    stream.write_all(REMOTE_DECLARATION).await?;
+    // List; answered with Sessions (kind 9) only if the declaration didn't hang up.
+    stream.write_all(&[1, 0, 0, 0, 2]).await?;
+    Ok(read_kind(&mut stream).await? == 9)
+}
+
+/// The kind byte of the next frame, discarding its payload.
+async fn read_kind(stream: &mut UnixStream) -> Result<u8> {
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).await?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len == 0 || len > (16 << 20) {
+        bail!("bad frame length");
+    }
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await?;
+    Ok(body[0])
 }
 
 async fn reply(
@@ -673,5 +723,56 @@ mod tests {
             assert!(!guard.note_failure(ip), "first five failures are budgeted");
         }
         assert!(guard.note_failure(ip), "the sixth failure is throttled");
+    }
+
+    /// A scripted session server on a socket of its own: `script` answers the probe's
+    /// frames, then the connection hangs up.
+    fn fake_server(name: &str, script: Vec<Vec<u8>>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kil-probe-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            for reply in script {
+                let mut len = [0u8; 4];
+                if stream.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let len = u32::from_le_bytes(len) as usize;
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&reply).await.is_err() {
+                    return;
+                }
+            }
+        });
+        socket
+    }
+
+    #[tokio::test]
+    async fn the_probe_sees_a_server_that_tags_remote() {
+        // Hello answered, the declaration swallowed, List answered with Sessions.
+        let socket = fake_server(
+            "new",
+            vec![
+                vec![5, 0, 0, 0, 1, 2, 0, 0, 0],
+                vec![],
+                vec![5, 0, 0, 0, 9, 0, 0, 0, 0],
+            ],
+        );
+        assert!(server_tags_remote(&socket).await);
+    }
+
+    #[tokio::test]
+    async fn the_probe_falls_back_on_a_server_from_before_remote() {
+        // Hello answered, then a hangup on the declaration: no declaration is sent.
+        let socket = fake_server("old", vec![vec![5, 0, 0, 0, 1, 2, 0, 0, 0]]);
+        assert!(!server_tags_remote(&socket).await);
     }
 }

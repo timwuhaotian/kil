@@ -4,6 +4,16 @@ Notable changes to Kil. The download is always the latest build
 ([`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)); the
 versions below are how we track releases, and match `Cargo.toml` and the app's Info.plist.
 
+## 0.0.32 — 2026-11-09
+
+- **See when your phone is on a pane.** A phone attached through Agent on Edge now
+  marks the panes it watches: a small dot on the tab row and in the pane's corner.
+  When the phone types, the mark turns red instead — it is driving, not just
+  watching — and falls back to the dot 10 s after its last keystroke. The app polls
+  the server every 2 s, detaching clears both marks, and nothing is ever locked: a
+  marked pane stays fully usable. The frames are additive and the protocol stays 2,
+  so old and new servers, bridges and apps mix.
+
 ## 0.0.31 — 2026-11-09
 
 - **A session can have several clients at once.** Attaching a second client (Agent on

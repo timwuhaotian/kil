@@ -132,6 +132,10 @@ pub struct TerminalPane {
     pub(crate) forwarding_guarded: bool,
     info: PaneInfo,
     info_refresh: Option<Task<()>>,
+    /// Another client (a phone) is attached to this pane's session.
+    watched: bool,
+    /// The phone recently typed in this pane's session: it is driving, not just watching.
+    controlled: bool,
     /// While the tab's layout animates, keep the grid: one resize when it settles, not one
     /// per frame (DESIGN.md §6.3).
     frozen: bool,
@@ -245,6 +249,8 @@ impl TerminalPane {
                 ..PaneInfo::default()
             },
             info_refresh: None,
+            watched: false,
+            controlled: false,
             frozen: false,
             id,
             start_dir: cwd,
@@ -258,6 +264,26 @@ impl TerminalPane {
 
     pub fn info(&self) -> &PaneInfo {
         &self.info
+    }
+
+    /// Whether a phone is attached to this pane's session.
+    pub fn watched(&self) -> bool {
+        self.watched
+    }
+
+    /// Whether a phone recently typed in this pane's session.
+    pub fn controlled(&self) -> bool {
+        self.controlled
+    }
+
+    /// Sets the presence marks; `true` if either changed.
+    pub(crate) fn set_presence(&mut self, watched: bool, controlled: bool) -> bool {
+        if self.watched == watched && self.controlled == controlled {
+            return false;
+        }
+        self.watched = watched;
+        self.controlled = controlled;
+        true
     }
 
     /// What this pane costs the machine: its grid, and the program running in it.

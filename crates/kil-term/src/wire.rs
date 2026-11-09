@@ -55,6 +55,14 @@ pub(crate) enum Frame {
     Resize(GridSize),
     /// Ends the session (hangup, then the reaper), unlike closing the connection.
     Close,
+    /// Asks which sessions another client watches; answered with [`Frame::Watching`].
+    Watchers,
+    /// Declares the connection a phone's, relayed by the bridge: the first frame it sends,
+    /// before its `Hello`, or any time before `Attach` on a connection of its own. Input
+    /// from a remote client marks the session controlled. An older server hangs up on it.
+    Remote,
+    /// Asks which sessions a phone recently typed in; answered with [`Frame::Controlling`].
+    Controllers,
     // Server to client.
     Sessions(Vec<String>),
     Stopped,
@@ -66,6 +74,16 @@ pub(crate) enum Frame {
     Exited(ExitStatus),
     /// Client to server, protocol 2: answer color queries from this from now on.
     Palette(Palette),
+    /// Sessions with more than one attached client: the app holds one per pane it shows,
+    /// so any extra is a phone watching (DESIGN.md §14.4). Asked with [`Frame::Watchers`]
+    /// on its own connection, so an older server hanging up on the unknown frame disturbs
+    /// nothing.
+    Watching(Vec<String>),
+    /// Sessions with a remote client attached that typed within
+    /// [`REMOTE_INPUT_WINDOW`][crate::session::REMOTE_INPUT_WINDOW]: the phone is driving,
+    /// not just watching. Asked with [`Frame::Controllers`] on its own connection, so an
+    /// older server hanging up on the unknown frame disturbs nothing.
+    Controlling(Vec<String>),
 }
 
 impl Frame {
@@ -87,6 +105,11 @@ impl Frame {
             Self::Output(_) => OUTPUT,
             Self::Exited(_) => 15,
             Self::Palette(_) => 16,
+            Self::Watchers => 17,
+            Self::Watching(_) => 18,
+            Self::Remote => 19,
+            Self::Controllers => 20,
+            Self::Controlling(_) => 21,
         }
     }
 
@@ -98,7 +121,14 @@ impl Frame {
         let mut put = Put(out);
         match self {
             Self::Hello { protocol } => put.u32(*protocol),
-            Self::List | Self::StopAll | Self::Close | Self::Stopped | Self::Missing => {}
+            Self::List
+            | Self::StopAll
+            | Self::Close
+            | Self::Stopped
+            | Self::Missing
+            | Self::Watchers
+            | Self::Remote
+            | Self::Controllers => {}
             Self::Spawn { id, config } => {
                 put.str(id);
                 put.config(config);
@@ -106,7 +136,7 @@ impl Frame {
             Self::Attach { id } => put.str(id),
             Self::Input(bytes) | Self::Output(bytes) => put.0.extend_from_slice(bytes),
             Self::Resize(size) => put.size(*size),
-            Self::Sessions(ids) => {
+            Self::Sessions(ids) | Self::Watching(ids) | Self::Controlling(ids) => {
                 put.len(ids.len());
                 for id in ids {
                     put.str(id);
@@ -160,6 +190,17 @@ impl Frame {
             OUTPUT => Self::Output(get.rest()),
             15 => Self::Exited(ExitStatus::from_raw(get.u32()?.cast_signed())),
             16 => Self::Palette(get.palette()?),
+            17 => Self::Watchers,
+            18 => {
+                let count = get.len()?;
+                Self::Watching((0..count).map(|_| get.str()).collect::<io::Result<_>>()?)
+            }
+            19 => Self::Remote,
+            20 => Self::Controllers,
+            21 => {
+                let count = get.len()?;
+                Self::Controlling((0..count).map(|_| get.str()).collect::<io::Result<_>>()?)
+            }
             _ => return Err(invalid("unknown frame kind")),
         };
         Ok(frame)
@@ -517,6 +558,11 @@ mod tests {
             Frame::Exited(ExitStatus::from_raw(3 << 8)),
             Frame::Close,
             Frame::Palette(palette),
+            Frame::Watchers,
+            Frame::Watching(vec!["a-1".into()]),
+            Frame::Remote,
+            Frame::Controllers,
+            Frame::Controlling(vec!["a-1".into()]),
         ];
         for frame in frames {
             assert_eq!(round_trip(&frame), frame);

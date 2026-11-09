@@ -106,6 +106,42 @@ impl Client {
         }
     }
 
+    /// Ids of the sessions another client watches (a phone attached to them).
+    ///
+    /// Asked on its own connection: a server older than the `Watchers` frame hangs up
+    /// on it, which reads as no presence info rather than disturbing the control
+    /// connection.
+    ///
+    /// # Errors
+    /// If the server is gone.
+    pub fn watchers(&self) -> io::Result<Vec<String>> {
+        let mut stream = self.connection()?;
+        wire::send(&mut stream, &Frame::Watchers)?;
+        match wire::receive(&mut stream)? {
+            Some(Frame::Watching(ids)) => Ok(ids),
+            None => Ok(Vec::new()),
+            Some(other) => Err(unexpected(&other)),
+        }
+    }
+
+    /// Ids of the sessions a phone recently typed in (it is driving, not just watching).
+    ///
+    /// Asked on its own connection: a server older than the `Controllers` frame hangs up
+    /// on it, which reads as no presence info rather than disturbing the control
+    /// connection.
+    ///
+    /// # Errors
+    /// If the server is gone.
+    pub fn controlling(&self) -> io::Result<Vec<String>> {
+        let mut stream = self.connection()?;
+        wire::send(&mut stream, &Frame::Controllers)?;
+        match wire::receive(&mut stream)? {
+            Some(Frame::Controlling(ids)) => Ok(ids),
+            None => Ok(Vec::new()),
+            Some(other) => Err(unexpected(&other)),
+        }
+    }
+
     /// Ends every session and waits until they are reaped (or killed).
     ///
     /// # Errors

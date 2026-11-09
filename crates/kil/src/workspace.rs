@@ -4,6 +4,7 @@
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
+    io,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -90,6 +91,8 @@ const SCREEN_INTERVAL: Duration = Duration::from_secs(30);
 const RESTORE_SETTLE: Duration = Duration::from_secs(10);
 /// How often the panes' memory is read, for the sidebar's figures (DESIGN.md §5.2).
 const MEMORY_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the server is asked which sessions a phone watches, for the presence marks.
+const WATCHERS_INTERVAL: Duration = Duration::from_secs(2);
 /// A tab's figure is shown from this much on; below it, the row stays quiet.
 const SHOWN_MEMORY: u64 = 100 * 1024 * 1024;
 /// From this much on, the figure is shown as a warning.
@@ -404,6 +407,8 @@ pub struct Workspace {
     blinking: Option<WeakEntity<TerminalPane>>,
     /// The timer that reads what the panes cost; see [`Self::refresh_memory`].
     memory_task: Option<Task<()>>,
+    /// The timer that asks which sessions a phone watches; see [`Self::apply_watchers`].
+    watchers_task: Option<Task<()>>,
     /// What the panes cost, and how the system is doing.
     memory: MemoryState,
     _subscriptions: Vec<Subscription>,
@@ -484,6 +489,7 @@ impl Workspace {
             blink: None,
             blinking: None,
             memory_task: None,
+            watchers_task: None,
             memory: MemoryState::default(),
             _subscriptions: vec![activation, quitting, moved, changed],
         };
@@ -515,6 +521,7 @@ impl Workspace {
         }
         this.sync_blink(window, cx);
         this.start_memory_watch(cx);
+        this.start_watchers_watch(cx);
         this
     }
 
@@ -1472,6 +1479,54 @@ impl Workspace {
         }));
     }
 
+    /// Marks the panes a phone is attached to, and the ones it recently typed in; a failed
+    /// query leaves the marks standing.
+    fn apply_watchers(
+        &mut self,
+        watched: io::Result<Vec<String>>,
+        controlling: io::Result<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Ok(watched), Ok(controlling)) = (watched, controlling) else {
+            return;
+        };
+        let watched: HashSet<&str> = watched.iter().map(String::as_str).collect();
+        let controlling: HashSet<&str> = controlling.iter().map(String::as_str).collect();
+        let mut changed = false;
+        for pane in self.all_panes() {
+            changed |= pane.update(cx, |pane, _| {
+                pane.set_presence(watched.contains(pane.id()), controlling.contains(pane.id()))
+            });
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Asks the server which sessions a phone watches, every [`WATCHERS_INTERVAL`].
+    fn start_watchers_watch(&mut self, cx: &mut Context<Self>) {
+        let client = Arc::clone(&self.client);
+        self.watchers_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCHERS_INTERVAL).await;
+                // A socket round trip: keep it off the UI thread, like panes spawning.
+                let (watched, controlling) = cx
+                    .background_executor()
+                    .spawn({
+                        let client = Arc::clone(&client);
+                        async move { (client.watchers(), client.controlling()) }
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.apply_watchers(watched, controlling, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
     // ── rendering ─────────────────────────────────────────────────────────────────────
 
     /// Collapses finished closes and freezes grids of tabs whose layout is animating.
@@ -1602,6 +1657,12 @@ impl Workspace {
             .filter(|rename| rename.tab == id)
             .map(|rename| rename.field.clone());
         let status = tab.status(cx);
+        let watched = tab.tree.leaves().iter().any(|pane| pane.read(cx).watched());
+        let controlled = tab
+            .tree
+            .leaves()
+            .iter()
+            .any(|pane| pane.read(cx).controlled());
         let active = index == self.active;
         let lifted = cx.has_active_drag() && self.dragging.is_some_and(|drag| drag.tab == id);
         let preview = RowPreview {
@@ -1682,6 +1743,9 @@ impl Workspace {
                     .child(row_title(title, editing, active, chrome))
                     .when_some(shown_memory(tab.memory), |row, shown| {
                         row.child(memory_label(shown, chrome))
+                    })
+                    .when_some(presence_mark(controlled, watched, chrome), |row, mark| {
+                        row.child(mark)
                     })
                     .child(tab_close(id, chrome, cx)),
             )
@@ -1918,6 +1982,22 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
             base.into_any_element()
         }
     });
+    // No handlers, so clicks and selections pass through to the pane below.
+    // Driving wins over watching: one mark per pane.
+    let presence = if pane.read(cx).controlled() {
+        Some((controlling_mark(chrome), "controlling-pane"))
+    } else if pane.read(cx).watched() {
+        Some((watched_mark(chrome), "watched-pane"))
+    } else {
+        None
+    };
+    let presence = presence.map(|(mark, selector)| {
+        mark.absolute()
+            .top(px(4.))
+            .right(px(4.))
+            .debug_selector(|| selector.to_owned())
+            .into_any_element()
+    });
     div()
         .relative()
         .size_full()
@@ -1931,6 +2011,7 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
         )
         .children(dim)
         .children(ring)
+        .children(presence)
         .into_any_element()
 }
 
@@ -2427,6 +2508,37 @@ fn status_mark(status: TabStatus, chrome: Chrome) -> Div {
             .text_color(chrome.failure)
             .child("!"),
     }
+}
+
+/// A phone is attached to the pane: small and static, like the status marks, so idle CPU
+/// stays at zero while it shows.
+fn watched_mark(chrome: Chrome) -> Div {
+    div()
+        .flex_none()
+        .size(px(6.))
+        .rounded_full()
+        .bg(chrome.accent)
+}
+
+/// The tab row's presence mark, if any: driving wins over watching.
+fn presence_mark(controlled: bool, watched: bool, chrome: Chrome) -> Option<Div> {
+    if controlled {
+        Some(controlling_mark(chrome).debug_selector(|| "controlling-tab".to_owned()))
+    } else if watched {
+        Some(watched_mark(chrome).debug_selector(|| "watched-tab".to_owned()))
+    } else {
+        None
+    }
+}
+
+/// The phone recently typed in the pane: larger and red, like the failure mark, so driving
+/// reads apart from watching at a glance. Static too: idle CPU stays at zero.
+fn controlling_mark(chrome: Chrome) -> Div {
+    div()
+        .flex_none()
+        .size(px(8.))
+        .rounded_full()
+        .bg(chrome.failure)
 }
 
 /// The row's title, or the field editing it.
@@ -3493,6 +3605,186 @@ mod tests {
         assert_eq!(first_status(&workspace, cx), TabStatus::Done);
         cx.dispatch_action(SelectTab1);
         assert_eq!(first_status(&workspace, cx), TabStatus::Idle);
+    }
+
+    /// Runs one presence poll, as the watchers timer does.
+    fn poll_watchers(
+        workspace: &Entity<Workspace>,
+        client: &Arc<Client>,
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update(cx, |this, cx| {
+            this.apply_watchers(client.watchers(), client.controlling(), cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_phone_on_a_session_should_mark_its_tab_row_and_pane_until_it_leaves(
+        cx: &mut TestAppContext,
+    ) {
+        let client = test_client();
+        let (workspace, cx) = workspace_on(Arc::clone(&client), None, cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        let id = pane_id(&pane, cx);
+        // The pane's session starts on a background thread.
+        for _ in 0..500 {
+            if client.sessions().is_ok_and(|ids| ids.contains(&id)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(client.sessions().is_ok_and(|ids| ids.contains(&id)));
+        poll_watchers(&workspace, &client, cx);
+        assert!(cx.debug_bounds("watched-tab").is_none());
+        assert!(cx.debug_bounds("watched-pane").is_none());
+
+        // A phone attaches to the session: the next poll marks the tab and the pane.
+        let phone = client.attach(&id, 1_000, |_| {}).unwrap().unwrap();
+        for _ in 0..500 {
+            if client
+                .watchers()
+                .is_ok_and(|watched| watched == [id.as_str()])
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        poll_watchers(&workspace, &client, cx);
+        assert!(cx.debug_bounds("watched-tab").is_some());
+        assert!(cx.debug_bounds("watched-pane").is_some());
+        // Attached without typing: watching only, never driving.
+        assert!(cx.debug_bounds("controlling-tab").is_none());
+        assert!(cx.debug_bounds("controlling-pane").is_none());
+
+        // It detaches: the next poll clears the state, and the marks follow it. Debug
+        // bounds accumulate across frames, so absence is read from the state; the initial
+        // `is_none` above proves the marks only draw while it is set.
+        drop(phone);
+        for _ in 0..500 {
+            if client.watchers().is_ok_and(|watched| watched.is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        poll_watchers(&workspace, &client, cx);
+        assert!(!pane.read_with(cx, |pane, _| pane.watched()));
+
+        // A second visit marks them again: the binding is live, not stuck.
+        let phone = client.attach(&id, 1_000, |_| {}).unwrap().unwrap();
+        for _ in 0..500 {
+            if client
+                .watchers()
+                .is_ok_and(|watched| watched == [id.as_str()])
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        poll_watchers(&workspace, &client, cx);
+        assert!(pane.read_with(cx, |pane, _| pane.watched()));
+        assert!(cx.debug_bounds("watched-tab").is_some());
+        assert!(cx.debug_bounds("watched-pane").is_some());
+        drop(phone);
+    }
+
+    #[gpui::test]
+    fn a_phone_typing_should_mark_its_tab_row_and_pane_controlled(cx: &mut TestAppContext) {
+        use std::io::{Read as _, Write as _};
+
+        // A server of this test's own, with its directory for a raw phone.
+        let dir = std::env::temp_dir().join(format!("kil-wst-{}-drives", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        kil_term::server::serve_in_thread(&dir).unwrap();
+        let client = Arc::new(Client::connect(&dir).unwrap());
+        let (workspace, cx) = workspace_on(Arc::clone(&client), None, cx);
+        let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
+        let id = pane_id(&pane, cx);
+        for _ in 0..500 {
+            if client.sessions().is_ok_and(|ids| ids.contains(&id)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(client.sessions().is_ok_and(|ids| ids.contains(&id)));
+
+        // The phone declares itself remote before its hello, as the bridge sends it.
+        let frame = |kind: u8, payload: &[u8]| {
+            let mut out = u32::try_from(payload.len() + 1)
+                .unwrap()
+                .to_le_bytes()
+                .to_vec();
+            out.push(kind);
+            out.extend_from_slice(payload);
+            out
+        };
+        let mut phone =
+            std::os::unix::net::UnixStream::connect(kil_term::server::socket_path(&dir)).unwrap();
+        phone
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        phone.write_all(&frame(19, &[])).unwrap();
+        phone.write_all(&frame(1, &2_u32.to_le_bytes())).unwrap();
+        let mut attach = u32::try_from(id.len()).unwrap().to_le_bytes().to_vec();
+        attach.extend_from_slice(id.as_bytes());
+        phone.write_all(&frame(5, &attach)).unwrap();
+        // Takes the server's output, or it is dropped as stalled.
+        let drain = |phone: &mut std::os::unix::net::UnixStream| {
+            let mut buf = [0u8; 8192];
+            loop {
+                match phone.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        drain(&mut phone);
+
+        // Attached but idle: the watching dot, not the driving mark.
+        for _ in 0..500 {
+            if client
+                .watchers()
+                .is_ok_and(|watched| watched == [id.as_str()])
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        poll_watchers(&workspace, &client, cx);
+        assert!(cx.debug_bounds("watched-tab").is_some());
+        assert!(cx.debug_bounds("watched-pane").is_some());
+        assert!(cx.debug_bounds("controlling-tab").is_none());
+        assert!(cx.debug_bounds("controlling-pane").is_none());
+
+        // A keystroke drives the session: the stronger mark wins on both.
+        phone.write_all(&frame(6, b"x")).unwrap();
+        drain(&mut phone);
+        for _ in 0..500 {
+            if client
+                .controlling()
+                .is_ok_and(|controlling| controlling == [id.as_str()])
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        poll_watchers(&workspace, &client, cx);
+        assert!(pane.read_with(cx, |pane, _| pane.controlled()));
+        assert!(cx.debug_bounds("controlling-tab").is_some());
+        assert!(cx.debug_bounds("controlling-pane").is_some());
+
+        // It detaches: the state clears, and the marks follow it.
+        drop(phone);
+        for _ in 0..500 {
+            if client.watchers().is_ok_and(|watched| watched.is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        poll_watchers(&workspace, &client, cx);
+        assert!(!pane.read_with(cx, |pane, _| pane.controlled()));
+        assert!(!pane.read_with(cx, |pane, _| pane.watched()));
     }
 
     fn notification() -> kil_term::Notification {
