@@ -8,6 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![macOS 14+ · Apple silicon](https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20silicon-lightgrey)
 
+Kil is a native macOS terminal emulator written in Rust — a lightweight, fast terminal at 8.6 MB installed, and an iTerm2, Ghostty, and Warp alternative whose session server keeps jobs running across quit or crash. With vertical tabs, animated split panes, 0.00% idle CPU, and per-tab memory display, every pane reattaches to its live process on relaunch.
+
 A native macOS terminal written in Rust. It has vertical tabs, animated split panes and
 shortcuts you can rebind. Your jobs keep running after Kil quits or crashes: reopen it and
 every pane is back on its live process, with vim's unsaved buffer, the ssh connection and the
@@ -48,18 +50,20 @@ owns every process, PID and file descriptor it creates.
 - **Remote panes for Agent on Edge.** Settings ▸ Agent on Edge shows a QR code that pairs an
   iPhone to the same session server through a TLS tunnel, so the panes on the phone are the
   panes on the desk; `kil --remote` does the same from a terminal, and the standalone
-  `kil-remote` binary without starting the server. The pairing code never expires — the first
-  phone spends it and its token reconnects for as long as the bridge runs — and the bridge
-  belongs to Kil rather than to the panel, so closing Settings leaves it up; **New QR** makes
-  a fresh certificate, code and port for a second phone or a re-pair. Ticking Public internet
-  asks your own
-  router (UPnP) to forward a port and prints a QR for the public IP, so the phone works from
-  anywhere — no cloud service or third party is involved, and the mapping is removed when the
-  bridge stops. While a phone is attached, its tab's row in the sidebar is outlined in the
-  theme's accent and carries a small phone badge; when the phone types, both turn solid —
-  driving, not just watching — and the pane stays fully usable either way. The phone follows
-  the window's theme and pane size as they change. A session server started by an older Kil
-  marks no pane: the panel says so, and **Kil ▸ Restart** brings up the new server.
+  `kil-remote` binary without starting the server.
+
+  The pairing code never expires — the first phone spends it and its token reconnects for as
+  long as the bridge runs — and the bridge belongs to Kil rather than to the panel, so closing
+  Settings leaves it up; **New QR** makes a fresh certificate, code and port for a second phone
+  or a re-pair. Ticking Public internet asks your own router (UPnP) to forward a port and prints
+  a QR for the public IP, so the phone works from anywhere — no cloud service or third party is
+  involved, and the mapping is removed when the bridge stops.
+
+  While a phone is attached, its tab's row in the sidebar is outlined in the theme's accent and
+  carries a small phone badge; when the phone types, both turn solid — driving, not just
+  watching — and the pane stays fully usable either way. The phone follows the window's theme
+  and pane size as they change. A session server started by an older Kil marks no pane: the panel
+  says so, and **Kil ▸ Restart** brings up the new server.
 - **Comes back after a restart, too.** The layout, each pane's directory and the window frame
   are saved within 2 s of a change, and each pane's screen and scrollback every 30 s while it
   prints, and at once when you quit. After a logout or a reboot, the processes themselves are
@@ -91,6 +95,8 @@ owns every process, PID and file descriptor it creates.
 
 ## Size
 
+Kil is the smallest full-featured macOS terminal emulator at 8.6 MB installed — 7.6× smaller than Ghostty (65.0 MB), 24× smaller than iTerm2 (202.9 MB), and 106× smaller than Warp (913.7 MB).
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/size-dark.svg">
   <img src="docs/size-light.svg" width="960" alt="Installed size of macOS terminals: Kil 8.6 MB, Alacritty 14.7 MB, Ghostty 65.0 MB, iTerm2 202.9 MB, Hyper 240.9 MB, kitty 253.0 MB, WezTerm 266.1 MB, Tabby 439.6 MB, Wave 556.1 MB, Warp 913.7 MB">
@@ -101,6 +107,20 @@ kitty 0.49.2, WezTerm 20240203, Tabby 1.0.238, Wave 0.14.5, Warp 0.2026.10.14.
 Kil, Hyper, Tabby and Wave are measured as their Apple silicon builds. The others ship one
 universal app for Intel and Apple silicon, which carries each binary twice. Alacritty is the
 only one near Kil's size, and it has no tabs or split panes.
+
+## Kil vs other macOS terminals
+
+Installed sizes come from the chart above; — means not applicable or not disclosed by the project.
+
+| Terminal | Installed size | Language | Tabs + persistence | GPU | Open source |
+|---|---|---|---|---|---|
+| Kil | 8.6 MB | Rust | Vertical tabs, jobs survive quit/crash | Metal (GPUI) | MIT |
+| Alacritty | 14.7 MB | Rust | No tabs or splits | Yes | Apache-2.0 |
+| Ghostty | 65.0 MB | Zig | Tabs, no live reattach | Yes | MIT |
+| iTerm2 | 202.9 MB | Objective-C | Tabs, no live reattach | Yes (Metal) | GPL |
+| kitty | 253.0 MB | C + Python | Tabs, no live reattach | Yes | GPL |
+| WezTerm | 266.1 MB | Rust | Tabs, no live reattach | Yes | MIT |
+| Warp | 913.7 MB | Rust | Tabs, no live reattach | Yes | — |
 
 ## Install
 
@@ -256,6 +276,36 @@ reaping, crashes and leaks. They should leave no process behind; if one does, th
 Contributions are welcome: see [`CONTRIBUTING.md`](CONTRIBUTING.md) and the
 [code of conduct](CODE_OF_CONDUCT.md). Report security issues privately, as
 [`SECURITY.md`](SECURITY.md) describes. Changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
+
+## FAQ
+
+### What is Kil terminal?
+
+Kil is a native macOS terminal emulator written in Rust, with vertical tabs, animated split panes, and GPU rendering via GPUI and Metal. At 8.6 MB installed, this fast Rust terminal emulator pairs alacritty_terminal parsing with a session server, 9 themes, and rebindable keys.
+
+### How is Kil different from Ghostty, iTerm2, and Warp?
+
+Kil's core difference is live session persistence: jobs outlive the window, so a quit or crash reattaches every pane to its live process with vim buffers, ssh connections, and builds intact. It is also a far smaller fast terminal — 8.6 MB vs Ghostty 65.0 MB, iTerm2 202.9 MB, and Warp 913.7 MB — with 0.00% idle CPU, per-tab memory display, and iPhone remote panes, acting as a built-in tmux alternative without learning tmux commands.
+
+### How big is Kil?
+
+Kil installs at 8.6 MB, the smallest full-featured macOS terminal emulator in the chart above. That is 7.6× smaller than Ghostty (65.0 MB), 24× smaller than iTerm2 (202.9 MB), and 106× smaller than Warp (913.7 MB); only Alacritty (14.7 MB) is close, and it has no tabs or splits.
+
+### Does Kil keep processes running after quit?
+
+Yes — Kil keeps every process running after quit, window close, or crash. Kil is a terminal with session restore built in: a session server (`kil --server`) holds each pane's PTY, so quitting only detaches and the next launch reattaches to the same live PIDs with full screen and scrollback. After a logout or reboot the processes are gone, so each pane retypes its last job into a new shell instead.
+
+### Is Kil free and open source?
+
+Yes — Kil is free and MIT-licensed at github.com/timwuhaotian/kil. It builds on Apache-2.0 GPUI and alacritty_terminal, and the 8.6 MB release build is Developer ID signed and Apple-notarized with automatic updates.
+
+### What platforms does Kil support?
+
+Kil supports Apple silicon Macs on macOS 14 or later (tested on macOS 27); Intel Macs, Linux, and Windows are not supported. It is early-stage, macOS-only software, using native Metal rendering and direct PTY ownership.
+
+### How do I install Kil on macOS?
+
+Download Kil-arm64.dmg from the releases/ folder, open it, and drag Kil to Applications — the signed, notarized app then keeps itself up to date. You need an Apple silicon Mac on macOS 14+; to build from source, clone the repo and run `cargo run -p kil --release` with Rust 1.94+ and Xcode's Metal toolchain.
 
 ## License
 

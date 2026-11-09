@@ -1,0 +1,42 @@
+# Kil
+
+> Kil is a native macOS terminal written in Rust that keeps every job running after quit or crash, ships as an 8.6 MB app, and idles at 0.00% CPU.
+
+Kil renders with GPUI on Metal, parses VT sequences with `alacritty_terminal`, and runs every pane's process in a small session server (`kil --server`, the same binary), so reopening Kil reattaches each pane to its live process: vim's unsaved buffer, the ssh connection, the half-finished build. It offers vertical tabs, animated split panes, per-tab memory figures, nine themes, rebindable keys, and an iPhone remote that drives the same panes over a TLS tunnel. Kil is MIT-licensed, early-stage, and requires Apple silicon with macOS 14 or later.
+
+## Features
+
+- [Vertical tabs](https://github.com/timwuhaotian/kil#features): sidebar tabs with running-job rings, finished-job dots, drag reorder, and rename.
+- [Session persistence](https://github.com/timwuhaotian/kil#features): quit, crash, or update without losing jobs; layout saved within 2 s, screens every 30 s.
+- [Split panes](https://github.com/timwuhaotian/kil#features): animated splits that share the tab evenly, with draggable dividers.
+- [iPhone remote](https://github.com/timwuhaotian/kil#features): Agent on Edge pairs a phone by QR over TLS; optional UPnP port forward, no cloud service.
+- [Size and performance](https://github.com/timwuhaotian/kil#size): 8.6 MB installed, against 65.0 MB for Ghostty, 202.9 MB for iTerm2, and 913.7 MB for Warp.
+- [Per-tab memory](https://github.com/timwuhaotian/kil#features): each tab shows what its programs cost, plus a total for every tab.
+- [Nine themes](https://github.com/timwuhaotian/kil#features): Batman, Iced Coffee, Creamery Station, Pastel Tweencore, Cappuccino, Shades of Gray, Off White, Red Orange, Snow and Ice.
+- [Rebindable keys](https://github.com/timwuhaotian/kil#using-kil): every command rebindable in `~/.config/kil/keymap.toml` or Settings ▸ Keyboard.
+
+## Install
+
+- [Download Kil-arm64.dmg](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg): always the latest release; drag Kil to Applications. Signed with a Developer ID and notarized by Apple.
+- [Install guide](https://github.com/timwuhaotian/kil#install): checksum verification and self-update behavior.
+- [Build from source](https://github.com/timwuhaotian/kil#build-from-source): needs Apple silicon, Xcode with the Metal toolchain, and Rust 1.94+; `git clone https://github.com/timwuhaotian/kil.git && cd kil && cargo run -p kil --release`.
+
+## Config
+
+- [Key bindings](https://github.com/timwuhaotian/kil#using-kil): `~/.config/kil/keymap.toml` (Kil ▸ Keyboard Shortcuts… opens it).
+- [Settings](https://github.com/timwuhaotian/kil#using-kil): `~/.config/kil/config.toml` or the Settings window (`⌘,`); theme, font, scrollback, sidebar opacity, auto-update.
+- [Session state](https://github.com/timwuhaotian/kil#using-kil): `~/Library/Application Support/kil/` holds the layout, saved screens, and the server socket.
+
+## Positioning
+
+- Kil vs Ghostty, iTerm2, Warp, and Alacritty: Kil is the smallest (8.6 MB) macOS-native option with session persistence and an iPhone remote, at the cost of supporting only Apple silicon on macOS 14+ while early-stage.
+- [Size comparison](https://github.com/timwuhaotian/kil#size): measured install sizes across ten terminals.
+- [FAQ](https://github.com/timwuhaotian/kil/blob/main/docs/faq.md): twelve questions on differences, persistence, size, install, and config.
+
+## Docs
+
+- [README](https://github.com/timwuhaotian/kil#readme): features, install, usage, and development.
+- [How it works](https://github.com/timwuhaotian/kil#how-it-works): session server architecture and crate layout.
+- [DESIGN.md](https://github.com/timwuhaotian/kil/blob/main/DESIGN.md): full design with measured PTY, memory, and rendering findings.
+- [CHANGELOG.md](https://github.com/timwuhaotian/kil/blob/main/CHANGELOG.md): release history.
+- [Releases](https://github.com/timwuhaotian/kil/tree/main/releases): latest DMG, checksum, and update metadata.

@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kil — 8.6MB Native macOS Terminal, Sessions Survive Quit</title>
+<meta name="description" content="Kil is a native macOS terminal written in Rust: 8.6 MB installed, 0% CPU at idle, vertical tabs, split panes, and jobs that survive quit, crash, reboot.">
+<meta name="keywords" content="kil terminal, native macos terminal, rust terminal emulator, lightweight terminal mac, terminal session persistence, apple silicon terminal, gpui terminal, iterm2 alternative">
+<link rel="canonical" href="https://github.com/timwuhaotian/kil">
+<meta name="robots" content="index, follow">
+<meta name="theme-color" content="#0d1117">
+
+<!-- Open Graph -->
+<meta property="og:title" content="Kil — 8.6MB Native macOS Terminal, Sessions Survive Quit">
+<meta property="og:description" content="A native macOS terminal in Rust: 8.6 MB installed, 0% CPU at idle, vertical tabs, split panes, and jobs that survive quit, crash, and reboot.">
+<meta property="og:image" content="https://raw.githubusercontent.com/timwuhaotian/kil/main/docs/screenshot.png">
+<meta property="og:url" content="https://github.com/timwuhaotian/kil">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Kil">
+
+<!-- Twitter Cards -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Kil — 8.6MB Native macOS Terminal, Sessions Survive Quit">
+<meta name="twitter:description" content="A native macOS terminal in Rust: 8.6 MB, 0% idle CPU, and jobs that survive quit, crash, and reboot. Free and MIT-licensed.">
+<meta name="twitter:image" content="https://raw.githubusercontent.com/timwuhaotian/kil/main/docs/screenshot.png">
+
+<link rel="icon" href="https://raw.githubusercontent.com/timwuhaotian/kil/main/docs/icon.png">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "Kil",
+      "description": "A native macOS terminal written in Rust: 8.6 MB installed, 0% CPU at idle, vertical tabs, animated split panes, and jobs that survive quit, crash, and reboot.",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "macOS 14 or later, Apple silicon",
+      "url": "https://github.com/timwuhaotian/kil",
+      "downloadUrl": "https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg",
+      "softwareVersion": "0.0.34",
+      "releaseNotes": "https://github.com/timwuhaotian/kil/blob/main/CHANGELOG.md",
+      "screenshot": "https://raw.githubusercontent.com/timwuhaotian/kil/main/docs/screenshot.png",
+      "featureList": [
+        "Jobs keep running after Kil quits or crashes; reopening restores every pane on its live process",
+        "8.6 MB installed — the smallest macOS terminal with tabs and split panes",
+        "Zero CPU at rest; a blinking cursor redraws only itself",
+        "Vertical tabs with job badges, animated split panes, rebindable keys",
+        "Agent on Edge: pair an iPhone over a TLS tunnel to drive the same panes",
+        "Self-updating: checks at launch and every 6 hours, jobs keep running across updates"
+      ],
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD",
+        "availability": "https://schema.org/InStock"
+      },
+      "author": {
+        "@type": "Organization",
+        "name": "Kil",
+        "url": "https://github.com/timwuhaotian/kil"
+      }
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is Kil?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Kil is a native macOS terminal written in Rust, built on GPUI (Metal rendering) and alacritty_terminal (VT parsing). It has vertical tabs, animated split panes, and rebindable shortcuts, installs at 8.6 MB, and runs on Apple silicon with macOS 14 or later."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do my sessions survive quit or crash?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A small session server (kil --server, the same binary) holds every pane's terminal and owns its PTY and child process. Pressing Cmd+Q or closing the window only detaches from it, and so does a crash. The next launch reattaches to the same live processes with the full screen, scrollback, and input modes — vim's unsaved buffer, the ssh connection, and the half-finished build are where you left them."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What happens after a logout or reboot?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Kil saves the layout, each pane's directory, and the window frame within 2 seconds of a change, and each pane's screen and scrollback every 30 seconds while it prints, plus immediately on quit. After a logout or reboot the processes themselves are gone, so each pane's last job is typed into a new shell instead."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How big is Kil compared to other macOS terminals?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Kil installs at 8.6 MB, measured at version 0.0.10. For comparison: Alacritty 14.7 MB, Ghostty 65.0 MB, iTerm2 202.9 MB, kitty 253.0 MB, and Warp 913.7 MB. Alacritty is the only one near Kil's size, and it has no tabs or split panes."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does Kil use CPU when idle?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. A window with nothing to draw doesn't wake: zero CPU at rest, and a blinking cursor redraws only itself. Nothing is written to disk unless something changed."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I install Kil, and what does it cost?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Kil is free and MIT-licensed. Download Kil-arm64.dmg (always the latest build), open it, and drag Kil to Applications. The app is signed with a Developer ID and notarized by Apple. From then on it keeps itself up to date: it checks at launch and every 6 hours, verifies checksum, signature, and notarization, and jobs keep running across the update."
+          }
+        }
+      ]
+    },
+    {
+      "@type": "Organization",
+      "name": "Kil",
+      "url": "https://github.com/timwuhaotian/kil",
+      "description": "Kil is a native macOS terminal written in Rust: 8.6 MB installed, zero CPU at idle, and terminal sessions that survive quit, crash, and reboot.",
+      "sameAs": ["https://github.com/timwuhaotian/kil"]
+    }
+  ]
+}
+</script>
+
+<style>
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #9aa4b2;
+  --accent: #58a6ff;
+  --accent-soft: rgba(88, 166, 255, .12);
+  --radius: 12px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+header.hero { padding: 72px 0 40px; text-align: center; }
+.hero .icon { width: 96px; height: 96px; border-radius: 22px; }
+h1 { font-size: 2.6rem; line-height: 1.15; margin: 20px 0 12px; letter-spacing: -0.02em; }
+.lede { font-size: 1.15rem; color: var(--muted); max-width: 680px; margin: 0 auto 28px; }
+.lede strong { color: var(--text); }
+.cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 20px; }
+.btn {
+  display: inline-block;
+  padding: 12px 28px;
+  border-radius: 10px;
+  font-size: 1rem;
+  font-weight: 600;
+  text-decoration: none;
+  border: 1px solid transparent;
+}
+.btn-primary { background: var(--accent); color: #04121f; }
+.btn-primary:hover { filter: brightness(1.1); }
+.btn-ghost { border-color: var(--border); color: var(--text); background: var(--panel); }
+.btn-ghost:hover { border-color: var(--accent); }
+.badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.badge {
+  font-size: .8rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 12px;
+  background: var(--panel);
+}
+.badge b { color: var(--text); font-weight: 600; }
+main section { padding: 36px 0; }
+h2 { font-size: 1.6rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+.section-sub { color: var(--muted); margin: 0 0 24px; }
+figure.shot { margin: 0; }
+figure.shot img {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: block;
+}
+figure.shot figcaption { color: var(--muted); font-size: .9rem; text-align: center; margin-top: 10px; }
+.cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+}
+.card h3 { margin: 0 0 8px; font-size: 1.1rem; }
+.card h3 .stat { color: var(--accent); }
+.card p { margin: 0; color: var(--muted); font-size: .95rem; }
+table.size { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; font-size: .95rem; }
+table.size th, table.size td { padding: 10px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+table.size tr:last-child th, table.size tr:last-child td { border-bottom: none; }
+table.size th { color: var(--muted); font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
+table.size td.num { font-variant-numeric: tabular-nums; }
+table.size tr.kil td { background: var(--accent-soft); font-weight: 700; }
+table.size tr.kil td:first-child { color: var(--accent); }
+.note { color: var(--muted); font-size: .85rem; margin-top: 12px; }
+.faq details {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  margin-bottom: 10px;
+}
+.faq summary { cursor: pointer; font-weight: 600; }
+.faq summary::marker { color: var(--accent); }
+.faq p { color: var(--muted); margin: 8px 0 2px; font-size: .95rem; }
+.install ol { color: var(--muted); padding-left: 22px; margin: 0; }
+.install ol li { margin-bottom: 8px; }
+.install a, footer a { color: var(--accent); text-decoration: none; }
+.install a:hover, footer a:hover { text-decoration: underline; }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .88em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+footer { border-top: 1px solid var(--border); padding: 28px 0 40px; margin-top: 12px; color: var(--muted); font-size: .9rem; text-align: center; }
+footer p { margin: 4px 0; }
+@media (max-width: 640px) {
+  h1 { font-size: 1.9rem; }
+  header.hero { padding: 48px 0 28px; }
+  .cards { grid-template-columns: 1fr; }
+  .btn { width: 100%; text-align: center; }
+  .cta { flex-direction: column; }
+}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <img class="icon" src="https://raw.githubusercontent.com/timwuhaotian/kil/main/docs/icon.png" alt="Kil app icon" width="96" height="96">
+    <h1>Kil — a terminal whose sessions survive quit</h1>
+    <p class="lede">A native macOS terminal written in Rust. <strong>8.6&nbsp;MB</strong> installed, <strong>zero CPU</strong> at idle — quit or crash it, reopen, and every pane is back on its live process.</p>
+    <div class="cta">
+      <a class="btn btn-primary" href="https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg">Download DMG</a>
+      <a class="btn btn-ghost" href="https://github.com/timwuhaotian/kil">GitHub</a>
+    </div>
+    <div class="badges">
+      <span class="badge"><b>v0.0.34</b></span>
+      <span class="badge">macOS 14+ · Apple silicon</span>
+      <span class="badge">8.6 MB</span>
+      <span class="badge">MIT license</span>
+      <span class="badge">Signed &amp; notarized by Apple</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+
+    <section aria-label="Screenshot">
+      <figure class="shot">
+        <img src="https://raw.githubusercontent.com/timwuhaotian/kil/main/docs/screenshot.png" alt="Kil terminal: vertical tabs in the sidebar; a tab split into git log, vim and htop panes" width="1000" loading="lazy">
+        <figcaption>Vertical tabs in the sidebar; one tab split into git log, vim, and htop.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="features">
+      <h2 id="features">Why Kil</h2>
+      <p class="section-sub">Four things Kil does that other macOS terminals don't do together.</p>
+      <div class="cards">
+        <div class="card">
+          <h3><span class="stat">Jobs survive quit</span> — even crash</h3>
+          <p>A session server holds every pane's terminal. <code>⌘Q</code>, closing the window, or a crash only detaches; the next launch reattaches to the same live processes with full screen, scrollback, and input modes.</p>
+        </div>
+        <div class="card">
+          <h3><span class="stat">8.6 MB</span> installed</h3>
+          <p>Smaller than Alacritty (14.7 MB) — which has no tabs or splits — and over 100× smaller than Warp (913.7 MB). Native Metal rendering via GPUI, VT parsing via alacritty_terminal.</p>
+        </div>
+        <div class="card">
+          <h3><span class="stat">0% CPU</span> at idle</h3>
+          <p>A window with nothing to draw doesn't wake. A blinking cursor redraws only itself, and nothing is written to disk unless something changed.</p>
+        </div>
+        <div class="card">
+          <h3><span class="stat">Phone remote</span> via Agent on Edge</h3>
+          <p>Scan a QR code to pair an iPhone to the same session server over a TLS tunnel — the panes on the phone are the panes on the desk. Optional UPnP port forwarding, no cloud service involved.</p>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="size">
+      <h2 id="size">Installed size vs other macOS terminals</h2>
+      <p class="section-sub">Measured installed app size. Kil ships an Apple silicon build; most others ship one universal app carrying each binary twice.</p>
+      <table class="size">
+        <thead>
+          <tr><th scope="col">Terminal</th><th scope="col">Installed size</th></tr>
+        </thead>
+        <tbody>
+          <tr class="kil"><td>Kil 0.0.10</td><td class="num">8.6 MB</td></tr>
+          <tr><td>Alacritty 0.17.0</td><td class="num">14.7 MB</td></tr>
+          <tr><td>Ghostty 1.3.1</td><td class="num">65.0 MB</td></tr>
+          <tr><td>iTerm2 3.7.6</td><td class="num">202.9 MB</td></tr>
+          <tr><td>kitty 0.49.2</td><td class="num">253.0 MB</td></tr>
+          <tr><td>Warp 0.2026.10.14</td><td class="num">913.7 MB</td></tr>
+        </tbody>
+      </table>
+      <p class="note">Alacritty is the only terminal near Kil's size, and it has no tabs or split panes. Source: measurements published in the Kil README.</p>
+    </section>
+
+    <section class="install" aria-labelledby="install">
+      <h2 id="install">Install in a minute</h2>
+      <p class="section-sub">Free and MIT-licensed. Signed with a Developer ID and notarized by Apple.</p>
+      <ol>
+        <li>Download <a href="https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg">Kil-arm64.dmg</a> — always the latest build.</li>
+        <li>Open it and drag <strong>Kil</strong> to <strong>Applications</strong>.</li>
+        <li>From then on Kil updates itself: it checks at launch and every 6 hours, verifies checksum, signature, and notarization — and your jobs keep running across the update.</li>
+      </ol>
+    </section>
+
+    <section class="faq" aria-labelledby="faq">
+      <h2 id="faq">Frequently asked questions</h2>
+      <p class="section-sub">Short answers, with the numbers.</p>
+
+      <details open>
+        <summary>What is Kil?</summary>
+        <p>Kil is a native macOS terminal written in Rust, built on GPUI (Metal rendering) and alacritty_terminal (VT parsing). It has vertical tabs, animated split panes, and rebindable shortcuts, installs at 8.6 MB, and runs on Apple silicon with macOS 14 or later.</p>
+      </details>
+
+      <details>
+        <summary>How do my sessions survive quit or crash?</summary>
+        <p>A small session server (kil --server, the same binary) holds every pane's terminal and owns its PTY and child process. Pressing Cmd+Q or closing the window only detaches from it, and so does a crash. The next launch reattaches to the same live processes with the full screen, scrollback, and input modes — vim's unsaved buffer, the ssh connection, and the half-finished build are where you left them.</p>
+      </details>
+
+      <details>
+        <summary>What happens after a logout or reboot?</summary>
+        <p>Kil saves the layout, each pane's directory, and the window frame within 2 seconds of a change, and each pane's screen and scrollback every 30 seconds while it prints, plus immediately on quit. After a logout or reboot the processes themselves are gone, so each pane's last job is typed into a new shell instead.</p>
+      </details>
+
+      <details>
+        <summary>How big is Kil compared to other macOS terminals?</summary>
+        <p>Kil installs at 8.6 MB, measured at version 0.0.10. For comparison: Alacritty 14.7 MB, Ghostty 65.0 MB, iTerm2 202.9 MB, kitty 253.0 MB, and Warp 913.7 MB. Alacritty is the only one near Kil's size, and it has no tabs or split panes.</p>
+      </details>
+
+      <details>
+        <summary>Does Kil use CPU when idle?</summary>
+        <p>No. A window with nothing to draw doesn't wake: zero CPU at rest, and a blinking cursor redraws only itself. Nothing is written to disk unless something changed.</p>
+      </details>
+
+      <details>
+        <summary>How do I install Kil, and what does it cost?</summary>
+        <p>Kil is free and MIT-licensed. Download Kil-arm64.dmg (always the latest build), open it, and drag Kil to Applications. The app is signed with a Developer ID and notarized by Apple. From then on it keeps itself up to date: it checks at launch and every 6 hours, verifies checksum, signature, and notarization, and jobs keep running across the update.</p>
+      </details>
+    </section>
+
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Kil is <a href="https://github.com/timwuhaotian/kil/blob/main/LICENSE">MIT-licensed</a>. GPUI and alacritty_terminal are Apache-2.0.</p>
+    <p><a href="https://github.com/timwuhaotian/kil">GitHub — timwuhaotian/kil</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

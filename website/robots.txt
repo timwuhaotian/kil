@@ -1,0 +1,30 @@
+# Kil landing page — robots.txt
+# Assumes GitHub Pages at https://timwuhaotian.github.io/kil/
+# If you switch to a custom domain, replace the Sitemap URL below
+# with https://your-domain/sitemap.xml (no other change needed).
+
+User-agent: *
+Allow: /
+
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: GPTBot
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
+
+Sitemap: https://timwuhaotian.github.io/kil/sitemap.xml
