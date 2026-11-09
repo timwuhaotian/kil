@@ -2,7 +2,7 @@
 //! [--host <ip>] [--launcher <exe>] [--public]`. Prefer `kil --remote`, which
 //! also knows how to start the session server.
 
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
@@ -47,7 +47,6 @@ fn main() -> Result<()> {
         dir,
         port,
         host,
-        ttl: Duration::from_secs(300),
         launcher,
         public,
     })?;

@@ -4,6 +4,32 @@ Notable changes to Kil. The download is always the latest build
 ([`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)); the
 versions below are how we track releases, and match `Cargo.toml` and the app's Info.plist.
 
+## 0.0.34 — 2026-11-09
+
+- **The pairing code no longer expires.** It is spent by the first phone, and that phone's token
+  reconnects for as long as the bridge runs — so the QR stays good until you switch the bridge
+  off, however long you take to scan it. **New QR** is for a second phone or a re-pair.
+- **The bridge belongs to Kil, not to the Settings panel.** Closing Settings leaves the tunnel up;
+  only the switch, or quitting Kil, stops it — and quitting stops it even from a terminal
+  (`kil --remote`), so a public port mapping never outlives Kil.
+- **The Remote panel says when the server is too old to mark a phone.** A session server started by
+  an older Kil reports no phone at all, and the panel used to show nothing about it. Settings ▸ Agent
+  on Edge now says so under the QR, with the remedy: **Kil ▸ Restart** brings up the new server. The
+  bridge probes the server once when it starts instead of once per connection.
+
+## Unreleased
+
+- **The pairing code no longer expires.** It is spent by the first phone, and that phone's token
+  reconnects for as long as the bridge runs — so the QR stays good until you switch the bridge
+  off, however long you take to scan it. **New QR** is for a second phone or a re-pair.
+- **The bridge belongs to Kil, not to the Settings panel.** Closing Settings leaves the tunnel up;
+  only the switch, or quitting Kil, stops it — and quitting stops it even from a terminal
+  (`kil --remote`), so a public port mapping never outlives Kil.
+- **The Remote panel says when the server is too old to mark a phone.** A session server started by
+  an older Kil reports no phone at all, and the panel used to show nothing about it. Settings ▸ Agent
+  on Edge now says so under the QR, with the remedy: **Kil ▸ Restart** brings up the new server. The
+  bridge probes the server once when it starts instead of once per connection.
+
 ## 0.0.33 — 2026-11-09
 
 - **A phone on a pane reads at a glance.** The tab's row in the sidebar is outlined in the

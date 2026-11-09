@@ -8,6 +8,7 @@ mod motion;
 mod notify;
 mod pane_tree;
 mod qr;
+mod remote;
 mod restore;
 mod settings;
 mod settings_window;
@@ -302,7 +303,6 @@ fn remote_config() -> Option<kil_remote::Config> {
         dir,
         port,
         host,
-        ttl: std::time::Duration::from_secs(300),
         launcher: std::env::current_exe().ok(),
         public,
     })
@@ -376,6 +376,7 @@ fn main() {
             return;
         };
         register_app_actions(cx);
+        remote::init(cx);
         update::init(cx);
         let clicks = notify::init();
         // Settings alone doesn't keep the app alive.

@@ -48,13 +48,18 @@ owns every process, PID and file descriptor it creates.
 - **Remote panes for Agent on Edge.** Settings ▸ Agent on Edge shows a QR code that pairs an
   iPhone to the same session server through a TLS tunnel, so the panes on the phone are the
   panes on the desk; `kil --remote` does the same from a terminal, and the standalone
-  `kil-remote` binary without starting the server. Ticking Public internet asks your own
+  `kil-remote` binary without starting the server. The pairing code never expires — the first
+  phone spends it and its token reconnects for as long as the bridge runs — and the bridge
+  belongs to Kil rather than to the panel, so closing Settings leaves it up; **New QR** makes
+  a fresh certificate, code and port for a second phone or a re-pair. Ticking Public internet
+  asks your own
   router (UPnP) to forward a port and prints a QR for the public IP, so the phone works from
   anywhere — no cloud service or third party is involved, and the mapping is removed when the
   bridge stops. While a phone is attached, its tab's row in the sidebar is outlined in the
   theme's accent and carries a small phone badge; when the phone types, both turn solid —
   driving, not just watching — and the pane stays fully usable either way. The phone follows
-  the window's theme and pane size as they change.
+  the window's theme and pane size as they change. A session server started by an older Kil
+  marks no pane: the panel says so, and **Kil ▸ Restart** brings up the new server.
 - **Comes back after a restart, too.** The layout, each pane's directory and the window frame
   are saved within 2 s of a change, and each pane's screen and scrollback every 30 s while it
   prints, and at once when you quit. After a logout or a reboot, the processes themselves are

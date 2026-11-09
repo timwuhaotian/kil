@@ -7,15 +7,17 @@ use std::{fs, sync::Arc, time::Duration};
 use gpui::{
     AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, Div, ElementId, Entity,
     FocusHandle, Focusable, Hsla, ImageSource, KeyBinding, Keystroke, MouseButton, MouseDownEvent,
-    PathPromptOptions, RenderImage, SharedString, Stateful, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, div, img, point, prelude::*, px, size,
+    PathPromptOptions, RenderImage, SharedString, Stateful, Subscription, Task, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, div, img, point, prelude::*, px, size,
 };
-use kil_remote::Bridge;
+use kil_remote::Config;
 
 use crate::{
     config,
     keymap::{self, Command},
-    qr, restore,
+    qr,
+    remote::Remote,
+    restore,
     settings::{Settings, abbreviate_home, config_dir, expand_home},
     text_field::{FieldEvent, TextField},
     theme::{Theme, ThemeName, hsla},
@@ -84,14 +86,17 @@ pub struct SettingsWindow {
     error: Option<SharedString>,
     /// Check Now is waiting on its update check.
     checking_update: bool,
-    /// The Agent on Edge bridge shown in the Remote section, when enabled.
-    remote: Option<Arc<Bridge>>,
     remote_qr: Option<Arc<RenderImage>>,
     remote_code: Option<String>,
     remote_fingerprint: Option<String>,
     remote_public: bool,
     remote_paired: bool,
     remote_error: Option<SharedString>,
+    /// The Remote section's warning, set when the QR lands: the session server
+    /// is from before the presence frames, so it marks no pane.
+    remote_warning: Option<&'static str>,
+    /// The loop that watches the bridge while it runs; dropped with the bridge.
+    remote_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -133,13 +138,14 @@ impl SettingsWindow {
             recorder: None,
             error,
             checking_update: false,
-            remote: None,
             remote_qr: None,
             remote_code: None,
             remote_fingerprint: None,
             remote_public: false,
             remote_paired: false,
             remote_error: None,
+            remote_warning: None,
+            remote_task: None,
             _subscriptions: subscriptions,
         };
         this.load_keys();
@@ -568,6 +574,16 @@ fn pressed(color: Hsla) -> Hsla {
     }
 }
 
+/// The Remote section's warning when the session server is too old to report a
+/// phone: `None` when it reports one. Pure, so the mapping is unit-tested
+/// without a server.
+fn stale_server_warning(stale: bool) -> Option<&'static str> {
+    stale.then_some(
+        "Kil's session server is from an older Kil, so a phone won't be marked on your panes. \
+         Kil ▸ Restart brings up the new server.",
+    )
+}
+
 /// A settings row; clicking `label_for`'s label focuses its field.
 fn row(
     label: &'static str,
@@ -960,7 +976,7 @@ impl SettingsWindow {
     /// The "Agent on Edge remote" section: enable the bridge, choose public
     /// mode, and once running show the QR, pairing code and connection state.
     fn remote_rows(&self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let on = self.remote.is_some();
+        let on = cx.global::<Remote>().on();
         let mut rows = vec![
             row(
                 "Agent on Edge remote",
@@ -974,9 +990,8 @@ impl SettingsWindow {
                 toggle("agent-on-edge-remote", on, c).on_click(cx.listener(
                     |this, _: &ClickEvent, window, cx| {
                         this.cancel_recording(cx);
-                        if this.remote.is_some() {
+                        if cx.global::<Remote>().on() {
                             this.remote_stop(cx);
-                            cx.notify();
                         } else {
                             this.remote_start(window, cx);
                         }
@@ -991,7 +1006,7 @@ impl SettingsWindow {
                 toggle("remote-public", self.remote_public, c).on_click(cx.listener(
                     |this, _: &ClickEvent, window, cx| {
                         this.remote_public = !this.remote_public;
-                        if this.remote.is_some() {
+                        if cx.global::<Remote>().on() {
                             this.remote_stop(cx);
                             this.remote_start(window, cx);
                         } else {
@@ -1004,42 +1019,17 @@ impl SettingsWindow {
 
         if on {
             if let Some(image) = self.remote_qr.as_ref() {
-                rows.push(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_1()
-                        .py_2()
-                        .child(
-                            img(ImageSource::Render(image.clone()))
-                                .w(px(220.))
-                                .h(px(220.)),
-                        )
-                        .child(div().text_size(px(11.)).text_color(c.muted).child(format!(
-                            "Pairing code: {}",
-                            self.remote_code.as_deref().unwrap_or("…")
-                        )))
-                        .child(div().text_size(px(11.)).text_color(c.muted).child(format!(
-                            "Fingerprint: sha256:{}",
-                            self.remote_fingerprint.as_deref().unwrap_or("…")
-                        )))
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(if self.remote_paired {
-                                    c.accent
-                                } else {
-                                    c.muted
-                                })
-                                .child(if self.remote_paired {
-                                    "● Paired — iPhone connected"
-                                } else {
-                                    "○ Waiting for scan…"
-                                }),
-                        )
-                        .into_any_element(),
-                );
+                rows.push(self.remote_qr(image, c, cx));
+                if let Some(warning) = self.remote_warning {
+                    rows.push(
+                        div()
+                            .py_1()
+                            .text_size(px(11.))
+                            .text_color(c.error)
+                            .child(warning)
+                            .into_any_element(),
+                    );
+                }
             } else if let Some(err) = self.remote_error.as_ref() {
                 rows.push(
                     div()
@@ -1063,65 +1053,123 @@ impl SettingsWindow {
         rows
     }
 
+    /// The running bridge's QR, pairing code, connection state, and the button
+    /// for a fresh one.
+    fn remote_qr(&self, image: &Arc<RenderImage>, c: Colors, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .py_2()
+            .child(
+                img(ImageSource::Render(image.clone()))
+                    .w(px(220.))
+                    .h(px(220.)),
+            )
+            .child(div().text_size(px(11.)).text_color(c.muted).child(format!(
+                "Pairing code: {}",
+                self.remote_code.as_deref().unwrap_or("…")
+            )))
+            .child(div().text_size(px(11.)).text_color(c.muted).child(format!(
+                "Fingerprint: sha256:{}",
+                self.remote_fingerprint.as_deref().unwrap_or("…")
+            )))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(if self.remote_paired {
+                        c.accent
+                    } else {
+                        c.muted
+                    })
+                    .child(if self.remote_paired {
+                        "● Paired — iPhone connected"
+                    } else {
+                        "○ Waiting for scan…"
+                    }),
+            )
+            .child(
+                // The code is spent by the first phone, so a fresh one — for a
+                // second phone, or a re-pair — is a click away.
+                button("remote-new-qr", "New QR", c)
+                    .text_size(px(11.))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.cancel_recording(cx);
+                        this.remote_restart(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn remote_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dir) = restore::Store::standard().map(|store| store.dir().to_owned()) else {
             self.remote_error = Some("No session server directory available.".into());
             cx.notify();
             return;
         };
-        let config = kil_remote::Config {
+        let config = Config {
             dir,
             port: 0,
             host: None,
-            ttl: Duration::from_secs(300),
             launcher: std::env::current_exe().ok(),
             public: self.remote_public,
         };
-        match Bridge::start(&config) {
-            Ok(bridge) => {
-                self.remote = Some(bridge);
+        match cx.global_mut::<Remote>().start(&config) {
+            Ok(()) => {
+                self.remote_warning = None;
                 self.remote_qr = None;
                 self.remote_code = None;
                 self.remote_fingerprint = None;
                 self.remote_error = None;
                 self.remote_paired = false;
                 cx.notify();
-
-                let weak = cx.entity().downgrade();
-                window
-                    .spawn(cx, async move |async_cx| {
-                        loop {
-                            let keep = async_cx
-                                .update(|_, cx| {
-                                    weak.update(cx, |this, cx| {
-                                        if this.remote.is_none() {
-                                            return false;
-                                        }
-                                        this.remote_poll(cx);
-                                        true
-                                    })
-                                    .unwrap_or(false)
-                                })
-                                .unwrap_or(false);
-                            if !keep {
-                                break;
-                            }
-                            async_io::Timer::after(Duration::from_millis(500)).await;
-                        }
-                    })
-                    .detach();
+                self.remote_watch(window, cx);
             }
             Err(err) => {
-                self.remote_error = Some(format!("{err:#}").into());
+                self.remote_error = Some(err.into());
                 cx.notify();
             }
         }
     }
 
-    fn remote_stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(bridge) = self.remote.take() {
-            bridge.stop();
+    /// Watches the bridge while it runs: materializes the QR once it is ready,
+    /// and keeps the paired indicator true. Started when the bridge starts and
+    /// when a panel opens on a bridge that already runs — the bridge is the
+    /// app's, so the panel may not be what started it.
+    fn remote_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_task.is_some() {
+            return;
         }
+        let weak = cx.entity().downgrade();
+        self.remote_task = Some(window.spawn(cx, async move |async_cx| {
+            loop {
+                let keep = async_cx
+                    .update(|_, cx| {
+                        weak.update(cx, |this, cx| {
+                            if !cx.global::<Remote>().on() {
+                                return false;
+                            }
+                            this.remote_poll(cx);
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+                async_io::Timer::after(Duration::from_millis(500)).await;
+            }
+        }));
+    }
+
+    fn remote_stop(&mut self, cx: &mut Context<Self>) {
+        cx.global_mut::<Remote>().stop();
+        // Dropping the task ends the loop at once; leaving it to notice the
+        // bridge is gone would run two loops after a restart.
+        self.remote_task = None;
+        self.remote_warning = None;
         self.remote_qr = None;
         self.remote_code = None;
         self.remote_fingerprint = None;
@@ -1130,10 +1178,18 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    /// A fresh QR: the bridge restarts, which makes a new certificate, pairing
+    /// code and port. For a second phone, or a re-pair — the code never expires,
+    /// so there is no clock to beat.
+    fn remote_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remote_stop(cx);
+        self.remote_start(window, cx);
+    }
+
     /// Called on a timer while the bridge runs: materialize the QR once it is
     /// ready and refresh the paired indicator.
     fn remote_poll(&mut self, cx: &mut Context<Self>) {
-        let Some(bridge) = self.remote.as_ref() else {
+        let Some(bridge) = cx.global::<Remote>().bridge().cloned() else {
             return;
         };
         if self.remote_qr.is_none()
@@ -1147,6 +1203,10 @@ impl SettingsWindow {
                 }
                 Err(err) => self.remote_error = Some(err),
             }
+            // Asked once, the first time the QR lands: the bridge publishes it only
+            // with the server up, so this reads a live answer. A server from before
+            // the presence frames reports no phone, however the phone itself does.
+            self.remote_warning = stale_server_warning(!bridge.reports_presence());
             cx.notify();
         }
         if let Some(err) = bridge.error()
@@ -1159,14 +1219,6 @@ impl SettingsWindow {
         if paired != self.remote_paired {
             self.remote_paired = paired;
             cx.notify();
-        }
-    }
-}
-
-impl Drop for SettingsWindow {
-    fn drop(&mut self) {
-        if let Some(bridge) = self.remote.take() {
-            bridge.stop();
         }
     }
 }
@@ -1259,6 +1311,7 @@ mod tests {
         cx.update(|cx| {
             cx.set_global(Theme::default());
             cx.set_global(Settings::default());
+            cx.set_global(crate::remote::Remote::default());
             crate::register_app_actions(cx);
             cx.dispatch_action(&crate::OpenSettings);
         });
@@ -1267,6 +1320,15 @@ mod tests {
             .iter()
             .find_map(AnyWindowHandle::downcast::<SettingsWindow>)
             .expect("the Settings window")
+    }
+
+    #[test]
+    fn only_a_server_too_old_to_report_a_phone_gets_the_warning() {
+        assert_eq!(stale_server_warning(false), None);
+        assert!(
+            stale_server_warning(true).is_some_and(|warning| warning.contains("Restart")),
+            "the warning says the marks are missing and names the remedy"
+        );
     }
 
     #[test]
@@ -1406,6 +1468,7 @@ mod tests {
         cx.update(|cx| {
             cx.set_global(Theme::default());
             cx.set_global(Settings::default());
+            cx.set_global(crate::remote::Remote::default());
             crate::register_app_actions(cx);
             cx.dispatch_action(&crate::OpenSettings);
             cx.dispatch_action(&crate::OpenSettings);

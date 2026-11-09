@@ -29,7 +29,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -57,8 +60,6 @@ pub struct Config {
     pub port: u16,
     /// Address to put in the QR, overriding the detected LAN IP.
     pub host: Option<String>,
-    /// How long a printed pairing code stays valid.
-    pub ttl: Duration,
     /// A binary that can run `--server <dir>` if no session server is running.
     pub launcher: Option<PathBuf>,
     /// Expose the bridge through the router's `UPnP` port mapping so the QR
@@ -76,8 +77,25 @@ pub struct QrPayload {
     pub url: String,
 }
 
+/// A fresh self-signed identity for the tunnel: the SHA-256 fingerprint of
+/// the certificate the phone pins (it goes in the QR), and the acceptor that
+/// serves it. A new one per bridge start is what makes **New QR** a re-pair.
+fn tls_identity() -> Result<(String, TlsAcceptor)> {
+    let certified = rcgen::generate_simple_self_signed(vec!["kil".into()])
+        .context("generate a self-signed certificate")?;
+    let fingerprint = fingerprint(certified.cert.der());
+    let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certified.cert.der().clone()], key)
+        .context("build the TLS server config")?;
+    Ok((fingerprint, TlsAcceptor::from(Arc::new(tls))))
+}
+
 /// The one-time pairing secret, the token issued after the first use, and a
-/// per-IP failure ledger that throttles pairing-code brute force.
+/// per-IP failure ledger that throttles pairing-code brute force. The code
+/// never expires: it is good until the bridge stops, and the first phone to
+/// spend it holds the token from then on.
 struct Auth {
     code: String,
     token: Option<String>,
@@ -110,6 +128,10 @@ pub struct Bridge {
     shutdown: watch::Sender<bool>,
     qr: Arc<Mutex<Option<QrPayload>>>,
     error: Arc<Mutex<Option<String>>>,
+    /// Whether the session server understands a phone's declaration, probed
+    /// once when the bridge starts: a server that answers it also answers the
+    /// app's presence queries, so this is whether a phone is marked at all.
+    tags_remote: Arc<AtomicBool>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -124,18 +146,8 @@ impl Bridge {
         // If a provider is already installed (GPUI's HTTP client installs one), keep it.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let certified = rcgen::generate_simple_self_signed(vec!["kil".into()])
-            .context("generate a self-signed certificate")?;
-        let cert = certified.cert.der().clone();
-        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
-        let tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.clone()], key)
-            .context("build the TLS server config")?;
-        let acceptor = TlsAcceptor::from(Arc::new(tls));
-
+        let (fingerprint, acceptor) = tls_identity()?;
         let code = random_code()?;
-        let fingerprint = fingerprint(&cert);
         let listener = StdTcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.port)))
             .with_context(|| format!("bind port {}", config.port))?;
         listener.set_nonblocking(true)?;
@@ -147,6 +159,7 @@ impl Bridge {
         }));
         let qr = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
+        let tags_remote = Arc::new(AtomicBool::new(false));
         let socket_path = kil_term::server::socket_path(&config.dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -154,6 +167,7 @@ impl Bridge {
         let thread_auth = Arc::clone(&auth);
         let qr_ready = Arc::clone(&qr);
         let error_slot = Arc::clone(&error);
+        let thread_tags = Arc::clone(&tags_remote);
         let thread = std::thread::Builder::new()
             .name("kil-remote".into())
             .spawn(move || {
@@ -170,6 +184,10 @@ impl Bridge {
                         TcpListener::from_std(listener).context("register the TCP listener")?;
                     ensure_server(&socket_path, config.launcher.as_deref(), &config.dir).await?;
                     keep_alive(&socket_path).await?;
+                    // Probed once, not once per phone connection: the answer is
+                    // the server's, and the app's presence poll needs it too.
+                    let tags = server_tags_remote(&socket_path).await;
+                    thread_tags.store(tags, Ordering::Release);
 
                     let public = if config.public {
                         Some(PublicMapping::create(listener.local_addr()?).await?)
@@ -198,9 +216,11 @@ impl Bridge {
                     let result = serve(
                         listener,
                         acceptor,
-                        socket_path,
+                        Relay {
+                            socket_path,
+                            tags_remote: tags,
+                        },
                         thread_auth,
-                        config.ttl,
                         shutdown_rx,
                     )
                     .await;
@@ -220,6 +240,7 @@ impl Bridge {
             shutdown: shutdown_tx,
             qr,
             error,
+            tags_remote,
             thread: Mutex::new(Some(thread)),
         }))
     }
@@ -256,6 +277,14 @@ impl Bridge {
             .is_some()
     }
 
+    /// Whether the session server reports a phone's presence at all. The
+    /// `Remote` declaration it understands and the `Watchers` query the app
+    /// polls arrived in the same Kil, so one probe answers both: `false` is a
+    /// server from an older Kil, which marks no pane until it is replaced.
+    pub fn reports_presence(&self) -> bool {
+        self.tags_remote.load(Ordering::Acquire)
+    }
+
     /// A fatal setup or runtime error, if any, for the UI to show.
     pub fn error(&self) -> Option<String> {
         self.error
@@ -263,6 +292,16 @@ impl Bridge {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+}
+
+/// What every relayed connection needs about Kil's session server: its
+/// socket, and whether it understands a phone's declaration (probed once when
+/// the bridge starts, since a server that answers it also answers the app's
+/// presence queries).
+#[derive(Clone)]
+struct Relay {
+    socket_path: PathBuf,
+    tags_remote: bool,
 }
 
 /// Runs the bridge as a command line: prints the QR, waits for Ctrl-C, stops.
@@ -402,21 +441,19 @@ async fn keep_alive(socket_path: &Path) -> Result<()> {
 async fn serve(
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    socket_path: PathBuf,
+    relay: Relay,
     auth: Arc<Mutex<Auth>>,
-    ttl: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let started = std::time::Instant::now();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (tcp, peer) = accepted?;
                 let acceptor = acceptor.clone();
                 let auth = Arc::clone(&auth);
-                let socket_path = socket_path.clone();
+                let relay = relay.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(acceptor, tcp, peer, &socket_path, auth, ttl, started).await {
+                    if let Err(err) = handle_connection(acceptor, tcp, peer, relay, auth).await {
                         log::info!("remote connection from {peer} ended: {err:#}");
                     }
                 });
@@ -435,10 +472,8 @@ async fn handle_connection(
     acceptor: TlsAcceptor,
     tcp: TcpStream,
     peer: SocketAddr,
-    socket_path: &Path,
+    relay: Relay,
     auth: Arc<Mutex<Auth>>,
-    ttl: Duration,
-    started: std::time::Instant,
 ) -> Result<()> {
     let tls = acceptor.accept(tcp).await.context("TLS handshake")?;
     let mut reader = BufReader::new(tls);
@@ -449,14 +484,6 @@ async fn handle_connection(
         .context("read the pairing line")?;
 
     let line = line.trim();
-
-    // The pairing code expires; an issued token does not, so a phone that is
-    // already paired can keep opening control/attach connections for as long
-    // as the bridge runs.
-    if line.starts_with("KIL1 ") && started.elapsed() > ttl {
-        reply(&mut reader, "ERR expired").await?;
-        return Ok(());
-    }
 
     let Some(token) = authenticate(line, &auth) else {
         // Public exposure makes the pairing code brute-forceable in theory;
@@ -476,13 +503,13 @@ async fn handle_connection(
         return Ok(());
     };
 
-    let mut unix = UnixStream::connect(socket_path)
+    let mut unix = UnixStream::connect(&relay.socket_path)
         .await
         .context("connect to Kil's session server")?;
     // A supporting server tags the connection a phone's from this declaration, so its
     // input reads as driving; an older one never sees it, and the relay then behaves
     // exactly as before.
-    if server_tags_remote(socket_path).await {
+    if relay.tags_remote {
         unix.write_all(REMOTE_DECLARATION)
             .await
             .context("declare the relay a phone's")?;
@@ -515,6 +542,10 @@ const REMOTE_DECLARATION: &[u8] = &[1, 0, 0, 0, 19];
 /// says hello, declares itself remote, and asks for the sessions. A server from before
 /// the declaration hangs up on the unknown frame instead of answering, which reads as
 /// no support.
+///
+/// Asked once when the bridge starts: a server from the same generation answers the
+/// app's `Watchers` query too, so this one probe decides whether a phone is reported
+/// on the panes at all.
 async fn server_tags_remote(socket_path: &Path) -> bool {
     tokio::time::timeout(Duration::from_secs(2), probe_remote(socket_path))
         .await
@@ -617,7 +648,7 @@ fn print_qr(payload: &str, code: &str, fingerprint: &str, dir: &Path, public: bo
         );
         println!("          the mapping is removed when this process stops.");
     }
-    println!("  The code is valid once and expires shortly after printing.");
+    println!("  The code is spent by the first phone and stays good until this bridge stops.");
     println!();
 }
 
@@ -767,6 +798,67 @@ mod tests {
             ],
         );
         assert!(server_tags_remote(&socket).await);
+    }
+
+    /// A server from before the `Remote` declaration, on a socket of its own: it answers
+    /// hello, then hangs up on the frame it doesn't know — as a real one from before
+    /// 0.0.32 does, both to the declaration and to the app's `Watchers`.
+    fn server_from_before_presence(dir: &Path) -> PathBuf {
+        use std::io::{Read as _, Write as _};
+
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let socket = dir.join("server.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    // Hello { protocol: 2 }, then nothing: the next frame is unknown.
+                    let _ = stream.write_all(&[5, 0, 0, 0, 1, 2, 0, 0, 0]);
+                    let mut buf = [0u8; 64];
+                    let _ = stream.read(&mut buf);
+                });
+            }
+        });
+        socket
+    }
+
+    fn bridge_on(dir: &Path) -> Arc<Bridge> {
+        Bridge::start(&Config {
+            dir: dir.to_owned(),
+            port: 0,
+            host: None,
+            launcher: None,
+            public: false,
+        })
+        .expect("the bridge starts")
+    }
+
+    #[tokio::test]
+    async fn a_current_server_reports_a_phone_to_the_bridge() {
+        let dir = std::env::temp_dir().join(format!("kil-bridge-new-{}", std::process::id()));
+        kil_term::server::serve_in_thread(&dir).unwrap();
+        let bridge = bridge_on(&dir);
+        wait_for_qr(&bridge, Duration::from_secs(15)).unwrap();
+        assert!(
+            bridge.reports_presence(),
+            "a server that answers the declaration reports the phone"
+        );
+        bridge.stop();
+    }
+
+    #[tokio::test]
+    async fn a_server_from_before_presence_reports_no_phone_to_the_bridge() {
+        let dir = std::env::temp_dir().join(format!("kil-bridge-old-{}", std::process::id()));
+        server_from_before_presence(&dir);
+        let bridge = bridge_on(&dir);
+        wait_for_qr(&bridge, Duration::from_secs(15)).unwrap();
+        assert!(
+            !bridge.reports_presence(),
+            "a server that hangs up on the declaration reports no phone"
+        );
+        bridge.stop();
     }
 
     #[tokio::test]
