@@ -3086,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "kil"
-version = "0.0.27"
+version = "0.0.28"
 dependencies = [
  "anyhow",
  "block2",
@@ -3104,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "kil-term"
-version = "0.0.27"
+version = "0.0.28"
 dependencies = [
  "alacritty_terminal",
  "libc",

@@ -6,6 +6,40 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.28 — 2026-11-09
+
+- **The sidebar follows the active tab.** With more tabs than fit, `⌘1…9`, `⌘⇧[` / `]`
+  and notification clicks scroll the selected row into view. Long folder paths shorten
+  from the front, so the current folder stays visible instead of being cut off.
+- **The exit banner moved to the top of the pane**, so a crashed program's last lines
+  stay readable, and it says `exited 1` / `killed: SIGKILL` as documented. Clicking
+  it closes the pane.
+- **Selection drags past the pane edge**, with autoscroll, and shift-click extends the
+  selection from its anchor.
+- **Steady cursors stay steady.** A program that asks for one (vim) no longer blinks,
+  and the blink itself fades over 100 ms.
+- **Settings fixes.** Recording a shortcut no longer swallows typing in terminals,
+  Escape cancels it, and bare letters are refused. Validation errors pin to the
+  bottom instead of hiding below the fold, keymap file errors show here too, and
+  **Check Now** says **Checking…** while it works. Toggles show their knob on every
+  theme, and fields support shift-select, drag-select, word-select, copy and cut.
+- **Rebinding fully moves a command.** Both defaults of next/previous tab unbind, all
+  bound chords display, and the display matches the menus (`^⌥⇧⌘` order, `⌫ ⌦ ⎋`
+  glyphs). The file tolerates `[bindings]` comments and single quotes, and keeps
+  trailing comments.
+- **Links.** A URL wrapped across rows opens whole, Chinese punctuation no longer
+  glues onto URLs, and markdown links with parentheses open whole.
+- **Menus.** Quit is last again, the Window menu has Minimize (`⌘M`) and Zoom, and
+  the Kil menu has About Kil.
+- **Notifications.** Dismissing one no longer jumps to its pane, and repeats from
+  the same pane coalesce instead of stacking.
+- **Update window.** A background check opens without stealing focus, failures no
+  longer paint over the buttons, and offline failures say so plainly.
+- **Contrast.** Muted text meets AA on every theme, menu hover and toggle knobs use
+  dark-on-accent, and input borders show at rest.
+- **F13–F20 work**, double-clicking **New Tab** opens one tab, notices no longer
+  click through to the terminal, and a `Motion::scale` of 0 disables animations.
+
 ## 0.0.27 — 2026-11-08
 
 - **Updates download again.** GitHub's `github.com/<repo>/raw/<branch>/<file>` link answers

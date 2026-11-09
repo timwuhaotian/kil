@@ -62,7 +62,8 @@ owns every process, PID and file descriptor it creates.
 - **A default directory** for new tabs, if you want one. Splits still open where their pane
   is.
 - **Rebindable keys** in `~/.config/kil/keymap.toml` (**Kil ▸ Keyboard Shortcuts…** opens it),
-  with the menus showing whatever is bound. Settings live in a Settings window (`⌘,`) or
+  with the menus showing single-chord bindings (multi-stroke keys and `⌘1…9` work but
+  don't display). Settings live in a Settings window (`⌘,`) or
   `~/.config/kil/config.toml`.
 - **Strict about processes.** Children get clean descriptors and signal masks. A closed pane is
   hung up, then killed after 3 s if it ignores the hangup. No zombies, no leaked jobs. It is
