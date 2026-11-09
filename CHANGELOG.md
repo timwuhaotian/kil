@@ -4,6 +4,27 @@ Notable changes to Kil. The download is always the latest build
 ([`Kil-arm64.dmg`](https://raw.githubusercontent.com/timwuhaotian/kil/main/releases/Kil-arm64.dmg)); the
 versions below are how we track releases, and match `Cargo.toml` and the app's Info.plist.
 
+## Unreleased
+
+- **A phone on a pane reads at a glance.** The tab's row in the sidebar is outlined in the
+  theme's accent and carries a phone badge while Agent on Edge is attached; when the phone
+  types, the outline and badge turn solid. This replaces the dots on the tab row and in the
+  pane's corner, and the red driving mark that read like an error.
+- **A pane no longer shows itself ended while its job runs on.** A client that kept up was
+  still dropped by the session server whenever a megabyte of output arrived in one read, or
+  when the scrollback it attached to was over a megabyte — a wide pane's full history is —
+  and the window then showed "ended" with a `!`, and its later resizes went nowhere, so the
+  program kept drawing at its old size in a corner of the pane. Clients now get output as it
+  is read, the state an attach starts with is not counted as falling behind, and the limit is
+  4 MB. If the server does drop the window's connection, the pane attaches again at once from
+  the full state, with its own size and theme.
+- **The phone follows the window.** The server sends a phone the window's theme colors when
+  it attaches and when the theme changes, and the window's grid when it is resized. Older
+  phones skip the frames.
+- A session server started by an older Kil keeps running its own code until Kil ▸ Restart
+  or Kil ▸ Quit and Stop All Jobs: before 0.0.31 it handed a session to the phone and cut
+  the window off, and before 0.0.32 it reports no phone at all.
+
 ## 0.0.32 — 2026-11-09
 
 - **See when your phone is on a pane.** A phone attached through Agent on Edge now

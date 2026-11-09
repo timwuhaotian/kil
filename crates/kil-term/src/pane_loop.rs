@@ -44,10 +44,12 @@ const CLIENT_TOKEN: usize = 2;
 const MAX_LOCKED_READ: usize = 64 << 10;
 /// Bytes read before the loop goes back to the poller, so input and commands keep flowing.
 const MAX_READ: usize = 1 << 20;
-/// A client with this much output waiting is dropped: it fell too far behind
+/// A client with this much live output waiting is dropped: it fell too far behind
 /// to catch up, and the program must never wait for a terminal (DESIGN.md
-/// §14.4). A dropped app reattaches with the full state.
-const CLIENT_HIGH_WATER: usize = 1 << 20;
+/// §14.4). A dropped app reattaches with the full state. Well above one read's worth, so
+/// a burst read in one go can't sink a client that keeps up; the state an attach starts
+/// with doesn't count (see [`Client::grace`]).
+const CLIENT_HIGH_WATER: usize = 4 * MAX_READ;
 /// A client that takes nothing for this long while output waits is dropped, so a stopped
 /// or hung app never stalls the program. It reattaches with the full state.
 const CLIENT_STALL: Duration = Duration::from_secs(2);
@@ -290,7 +292,7 @@ impl PaneLoop {
             match self.rx.try_recv() {
                 Ok(Command::Input(bytes)) => self.writes.push_back(bytes),
                 Ok(Command::Resize(size)) => self.pty.on_resize(size),
-                Ok(Command::Palette(palette)) => self.palette = palette,
+                Ok(Command::Palette(palette)) => self.set_palette(palette),
                 Ok(Command::Attach { stream, remote }) => {
                     if let Err(err) = self.attach(stream, remote) {
                         log::warn!("attach failed: {err}");
@@ -327,6 +329,10 @@ impl PaneLoop {
             synced = self.parser.sync_bytes_count();
             for client in &mut self.clients {
                 client.queue_output(bytes);
+                // Handed over as it comes, so each client parses alongside this loop
+                // instead of getting a whole read's worth at once. A failure is the
+                // client's to report on its next event.
+                let _ = client.flush();
             }
             total += read;
         }
@@ -379,7 +385,7 @@ impl PaneLoop {
         while i < self.clients.len() {
             let client = &self.clients[i];
             let stalled = client.pending() > 0 && client.progress.elapsed() >= CLIENT_STALL;
-            let drowned = client.pending() > CLIENT_HIGH_WATER;
+            let drowned = client.backlog() > CLIENT_HIGH_WATER;
             if stalled || drowned {
                 if stalled {
                     log::warn!("client took nothing for {CLIENT_STALL:?}; detaching it");
@@ -425,6 +431,13 @@ impl PaneLoop {
         };
         let mut client = Client::new(stream, remote);
         client.queue_output(&bytes);
+        // A whole scrollback can be megabytes: what the client starts with is not falling
+        // behind, so only the output after it counts toward the high-water mark.
+        client.grace = client.pending();
+        if remote {
+            // A phone can't know the app's theme otherwise; the Kil window sends it.
+            client.queue(&Frame::Palette(self.palette.clone()));
+        }
         client.register(&self.poller)?;
         self.clients.push(client);
         self.attached.fetch_add(1, Ordering::AcqRel);
@@ -486,7 +499,7 @@ impl PaneLoop {
                     self.writes.push_back(bytes.into());
                 }
                 Frame::Resize(size) => self.resize(size),
-                Frame::Palette(palette) => self.palette = palette,
+                Frame::Palette(palette) => self.set_palette(palette),
                 Frame::Close => close = true,
                 other => log::warn!("unexpected frame from client: {other:?}"),
             }
@@ -501,6 +514,22 @@ impl PaneLoop {
         self.events.mark_dirty();
         self.nudge = None;
         self.pty.on_resize(size.into());
+        // A phone mirrors the grid it was handed on attach; tell it the window's new one.
+        self.tell_remotes(&Frame::Resize(size));
+    }
+
+    /// Color queries are answered from `palette` from now on, and phones restyle with it.
+    fn set_palette(&mut self, palette: Palette) {
+        self.tell_remotes(&Frame::Palette(palette.clone()));
+        self.palette = palette;
+    }
+
+    /// Queues `frame` for every phone. The Kil window sends these, so it never needs them
+    /// back; a phone too old to know them skips their kind.
+    fn tell_remotes(&mut self, frame: &Frame) {
+        for client in self.clients.iter_mut().filter(|client| client.remote) {
+            client.queue(frame);
+        }
     }
 
     /// Drops every client, after a last try at sending what is queued for each
@@ -540,6 +569,8 @@ struct Client {
     progress: Instant,
     out: Vec<u8>,
     sent: usize,
+    /// Bytes of the state it was attached with that it has yet to take: not a backlog.
+    grace: usize,
     registered: bool,
     writable: bool,
 }
@@ -553,6 +584,7 @@ impl Client {
             progress: Instant::now(),
             out: Vec::new(),
             sent: 0,
+            grace: 0,
             registered: false,
             writable: false,
         }
@@ -560,6 +592,11 @@ impl Client {
 
     fn pending(&self) -> usize {
         self.out.len() - self.sent
+    }
+
+    /// Live output waiting: what is pending beyond the rest of the attach state.
+    fn backlog(&self) -> usize {
+        self.pending().saturating_sub(self.grace)
     }
 
     fn queue(&mut self, frame: &Frame) {
@@ -629,6 +666,7 @@ impl Client {
                 Ok(0) => return Err(ErrorKind::WriteZero.into()),
                 Ok(written) => {
                     self.sent += written;
+                    self.grace = self.grace.saturating_sub(written);
                     self.progress = Instant::now();
                 }
                 Err(err) if err.kind() == ErrorKind::Interrupted => {}

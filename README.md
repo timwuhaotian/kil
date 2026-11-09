@@ -51,9 +51,10 @@ owns every process, PID and file descriptor it creates.
   `kil-remote` binary without starting the server. Ticking Public internet asks your own
   router (UPnP) to forward a port and prints a QR for the public IP, so the phone works from
   anywhere — no cloud service or third party is involved, and the mapping is removed when the
-  bridge stops. While a phone is attached, its panes carry a small dot on the tab row and in
-  the pane's corner; when the phone types, the mark turns red instead — driving, not just
-  watching — and the pane stays fully usable either way.
+  bridge stops. While a phone is attached, its tab's row in the sidebar is outlined in the
+  theme's accent and carries a small phone badge; when the phone types, both turn solid —
+  driving, not just watching — and the pane stays fully usable either way. The phone follows
+  the window's theme and pane size as they change.
 - **Comes back after a restart, too.** The layout, each pane's directory and the window frame
   are saved within 2 s of a change, and each pane's screen and scrollback every 30 s while it
   prints, and at once when you quit. After a logout or a reboot, the processes themselves are

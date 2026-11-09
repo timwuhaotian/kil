@@ -420,3 +420,236 @@ fn client_should_speak_down_to_a_protocol_1_server() {
     let client = Client::connect(&dir).unwrap();
     assert_eq!(client.sessions().unwrap(), Vec::<String>::new());
 }
+
+/// A raw client, as the bridge relays a phone: says hello, asks for `id`, and reads on a
+/// thread of its own so it never stalls. Returns the stream to write to and the frames,
+/// as `(kind, payload)`, until the server hangs up.
+#[expect(clippy::unwrap_used, reason = "test helper: a failure fails the test")]
+fn raw_attach(
+    dir: &std::path::Path,
+    id: &str,
+    remote: bool,
+) -> (UnixStream, mpsc::Receiver<(u8, Vec<u8>)>) {
+    let mut stream = UnixStream::connect(server::socket_path(dir)).unwrap();
+    if remote {
+        stream.write_all(&frame(19, &[])).unwrap();
+    }
+    stream.write_all(&frame(1, &2_u32.to_le_bytes())).unwrap();
+    let mut attach = u32::try_from(id.len()).unwrap().to_le_bytes().to_vec();
+    attach.extend_from_slice(id.as_bytes());
+    stream.write_all(&frame(5, &attach)).unwrap();
+    let mut reader = stream.try_clone().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        while let Some(frame) = read_frame(&mut reader) {
+            if tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    (stream, rx)
+}
+
+/// One frame from a blocking stream; `None` once it closed.
+fn read_frame(stream: &mut impl Read) -> Option<(u8, Vec<u8>)> {
+    let mut header = [0_u8; 5];
+    stream.read_exact(&mut header).ok()?;
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let mut payload = vec![0; len.checked_sub(1)?];
+    stream.read_exact(&mut payload).ok()?;
+    Some((header[4], payload))
+}
+
+/// Output frames' text, until `needle` shows up (`true`) or the server hangs up.
+fn output_reaches(frames: &mpsc::Receiver<(u8, Vec<u8>)>, needle: &str) -> bool {
+    let mut seen = String::new();
+    while let Ok((kind, payload)) = frames.recv_timeout(Duration::from_secs(30)) {
+        if kind == 14 {
+            seen.push_str(&String::from_utf8_lossy(&payload));
+            if seen.contains(needle) {
+                return true;
+            }
+            // Only the tail can still complete the needle.
+            let keep = seen.len().saturating_sub(needle.len());
+            seen.drain(..seen.floor_char_boundary(keep));
+        }
+    }
+    false
+}
+
+#[test]
+fn a_client_that_keeps_up_should_see_a_flood_through_to_the_exit() {
+    // One read of the PTY can take in a megabyte before the loop gets back to its clients.
+    // That alone must not count as falling behind: a client reading as fast as it can (the
+    // Kil window, say) keeps the session through a flood, up to the exit status.
+    let (dir, client) = server("flood-reader");
+    let go = dir.join("go");
+    let script = format!(
+        "while [ ! -e '{}' ]; do /bin/sleep 0.05; done; /usr/bin/yes | /usr/bin/head -c 8000000; exit 3",
+        go.display()
+    );
+    drop(spawn(&client, "a-1", &sh(&script)));
+    let (_stream, frames) = raw_attach(&dir, "a-1", false);
+    std::fs::write(&go, b"").unwrap();
+    let exit = std::iter::from_fn(|| frames.recv_timeout(Duration::from_secs(30)).ok())
+        .find(|(kind, _)| *kind == 15)
+        .map(|(_, payload)| u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]));
+    assert_eq!(exit, Some(3 << 8), "the client was dropped before the exit");
+}
+
+#[test]
+fn an_attach_should_take_a_scrollback_bigger_than_the_high_water_mark() {
+    // A wide pane's whole scrollback is megabytes of state. It is what an attach starts
+    // with, not a backlog: the client keeps the session and gets the output after it.
+    let (dir, client) = server("big-state");
+    let (done, go) = (dir.join("done"), dir.join("go"));
+    let mut config = sh(&format!(
+        "/usr/bin/yes $(/usr/bin/printf '%0511d' 0) | /usr/bin/head -n 12000; \
+         /usr/bin/touch '{}'; while [ ! -e '{}' ]; do /bin/sleep 0.05; done; \
+         echo AFTER-THE-STATE; exec /bin/sleep 600",
+        done.display(),
+        go.display()
+    ));
+    config.size.cols = 512;
+    config.scrollback_lines = 10_000;
+    drop(spawn(&client, "a-1", &config));
+    assert!(wait_until(Duration::from_secs(60), || done.exists()));
+    let (_stream, frames) = raw_attach(&dir, "a-1", false);
+    std::fs::write(&go, b"").unwrap();
+    assert!(output_reaches(&frames, "AFTER-THE-STATE"));
+    client.stop_all().unwrap();
+}
+
+/// The payload of the next frame of `kind`, skipping the others.
+fn next_of_kind(frames: &mpsc::Receiver<(u8, Vec<u8>)>, kind: u8) -> Option<Vec<u8>> {
+    std::iter::from_fn(|| frames.recv_timeout(Duration::from_secs(10)).ok())
+        .find(|(found, _)| *found == kind)
+        .map(|(_, payload)| payload)
+}
+
+#[test]
+fn a_phone_should_follow_the_windows_theme_and_grid() {
+    // A phone mirrors what the window shows, so it needs the window's palette and grid,
+    // which only the window sends. The server passes them to remote clients: on attach,
+    // and whenever the window changes them. A local client never gets them back.
+    let (dir, client) = server("to-phones");
+    let mut config = sh("exec /bin/cat");
+    config.palette.background = kil_term::Rgba { r: 1, g: 2, b: 3 };
+    let window = spawn(&client, "a-1", &config);
+    let (_phone, phone) = raw_attach(&dir, "a-1", true);
+    let (_desk, desk) = raw_attach(&dir, "a-1", false);
+
+    // Palette: 16 ANSI colors, then foreground, background and cursor, 3 bytes each.
+    let palette = next_of_kind(&phone, 16).unwrap();
+    assert_eq!(palette.len(), 19 * 3);
+    assert_eq!(palette[51..54], [1, 2, 3]);
+
+    let mut theme = config.palette;
+    theme.background = kil_term::Rgba { r: 4, g: 5, b: 6 };
+    window.set_palette(&theme);
+    window.resize(kil_term::GridSize {
+        rows: 30,
+        cols: 100,
+        ..SIZE
+    });
+    assert_eq!(next_of_kind(&phone, 16).unwrap()[51..54], [4, 5, 6]);
+    // Rows, then columns, as u16 little-endian.
+    assert_eq!(next_of_kind(&phone, 7).unwrap()[..4], [30, 0, 100, 0]);
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        desk.try_iter().all(|(kind, _)| kind != 16 && kind != 7),
+        "a local client must not get the window's own frames"
+    );
+    client.stop_all().unwrap();
+}
+
+/// A server that takes session `a-1` away from its client, as one stalled or behind is
+/// dropped, or as Kil before 0.0.31 handed it to a phone: each attach draws a line naming
+/// which attach it is, reports the frames its client sends, and hangs up once the client
+/// asks for a grid.
+#[expect(clippy::unwrap_used, reason = "test helper: a failure fails the test")]
+fn dropping_server(dir: &std::path::Path) -> mpsc::Receiver<(usize, u8, Vec<u8>)> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(server::socket_path(dir)).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let attaches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let (tx, attaches) = (tx.clone(), std::sync::Arc::clone(&attaches));
+            std::thread::spawn(move || {
+                if !matches!(read_frame(&mut stream), Some((1, _))) {
+                    return;
+                }
+                stream.write_all(&frame(1, &2_u32.to_le_bytes())).unwrap();
+                // The control connection never asks for more and waits here.
+                if !matches!(read_frame(&mut stream), Some((5, _))) {
+                    return;
+                }
+                let n = attaches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                // Identity: pid, start time, tty, then a 24×80 grid of 8×16 cells.
+                let mut identity = std::process::id().to_le_bytes().to_vec();
+                identity.extend_from_slice(&[0; 20]);
+                for value in [24_u16, 80, 8, 16] {
+                    identity.extend_from_slice(&value.to_le_bytes());
+                }
+                stream.write_all(&frame(11, &identity)).unwrap();
+                let line = if n == 1 { "first\r\n" } else { "second\r\n" };
+                stream.write_all(&frame(14, line.as_bytes())).unwrap();
+                while let Some((kind, payload)) = read_frame(&mut stream) {
+                    let _ = tx.send((n, kind, payload));
+                    if kind == 7 {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    rx
+}
+
+#[test]
+fn a_mirror_should_attach_again_when_the_server_drops_it() {
+    // The window's mirror outlives a dropped connection while the session runs on: it
+    // attaches again, starts over from the server's state, and asks for its grid again,
+    // so the pane neither shows an exit nor keeps a stale size. Once: a second drop right
+    // after ends it, rather than fight a phone for the session on an old server.
+    let dir = std::env::temp_dir().join(format!("kil-srv-{}-drops", std::process::id()));
+    let frames = dropping_server(&dir);
+    let client = Client::connect(&dir).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let session = client
+        .attach("a-1", 1_000, move |event| {
+            let _ = tx.send(event);
+        })
+        .unwrap()
+        .unwrap();
+    assert!(wait_for_text(&session, "first"));
+    session.resize(kil_term::GridSize {
+        rows: 30,
+        cols: 100,
+        ..SIZE
+    });
+    let first = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!((first.0, first.1), (1, 7));
+
+    assert!(wait_for_text(&session, "second"));
+    assert!(
+        !screen(&session).contains("first"),
+        "the mirror starts over from the new state"
+    );
+    let again = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!((again.0, again.1), (2, 7));
+    assert_eq!(again.2[..4], [30, 0, 100, 0]);
+
+    assert!(
+        std::iter::from_fn(|| rx.recv_timeout(Duration::from_secs(10)).ok())
+            .any(|event| matches!(event, SessionEvent::Ended))
+    );
+    assert!(
+        frames.recv_timeout(Duration::from_millis(500)).is_err(),
+        "no third attach"
+    );
+}

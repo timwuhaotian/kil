@@ -1657,12 +1657,7 @@ impl Workspace {
             .filter(|rename| rename.tab == id)
             .map(|rename| rename.field.clone());
         let status = tab.status(cx);
-        let watched = tab.tree.leaves().iter().any(|pane| pane.read(cx).watched());
-        let controlled = tab
-            .tree
-            .leaves()
-            .iter()
-            .any(|pane| pane.read(cx).controlled());
+        let presence = Presence::of(tab, cx);
         let active = index == self.active;
         let lifted = cx.has_active_drag() && self.dragging.is_some_and(|drag| drag.tab == id);
         let preview = RowPreview {
@@ -1733,6 +1728,9 @@ impl Workspace {
                 }),
             )
             .children(pill)
+            .when_some(presence, |row, presence| {
+                row.child(presence_ring(presence, chrome))
+            })
             .child(
                 div()
                     .relative()
@@ -1744,8 +1742,8 @@ impl Workspace {
                     .when_some(shown_memory(tab.memory), |row, shown| {
                         row.child(memory_label(shown, chrome))
                     })
-                    .when_some(presence_mark(controlled, watched, chrome), |row, mark| {
-                        row.child(mark)
+                    .when_some(presence, |row, presence| {
+                        row.child(presence_badge(presence, chrome))
                     })
                     .child(tab_close(id, chrome, cx)),
             )
@@ -1982,22 +1980,6 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
             base.into_any_element()
         }
     });
-    // No handlers, so clicks and selections pass through to the pane below.
-    // Driving wins over watching: one mark per pane.
-    let presence = if pane.read(cx).controlled() {
-        Some((controlling_mark(chrome), "controlling-pane"))
-    } else if pane.read(cx).watched() {
-        Some((watched_mark(chrome), "watched-pane"))
-    } else {
-        None
-    };
-    let presence = presence.map(|(mark, selector)| {
-        mark.absolute()
-            .top(px(4.))
-            .right(px(4.))
-            .debug_selector(|| selector.to_owned())
-            .into_any_element()
-    });
     div()
         .relative()
         .size_full()
@@ -2011,7 +1993,6 @@ fn render_leaf(pane: &Entity<TerminalPane>, tab: &Tab, chrome: Chrome, cx: &App)
         )
         .children(dim)
         .children(ring)
-        .children(presence)
         .into_any_element()
 }
 
@@ -2510,35 +2491,79 @@ fn status_mark(status: TabStatus, chrome: Chrome) -> Div {
     }
 }
 
-/// A phone is attached to the pane: small and static, like the status marks, so idle CPU
-/// stays at zero while it shows.
-fn watched_mark(chrome: Chrome) -> Div {
-    div()
-        .flex_none()
-        .size(px(6.))
-        .rounded_full()
-        .bg(chrome.accent)
+/// A phone on one of a tab's panes (DESIGN.md §14.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presence {
+    /// Attached: it sees the pane.
+    Watching,
+    /// It typed in the last few seconds: it drives the pane.
+    Driving,
 }
 
-/// The tab row's presence mark, if any: driving wins over watching.
-fn presence_mark(controlled: bool, watched: bool, chrome: Chrome) -> Option<Div> {
-    if controlled {
-        Some(controlling_mark(chrome).debug_selector(|| "controlling-tab".to_owned()))
-    } else if watched {
-        Some(watched_mark(chrome).debug_selector(|| "watched-tab".to_owned()))
-    } else {
-        None
+impl Presence {
+    /// Driving wins over watching, across all of the tab's panes.
+    fn of(tab: &Tab, cx: &App) -> Option<Self> {
+        let panes = tab.tree.leaves();
+        if panes.iter().any(|pane| pane.read(cx).controlled()) {
+            Some(Self::Driving)
+        } else if panes.iter().any(|pane| pane.read(cx).watched()) {
+            Some(Self::Watching)
+        } else {
+            None
+        }
     }
 }
 
-/// The phone recently typed in the pane: larger and red, like the failure mark, so driving
-/// reads apart from watching at a glance. Static too: idle CPU stays at zero.
-fn controlling_mark(chrome: Chrome) -> Div {
+/// The row of a tab a phone is on, outlined in the accent: a hairline while it watches,
+/// full strength with a faint wash while it drives. An overlay with no handlers, so the row
+/// neither shifts nor loses a click, and static, so idle CPU stays at zero.
+fn presence_ring(presence: Presence, chrome: Chrome) -> Div {
+    let ring = div().absolute().inset_0().rounded_lg().border_1();
+    match presence {
+        Presence::Watching => ring
+            .border_color(chrome.accent.opacity(0.5))
+            .debug_selector(|| "watched-row".to_owned()),
+        Presence::Driving => ring
+            .border_color(chrome.accent)
+            .bg(chrome.accent.opacity(0.08))
+            .debug_selector(|| "controlling-row".to_owned()),
+    }
+}
+
+/// "From the phone", in the row's title line: a handset in a capsule, tinted while the phone
+/// watches and solid while it drives. Accent, never the failure red, which next to the
+/// status mark would read as an error.
+fn presence_badge(presence: Presence, chrome: Chrome) -> Div {
+    let (fill, ink, selector) = match presence {
+        Presence::Watching => (chrome.accent.opacity(0.18), chrome.accent, "watched-tab"),
+        Presence::Driving => (chrome.accent, on_accent(), "controlling-tab"),
+    };
     div()
         .flex_none()
-        .size(px(8.))
+        .h(px(16.))
+        .px(px(5.))
+        .flex()
+        .items_center()
         .rounded_full()
-        .bg(chrome.failure)
+        .bg(fill)
+        .child(handset(ink))
+        .debug_selector(move || selector.to_owned())
+}
+
+/// A phone, drawn: a rounded outline with a home bar. Kil ships no icon font or images.
+fn handset(ink: Hsla) -> Div {
+    div()
+        .flex_none()
+        .w(px(7.))
+        .h(px(11.))
+        .rounded(px(2.))
+        .border_1()
+        .border_color(ink)
+        .flex()
+        .justify_center()
+        .items_end()
+        .pb(px(1.))
+        .child(div().w(px(3.)).h(px(1.)).rounded_full().bg(ink))
 }
 
 /// The row's title, or the field editing it.
@@ -3621,9 +3646,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_phone_on_a_session_should_mark_its_tab_row_and_pane_until_it_leaves(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_phone_on_a_session_should_mark_its_tab_row_until_it_leaves(cx: &mut TestAppContext) {
         let client = test_client();
         let (workspace, cx) = workspace_on(Arc::clone(&client), None, cx);
         let pane = workspace.read_with(cx, |this, _| this.tabs[0].focused.clone());
@@ -3638,9 +3661,9 @@ mod tests {
         assert!(client.sessions().is_ok_and(|ids| ids.contains(&id)));
         poll_watchers(&workspace, &client, cx);
         assert!(cx.debug_bounds("watched-tab").is_none());
-        assert!(cx.debug_bounds("watched-pane").is_none());
+        assert!(cx.debug_bounds("watched-row").is_none());
 
-        // A phone attaches to the session: the next poll marks the tab and the pane.
+        // A phone attaches to the session: the next poll rings its row and badges it.
         let phone = client.attach(&id, 1_000, |_| {}).unwrap().unwrap();
         for _ in 0..500 {
             if client
@@ -3652,11 +3675,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         poll_watchers(&workspace, &client, cx);
-        assert!(cx.debug_bounds("watched-tab").is_some());
-        assert!(cx.debug_bounds("watched-pane").is_some());
+        let (ring, badge) = (
+            cx.debug_bounds("watched-row").unwrap(),
+            cx.debug_bounds("watched-tab").unwrap(),
+        );
+        // The ring outlines the whole row, and the badge sits on it.
+        assert_eq!(ring.size.height, px(ROW_HEIGHT));
+        assert!(ring.left() <= badge.left() && badge.right() <= ring.right());
+        assert!(ring.top() <= badge.top() && badge.bottom() <= ring.bottom());
         // Attached without typing: watching only, never driving.
         assert!(cx.debug_bounds("controlling-tab").is_none());
-        assert!(cx.debug_bounds("controlling-pane").is_none());
+        assert!(cx.debug_bounds("controlling-row").is_none());
 
         // It detaches: the next poll clears the state, and the marks follow it. Debug
         // bounds accumulate across frames, so absence is read from the state; the initial
@@ -3685,12 +3714,12 @@ mod tests {
         poll_watchers(&workspace, &client, cx);
         assert!(pane.read_with(cx, |pane, _| pane.watched()));
         assert!(cx.debug_bounds("watched-tab").is_some());
-        assert!(cx.debug_bounds("watched-pane").is_some());
+        assert!(cx.debug_bounds("watched-row").is_some());
         drop(phone);
     }
 
     #[gpui::test]
-    fn a_phone_typing_should_mark_its_tab_row_and_pane_controlled(cx: &mut TestAppContext) {
+    fn a_phone_typing_should_mark_its_tab_row_driven(cx: &mut TestAppContext) {
         use std::io::{Read as _, Write as _};
 
         // A server of this test's own, with its directory for a raw phone.
@@ -3741,7 +3770,7 @@ mod tests {
         };
         drain(&mut phone);
 
-        // Attached but idle: the watching dot, not the driving mark.
+        // Attached but idle: the watching ring and badge, not the driving ones.
         for _ in 0..500 {
             if client
                 .watchers()
@@ -3753,11 +3782,11 @@ mod tests {
         }
         poll_watchers(&workspace, &client, cx);
         assert!(cx.debug_bounds("watched-tab").is_some());
-        assert!(cx.debug_bounds("watched-pane").is_some());
+        assert!(cx.debug_bounds("watched-row").is_some());
         assert!(cx.debug_bounds("controlling-tab").is_none());
-        assert!(cx.debug_bounds("controlling-pane").is_none());
+        assert!(cx.debug_bounds("controlling-row").is_none());
 
-        // A keystroke drives the session: the stronger mark wins on both.
+        // A keystroke drives the session: the stronger ring and badge win.
         phone.write_all(&frame(6, b"x")).unwrap();
         drain(&mut phone);
         for _ in 0..500 {
@@ -3772,7 +3801,7 @@ mod tests {
         poll_watchers(&workspace, &client, cx);
         assert!(pane.read_with(cx, |pane, _| pane.controlled()));
         assert!(cx.debug_bounds("controlling-tab").is_some());
-        assert!(cx.debug_bounds("controlling-pane").is_some());
+        assert!(cx.debug_bounds("controlling-row").is_some());
 
         // It detaches: the state clears, and the marks follow it.
         drop(phone);

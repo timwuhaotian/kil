@@ -25,7 +25,7 @@ use crate::{
     error::SpawnError,
     events::{EventProxy, Role, SessionEvent},
     server,
-    session::{Session, SessionConfig, term_config},
+    session::{GridSize, Session, SessionConfig, term_config},
     snapshot::Palette,
     wire::{self, Frame, Inbox, MIN_PROTOCOL, PROTOCOL},
 };
@@ -178,7 +178,13 @@ impl Client {
         wire::send(&mut stream, &request).map_err(SpawnError::Server)?;
         match wire::receive(&mut stream).map_err(SpawnError::Server)? {
             Some(Frame::Attached(identity)) => self
-                .mirror(stream, identity, config.scrollback_lines, Box::new(sink))
+                .mirror(
+                    stream,
+                    id,
+                    identity,
+                    config.scrollback_lines,
+                    Box::new(sink),
+                )
                 .map_err(SpawnError::Server),
             Some(Frame::Failed(message)) => Err(SpawnError::Refused(message)),
             other => Err(SpawnError::Server(match other {
@@ -199,15 +205,24 @@ impl Client {
         sink: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> io::Result<Option<Session>> {
         let mut stream = self.connection()?;
-        wire::send(&mut stream, &Frame::Attach { id: id.to_owned() })?;
-        match wire::receive(&mut stream)? {
-            Some(Frame::Attached(identity)) => self
-                .mirror(stream, identity, scrollback_lines, Box::new(sink))
+        match request_attach(&mut stream, id)? {
+            Some(identity) => self
+                .mirror(stream, id, identity, scrollback_lines, Box::new(sink))
                 .map(Some),
-            Some(Frame::Missing) => Ok(None),
-            Some(other) => Err(unexpected(&other)),
-            None => Err(ErrorKind::UnexpectedEof.into()),
+            None => Ok(None),
         }
+    }
+}
+
+/// Asks for session `id` on a fresh connection: its identity, with the state stream to
+/// follow, or `None` if the server has no such session.
+fn request_attach(stream: &mut UnixStream, id: &str) -> io::Result<Option<wire::Identity>> {
+    wire::send(stream, &Frame::Attach { id: id.to_owned() })?;
+    match wire::receive(stream)? {
+        Some(Frame::Attached(identity)) => Ok(Some(identity)),
+        Some(Frame::Missing) => Ok(None),
+        Some(other) => Err(unexpected(&other)),
+        None => Err(ErrorKind::UnexpectedEof.into()),
     }
 }
 
@@ -258,25 +273,37 @@ impl Client {
     fn mirror(
         &self,
         stream: UnixStream,
+        id: &str,
         identity: wire::Identity,
         scrollback_lines: usize,
         sink: Sink,
     ) -> io::Result<Session> {
-        mirror(stream, identity, scrollback_lines, sink, self.protocol >= 2)
+        let rejoin = Rejoin {
+            dir: self.dir.clone(),
+            protocol: self.protocol,
+            id: id.to_owned(),
+            identity,
+            scrollback_lines,
+            size: None,
+            palette: None,
+            exited: false,
+            last: None,
+        };
+        mirror(stream, identity, rejoin, sink, self.protocol >= 2)
     }
 }
 
 fn mirror(
     stream: UnixStream,
     identity: wire::Identity,
-    scrollback_lines: usize,
+    rejoin: Rejoin,
     sink: Sink,
     palettes: bool,
 ) -> io::Result<Session> {
     let size = identity.size.clamped();
     let events = EventProxy::new(sink, size, Role::Mirror);
     let term = Arc::new(FairMutex::new(Term::new(
-        term_config(scrollback_lines),
+        term_config(rejoin.scrollback_lines),
         &size,
         events.clone(),
     )));
@@ -300,6 +327,7 @@ fn mirror(
         inbox: Inbox::default(),
         out: Vec::new(),
         writable: false,
+        rejoin,
     };
     thread::Builder::new()
         .name("kil-mirror".into())
@@ -352,6 +380,38 @@ struct Feed {
     inbox: Inbox,
     out: Vec<u8>,
     writable: bool,
+    rejoin: Rejoin,
+}
+
+/// What a mirror needs to attach again when the server drops its connection while the
+/// session runs on: it fell behind or stalled (DESIGN.md §14.4), or a server from before
+/// 0.0.31, which holds one client per session, handed the session to a phone.
+struct Rejoin {
+    dir: PathBuf,
+    protocol: u32,
+    id: String,
+    /// The session as first attached: one of the same id in another process is not it.
+    identity: wire::Identity,
+    scrollback_lines: usize,
+    /// What the app last asked for, asked again on the new connection.
+    size: Option<GridSize>,
+    palette: Option<Palette>,
+    /// The server reported the program's exit: the session is over, not dropped.
+    exited: bool,
+    /// When the mirror last attached again.
+    last: Option<Instant>,
+}
+
+/// A drop this soon after the last rejoin is not chased: a server from before 0.0.31 and a
+/// phone would only take the session back and forth.
+const REJOIN_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Who ended a connection.
+enum End {
+    /// The app let go of the session, or the feed itself failed: nothing to rejoin.
+    App,
+    /// The server closed or broke it.
+    Server,
 }
 
 const STREAM_TOKEN: usize = 0;
@@ -359,19 +419,38 @@ const STREAM_TOKEN: usize = 0;
 impl Feed {
     #[expect(
         unsafe_code,
-        reason = "polling requires a source to outlive its registration: the stream lives in \
-                  `self` and is deleted from the poller before `run` returns"
+        reason = "polling requires a source to outlive its registration: each stream lives in \
+                  `self` and is deleted from the poller before it is replaced or `run` returns"
     )]
     fn run(mut self) {
-        // SAFETY: see the method's `expect`.
-        if let Err(err) = unsafe {
-            self.poller
-                .add_with_mode(&self.stream, Event::readable(STREAM_TOKEN), PollMode::Level)
-        } {
-            log::error!("mirror registration failed: {err}");
-            self.events.emit(SessionEvent::Ended);
-            return;
+        loop {
+            // SAFETY: see the method's `expect`.
+            if let Err(err) = unsafe {
+                self.poller.add_with_mode(
+                    &self.stream,
+                    Event::readable(STREAM_TOKEN),
+                    PollMode::Level,
+                )
+            } {
+                log::error!("mirror registration failed: {err}");
+                break;
+            }
+            self.writable = false;
+            if !self.out.is_empty() {
+                // What a rejoin queued goes out without waiting for the server to speak.
+                let _ = self.poller.notify();
+            }
+            let end = self.serve();
+            let _ = self.poller.delete(&self.stream);
+            if !matches!(end, End::Server) || !self.rejoin() {
+                break;
+            }
         }
+        self.events.emit(SessionEvent::Ended);
+    }
+
+    /// Carries frames both ways until the connection ends.
+    fn serve(&mut self) -> End {
         let mut events = Events::new();
         loop {
             let timeout = self
@@ -384,7 +463,7 @@ impl Feed {
                 && err.kind() != ErrorKind::Interrupted
             {
                 log::error!("mirror poll failed: {err}");
-                break;
+                return End::App;
             }
             if self
                 .parser
@@ -397,14 +476,14 @@ impl Feed {
             }
             if !self.outgoing() {
                 self.flush_before_closing();
-                break;
+                return End::App;
             }
             let readable = events.iter().any(|event| event.readable);
             if readable && !self.incoming() {
-                break;
+                return End::Server;
             }
             if self.flush().is_err() {
-                break;
+                return End::Server;
             }
             let wants = !self.out.is_empty();
             if wants != self.writable {
@@ -416,15 +495,80 @@ impl Feed {
                     .modify_with_mode(&self.stream, interest, PollMode::Level);
             }
         }
-        let _ = self.poller.delete(&self.stream);
-        self.events.emit(SessionEvent::Ended);
+    }
+
+    /// Attaches again after the server dropped the connection, from the session's whole
+    /// state and at the grid and palette the app last asked for, so the window keeps its
+    /// pane instead of showing it ended. `false` if the session is over or gone, the server
+    /// is, or the last rejoin was too recent ([`REJOIN_BACKOFF`]).
+    fn rejoin(&mut self) -> bool {
+        let rejoin = &mut self.rejoin;
+        if rejoin.exited || rejoin.last.is_some_and(|at| at.elapsed() < REJOIN_BACKOFF) {
+            return false;
+        }
+        rejoin.last = Some(Instant::now());
+        let attached = handshake(&rejoin.dir, rejoin.protocol).and_then(|(mut stream, _)| {
+            let identity = request_attach(&mut stream, &rejoin.id)?;
+            stream.set_read_timeout(None)?;
+            stream.set_nonblocking(true)?;
+            Ok(identity.map(|identity| (stream, identity)))
+        });
+        let (stream, identity) = match attached {
+            Ok(Some(found)) => found,
+            Ok(None) => return false,
+            Err(err) => {
+                log::warn!("session {}: attaching again failed: {err}", rejoin.id);
+                return false;
+            }
+        };
+        let first = rejoin.identity;
+        if (identity.pid, identity.start_sec, identity.start_usec)
+            != (first.pid, first.start_sec, first.start_usec)
+        {
+            return false;
+        }
+        log::info!(
+            "session {}: the server dropped this client; attached again",
+            rejoin.id
+        );
+        self.stream = stream;
+        self.inbox = Inbox::default();
+        // Whatever was half sent belongs to the old connection.
+        self.out.clear();
+        self.parser = Processor::new();
+        self.notifications = crate::notify::Scanner::default();
+        // The state stream that follows is laid out for the server's grid: a blank terminal
+        // of that size takes it, then the app's own grid, as on a first attach.
+        let size = identity.size.clamped();
+        *self.term.lock() = Term::new(
+            term_config(self.rejoin.scrollback_lines),
+            &size,
+            self.events.clone(),
+        );
+        self.events.set_size(size);
+        if let Some(grid) = self.rejoin.size.filter(|grid| *grid != size) {
+            self.term.lock().resize(grid);
+            self.events.set_size(grid);
+            Frame::Resize(grid).encode(&mut self.out);
+        }
+        if let Some(palette) = &self.rejoin.palette {
+            Frame::Palette(palette.clone()).encode(&mut self.out);
+        }
+        true
     }
 
     /// Queues what the app sent; `false` once the session handle is gone.
     fn outgoing(&mut self) -> bool {
         loop {
             match self.rx.try_recv() {
-                Ok(frame) => frame.encode(&mut self.out),
+                Ok(frame) => {
+                    match &frame {
+                        Frame::Resize(size) => self.rejoin.size = Some(*size),
+                        Frame::Palette(palette) => self.rejoin.palette = Some(palette.clone()),
+                        _ => {}
+                    }
+                    frame.encode(&mut self.out);
+                }
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
             }
@@ -456,7 +600,10 @@ impl Feed {
                 Err(err) => Err(err),
             };
             match frame {
-                Ok(Frame::Exited(status)) => self.events.emit(SessionEvent::ChildExited(status)),
+                Ok(Frame::Exited(status)) => {
+                    self.rejoin.exited = true;
+                    self.events.emit(SessionEvent::ChildExited(status));
+                }
                 Ok(other) => log::warn!("unexpected frame from the server: {other:?}"),
                 Err(err) => {
                     log::warn!("bad frame from the server: {err}");
