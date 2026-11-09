@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/kil-term", "crates/kil"]
+members = ["crates/kil-term", "crates/kil", "crates/kil-remote"]
 # gpui 0.2.2 with a change of ours (vendor/gpui/KIL.md): a dependency, not a member.
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.0.28"
+version = "0.0.29"
 edition = "2024"
 license = "MIT"
 authors = ["timwuhaotian"]
@@ -19,6 +19,7 @@ publish = false
 
 [workspace.dependencies]
 kil-term = { path = "crates/kil-term" }
+kil-remote = { path = "crates/kil-remote" }
 # Exact pins: both are pre-1.0 and we implement alacritty's PTY traits (DESIGN.md §2, §13).
 alacritty_terminal = "=0.26.0"
 gpui = "=0.2.2"

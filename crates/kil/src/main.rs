@@ -267,6 +267,42 @@ fn server_dir() -> Option<PathBuf> {
     args.next().map(PathBuf::from)
 }
 
+/// `kil --remote` exposes the session server to Agent on Edge over a paired
+/// TLS tunnel, printing a QR code to scan. Keeps the same session server the
+/// app runs, so the panes on the phone are the panes on the desk.
+///
+/// Optional flags after `--remote`: `--host <ip>` (override the QR address)
+/// and `--port <n>` (default: an OS-picked free port).
+fn remote_config() -> Option<kil_remote::Config> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != "--remote" {
+        return None;
+    }
+    let mut port = 0;
+    let mut host = None;
+    while let Some(arg) = args.next() {
+        match arg.to_str()? {
+            "--host" => host = Some(args.next()?.to_string_lossy().into_owned()),
+            "--port" => port = args.next()?.to_string_lossy().parse().ok()?,
+            other => {
+                eprintln!("kil --remote: ignoring unknown flag {other}");
+                return None;
+            }
+        }
+    }
+    let dir = restore::Store::standard().map_or_else(
+        || std::env::temp_dir().join("kil"),
+        |store| store.dir().to_owned(),
+    );
+    Some(kil_remote::Config {
+        dir,
+        port,
+        host,
+        ttl: std::time::Duration::from_secs(300),
+        launcher: std::env::current_exe().ok(),
+    })
+}
+
 fn serve(dir: &Path) {
     // Before any thread exists: the process that launched it exits here.
     if let Err(err) = kil_term::server::daemonize() {
@@ -305,6 +341,13 @@ fn main() {
     forget_launcher_identity();
     if let Some(dir) = server_dir() {
         serve(&dir);
+        return;
+    }
+    if let Some(config) = remote_config() {
+        if let Err(err) = kil_remote::run(&config) {
+            eprintln!("kil --remote: {err:#}");
+            std::process::exit(1);
+        }
         return;
     }
     env_logger::init();

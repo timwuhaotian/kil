@@ -1,0 +1,29 @@
+[package]
+name = "kil-remote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Expose Kil's session server to Agent on Edge over a paired TLS tunnel."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+kil-term.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true
+log.workspace = true
+qrcode = "0.13"
+rcgen = "0.13"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync"] }
+tokio-rustls = "0.26"
+
+[lints]
+workspace = true

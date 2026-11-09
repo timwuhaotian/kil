@@ -251,10 +251,10 @@ mod tests {
     fn unset_key_should_drop_the_assignment_and_keep_the_rest() {
         assert_eq!(
             unset_key(
-                "# mine\nsidebar_opacity = 0.5\ntheme = \"dusk\"",
+                "# mine\nsidebar_opacity = 0.5\ntheme = \"pastel-tweencore\"",
                 "sidebar_opacity"
             ),
-            "# mine\ntheme = \"dusk\"\n"
+            "# mine\ntheme = \"pastel-tweencore\"\n"
         );
     }
 

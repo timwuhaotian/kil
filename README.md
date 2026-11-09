@@ -45,6 +45,10 @@ owns every process, PID and file descriptor it creates.
   The next launch goes back on the same processes, with the full screen, scrollback and input
   modes. **Kil ▸ Quit and Stop All Jobs** ends everything, and **Kil ▸ Restart** ends it and
   opens Kil again.
+- **Remote panes for Agent on Edge.** `kil --remote` prints a QR code that pairs an iPhone
+  over the LAN to the same session server through a TLS tunnel, so the panes on the phone are
+  the panes on the desk; the standalone `kil-remote` binary does the same without starting the
+  server.
 - **Comes back after a restart, too.** The layout, each pane's directory and the window frame
   are saved within 2 s of a change, and each pane's screen and scrollback every 30 s while it
   prints, and at once when you quit. After a logout or a reboot, the processes themselves are
@@ -56,9 +60,10 @@ owns every process, PID and file descriptor it creates.
   notarization. Once it's ready, a window asks whether to update and lists what's new:
   **Restart Now**, or **Later** and it installs when you quit. Jobs keep running across the
   update.
-- **Five themes**: Night, Batman, Fjord, Ember and Dusk. Batman is black, with a yellow
-  accent. Programs that ask for the terminal's colors, like vim deciding
-  between light and dark, are told the theme's.
+- **Nine themes**, the same skins killi's `/theme` offers: Batman, Iced Coffee, Creamery
+  Station, Pastel Tweencore, Cappuccino, Shades of Gray, Off White, Red Orange and Snow and
+  Ice, each painted from the skin's own palette. Programs that ask for the terminal's colors,
+  like vim deciding between light and dark, are told the theme's.
 - **A default directory** for new tabs, if you want one. Splits still open where their pane
   is.
 - **Rebindable keys** in `~/.config/kil/keymap.toml` (**Kil ▸ Keyboard Shortcuts…** opens it),
@@ -189,7 +194,8 @@ regains focus, and the menu bar then shows the new keys.
 **`~/.config/kil/config.toml`** (`$XDG_CONFIG_HOME` is respected):
 
 ```toml
-theme = "night"                  # night, batman, fjord, ember or dusk
+theme = "batman"                       # batman, iced-coffee, creamery-station, pastel-tweencore,
+                                       # cappuccino, shades-of-gray, off-white, red-orange or snow-and-ice
 font_family = "Menlo"
 font_size = 13.0
 default_directory = "~/code"     # where new tabs open; leave out to follow the focused pane

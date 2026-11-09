@@ -783,7 +783,8 @@ impl SettingsWindow {
             div()
                 .py_3()
                 .flex()
-                .justify_between()
+                .flex_wrap()
+                .gap_2()
                 .children(swatches)
                 .into_any_element(),
             row(

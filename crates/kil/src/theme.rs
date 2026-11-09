@@ -1,49 +1,68 @@
-//! The five built-in themes, picked in Settings or with `theme` in `config.toml`
-//! (DESIGN.md §7).
+//! The nine built-in themes, matching the skins killi's `/theme` offers, picked in Settings
+//! or with `theme` in `config.toml` (DESIGN.md §7). Each paints the terminal with the skin's
+//! own palette (`crates/killi/src/tui/text.rs` in the killi repo): its ground, its lightest
+//! text, its brand color as the accent, and the skin's role colors as the ANSI slots.
 
 use gpui::{Global, Hsla, Rgba as GpuiRgba, rgb, rgba};
 use kil_term::{Palette, Rgba};
 use serde::Deserialize;
 
-/// A theme's name in `config.toml`.
+/// A theme's name in `config.toml`, the same names killi's `/theme` accepts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ThemeName {
     #[default]
-    Night,
     Batman,
-    Fjord,
-    Ember,
-    Dusk,
+    IcedCoffee,
+    CreameryStation,
+    PastelTweencore,
+    Cappuccino,
+    ShadesOfGray,
+    OffWhite,
+    RedOrange,
+    #[serde(rename = "snow-and-ice")]
+    SnowIce,
 }
 
 impl ThemeName {
-    pub const ALL: [Self; 5] = [
-        Self::Night,
+    pub const ALL: [Self; 9] = [
         Self::Batman,
-        Self::Fjord,
-        Self::Ember,
-        Self::Dusk,
+        Self::IcedCoffee,
+        Self::CreameryStation,
+        Self::PastelTweencore,
+        Self::Cappuccino,
+        Self::ShadesOfGray,
+        Self::OffWhite,
+        Self::RedOrange,
+        Self::SnowIce,
     ];
 
-    /// As written in `config.toml`.
+    /// As written in `config.toml`, exactly as killi's `/theme` writes `[ui] theme`.
     pub fn key(self) -> &'static str {
         match self {
-            Self::Night => "night",
             Self::Batman => "batman",
-            Self::Fjord => "fjord",
-            Self::Ember => "ember",
-            Self::Dusk => "dusk",
+            Self::IcedCoffee => "iced-coffee",
+            Self::CreameryStation => "creamery-station",
+            Self::PastelTweencore => "pastel-tweencore",
+            Self::Cappuccino => "cappuccino",
+            Self::ShadesOfGray => "shades-of-gray",
+            Self::OffWhite => "off-white",
+            Self::RedOrange => "red-orange",
+            Self::SnowIce => "snow-and-ice",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Night => "Night",
             Self::Batman => "Batman",
-            Self::Fjord => "Fjord",
-            Self::Ember => "Ember",
-            Self::Dusk => "Dusk",
+            Self::IcedCoffee => "Iced Coffee",
+            Self::CreameryStation => "Creamery Station",
+            Self::PastelTweencore => "Pastel Tweencore",
+            Self::Cappuccino => "Cappuccino",
+            Self::ShadesOfGray => "Shades of Gray",
+            Self::OffWhite => "Off White",
+            Self::RedOrange => "Red Orange",
+            Self::SnowIce => "Snow and Ice",
         }
     }
 }
@@ -70,7 +89,7 @@ impl Global for Theme {}
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::named(ThemeName::Night)
+        Self::named(ThemeName::Batman)
     }
 }
 
@@ -100,15 +119,48 @@ struct Chrome {
     banner: u32,
 }
 
+/// The chrome a skin's role colors give: its selection ground, its "a step off the terminal"
+/// tint as the sidebar and banner, its lightest text, its muted shade, its brand color as the
+/// accent and its failure red. Hairlines and borders use the skin's rule and muted shades.
+#[expect(clippy::unreadable_literal, reason = "hex colors read as #RRGGBB(AA)")]
+fn chrome(
+    selection: u32,
+    tint: u32,
+    text: u32,
+    muted: u32,
+    accent: u32,
+    failure: u32,
+    rule: u32,
+) -> Chrome {
+    Chrome {
+        selection: selection << 8 | 0xcc,
+        sidebar: (tint << 8) | 0xb8,
+        text,
+        muted,
+        hover: 0xffffff0f,
+        selected: 0xffffff1f,
+        accent,
+        failure,
+        divider: rule,
+        field_border: muted,
+        dim: 0x00000080,
+        banner: (tint << 8) | 0xf2,
+    }
+}
+
 #[expect(clippy::unreadable_literal, reason = "hex colors read as #RRGGBB(AA)")]
 impl Theme {
     pub fn named(name: ThemeName) -> Self {
         match name {
-            ThemeName::Night => Self::night(),
             ThemeName::Batman => Self::batman(),
-            ThemeName::Fjord => Self::fjord(),
-            ThemeName::Ember => Self::ember(),
-            ThemeName::Dusk => Self::dusk(),
+            ThemeName::IcedCoffee => Self::iced_coffee(),
+            ThemeName::CreameryStation => Self::creamery_station(),
+            ThemeName::PastelTweencore => Self::pastel_tweencore(),
+            ThemeName::Cappuccino => Self::cappuccino(),
+            ThemeName::ShadesOfGray => Self::shades_of_gray(),
+            ThemeName::OffWhite => Self::off_white(),
+            ThemeName::RedOrange => Self::red_orange(),
+            ThemeName::SnowIce => Self::snow_and_ice(),
         }
     }
 
@@ -121,146 +173,167 @@ impl Theme {
         self
     }
 
-    fn night() -> Self {
-        Self::build(
-            palette(
-                [
-                    0x1d1f24, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf,
-                    0x5c6370, 0xef7b85, 0xa8d38a, 0xf0cd8a, 0x74bdf7, 0xd48ae8, 0x67c7d2, 0xe6e9ef,
-                ],
-                0xd7dae0,
-                0x111316,
-                0xf2f3f5,
-            ),
-            &Chrome {
-                selection: 0x3d5a80cc,
-                sidebar: 0x16181db8,
-                text: 0xe3e6eb,
-                muted: 0x848b97,
-                hover: 0xffffff0f,
-                selected: 0xffffff1f,
-                accent: 0x6ca8ff,
-                failure: 0xf06c6c,
-                divider: 0x262930,
-                field_border: 0x6d6f74,
-                // Half: on a near-black background a lighter dim moves the background by
-                // ~2/255 and leaves only the text to show which pane has focus.
-                dim: 0x05060880,
-                banner: 0x1d2026f2,
-            },
-        )
-    }
-
-    /// Batman: black, and the yellow of the logo as the accent (the focus ring).
+    /// Batman: signal yellow and olive on slate and black — killi's `batman` skin.
     fn batman() -> Self {
         Self::build(
             palette(
                 [
-                    0x2a2a2a, 0xff5f5f, 0x66dd88, 0xffff36, 0x0fc3ff, 0xc79bff, 0x5ce1e6, 0xc7c7c7,
-                    0x5f5f5f, 0xff8a8a, 0x9be89b, 0xffff7a, 0x5fd4ff, 0xd9b8ff, 0x8beef0, 0xffeac9,
+                    0x282e3c, 0xff6f7d, 0x988829, 0xe6c832, 0x7e93bd, 0x9fb0d4, 0x8b96b3, 0xc7cfdf,
+                    0x686d76, 0xff8c97, 0xada054, 0xead051, 0x98a9ca, 0xb2c0dd, 0xa2abc2, 0xcbd3e2,
                 ],
-                0xffeac9,
-                0x000000,
-                0xffff36,
+                0xc7cfdf,
+                0x101014,
+                0xfdff00,
             ),
-            &Chrome {
-                selection: 0x0fc3ff4d,
-                sidebar: 0x0b0b0bb8,
-                text: 0xffeac9,
-                muted: 0x8a8a8a,
-                hover: 0xffffff12,
-                selected: 0xffffff24,
-                accent: 0xffff36,
-                failure: 0xff5f5f,
-                divider: 0x333333,
-                field_border: 0x666666,
-                dim: 0x00000080,
-                banner: 0x111111f2,
-            },
+            &chrome(
+                0x39445f, 0x282e3c, 0xc7cfdf, 0x8b96b3, 0xfdff00, 0xff6f7d, 0x3a435c,
+            ),
         )
     }
 
-    fn fjord() -> Self {
+    /// Iced coffee: sky blue, coral and amber on deep slate — killi's `iced-coffee` skin.
+    fn iced_coffee() -> Self {
         Self::build(
             palette(
                 [
-                    0x2a303c, 0xd0707a, 0xa3c48c, 0xe4c98a, 0x7fa6d6, 0xb896c8, 0x82c3c9, 0xd4dae6,
-                    0x637089, 0xdd8890, 0xb4d29e, 0xedd7a0, 0x95b8e3, 0xc7a9d6, 0x98d1d6, 0xeef1f6,
+                    0x22303e, 0xef6868, 0x96a4ad, 0xe09c26, 0x6fa8dc, 0xf4cccc, 0x8fc0e8, 0xcfe2f3,
+                    0x646e78, 0xf28686, 0xabb6bd, 0xe5ab47, 0x8cb9e3, 0xf6d6d6, 0xa5cded, 0xd3e4f4,
                 ],
-                0xd4dae6,
-                0x1c212b,
-                0xe5e9f0,
+                0xcfe2f3,
+                0x141a22,
+                0x6fa8dc,
             ),
-            &Chrome {
-                selection: 0x3e5679cc,
-                sidebar: 0x191d26b8,
-                text: 0xdde3ee,
-                muted: 0x8f98a7,
-                hover: 0xffffff0f,
-                selected: 0xffffff1f,
-                accent: 0x88b4e6,
-                failure: 0xe07a84,
-                divider: 0x2a313d,
-                field_border: 0x767a83,
-                dim: 0x0b0e1480,
-                banner: 0x232936f2,
-            },
+            &chrome(
+                0x2f4a63, 0x22303e, 0xcfe2f3, 0x9db4c9, 0x6fa8dc, 0xef6868, 0x3d4c5c,
+            ),
         )
     }
 
-    fn ember() -> Self {
+    /// Creamery station: cream, butter and tan on dark — killi's `creamery-station` skin.
+    fn creamery_station() -> Self {
         Self::build(
             palette(
                 [
-                    0x2b2520, 0xe06c50, 0xa9b665, 0xe3a64f, 0x7daea3, 0xd3869b, 0x89b482, 0xd4c4a8,
-                    0x766859, 0xf08a6e, 0xbfcc7c, 0xf0bd6b, 0x95c4b8, 0xe29db0, 0xa2c99a, 0xf2e8d5,
+                    0x3a3222, 0xff6f7d, 0x9d9884, 0xd9a84f, 0xd6bd8f, 0xdec092, 0xb3a086, 0xf8f2e7,
+                    0x757064, 0xff8c97, 0xb1ad9d, 0xdfb569, 0xdecaa5, 0xe5cda8, 0xc2b39e, 0xf9f3e9,
                 ],
-                0xe8dcc6,
-                0x1d1915,
-                0xf2c48d,
+                0xf8f2e7,
+                0x1a1610,
+                0xfce9b2,
             ),
-            &Chrome {
-                selection: 0x5a4632cc,
-                sidebar: 0x1a1612b8,
-                text: 0xece2d0,
-                muted: 0x9b8f7f,
-                hover: 0xffffff0f,
-                selected: 0xffffff1c,
-                accent: 0xe8a15a,
-                failure: 0xea6b55,
-                divider: 0x2f2822,
-                field_border: 0x797471,
-                dim: 0x0d0a0880,
-                banner: 0x2a241ef2,
-            },
+            &chrome(
+                0x55482c, 0x3a3222, 0xf8f2e7, 0xb3a086, 0xfce9b2, 0xff6f7d, 0x5f5340,
+            ),
         )
     }
 
-    fn dusk() -> Self {
+    /// Pastel tweencore: pastel pink, lavender and baby blue on dark — killi's `pastel-tweencore`
+    /// skin.
+    fn pastel_tweencore() -> Self {
         Self::build(
             palette(
                 [
-                    0x262233, 0xe4708e, 0x8fd1a0, 0xe8c88a, 0x8aa8f0, 0xc09af0, 0x7cc8d8, 0xcbc5dc,
-                    0x6b628a, 0xf088a4, 0xa6deb4, 0xf0d6a2, 0xa2baf5, 0xd0b2f6, 0x96d6e3, 0xf1eefa,
+                    0x402735, 0xff6f7d, 0x999ea9, 0xffcffc, 0xb9d8fa, 0xcbbeff, 0xd9ecff, 0xfffbee,
+                    0x796872, 0xff8c97, 0xadb1ba, 0xffd6fc, 0xc7e0fb, 0xd5cbff, 0xe1f0ff, 0xfffbef,
                 ],
-                0xddd8ea,
-                0x17141f,
-                0xe9e4f6,
+                0xfffbee,
+                0x181120,
+                0xff9cd2,
             ),
-            &Chrome {
-                selection: 0x4b3d6ecc,
-                sidebar: 0x15121cb8,
-                text: 0xe3def0,
-                muted: 0x928aa0,
-                hover: 0xffffff0f,
-                selected: 0xffffff1f,
-                accent: 0xb48cff,
-                failure: 0xef7591,
-                divider: 0x2b2638,
-                field_border: 0x72707b,
-                dim: 0x0a080f80,
-                banner: 0x221e2df2,
-            },
+            &chrome(
+                0x593d54, 0x402735, 0xfffbee, 0xada2d9, 0xff9cd2, 0xff6f7d, 0x514c66,
+            ),
+        )
+    }
+
+    /// Cappuccino: cream, tan and rust over coffee browns — killi's `cappuccino` skin.
+    fn cappuccino() -> Self {
+        Self::build(
+            palette(
+                [
+                    0x3c2f2f, 0xe65f50, 0x999288, 0xeebe6e, 0xcdaa8c, 0xc9786e, 0xbe9b7b, 0xf8f2e7,
+                    0x766d6d, 0xeb7f73, 0xada8a0, 0xf1c884, 0xd7bba3, 0xd4938b, 0xcbaf95, 0xf9f3e9,
+                ],
+                0xfff4e6,
+                0x171110,
+                0xe6c49b,
+            ),
+            &chrome(
+                0x4b3832, 0x3c2f2f, 0xfff4e6, 0xbe9b7b, 0xe6c49b, 0xe65f50, 0x5c4a40,
+            ),
+        )
+    }
+
+    /// Shades of gray: grays only, light to dark — killi's `shades-of-gray` skin. It keeps the
+    /// default red for failures, as the skin does.
+    fn shades_of_gray() -> Self {
+        Self::build(
+            palette(
+                [
+                    0x262626, 0xff6f7d, 0x999999, 0xdddddd, 0xaaaaaa, 0xcccccc, 0x999999, 0xf5f5f5,
+                    0x676767, 0xff8c97, 0xadadad, 0xe2e2e2, 0xbbbbbb, 0xd6d6d6, 0xadadad, 0xf6f6f6,
+                ],
+                0xe6e6e6,
+                0x121212,
+                0xeeeeee,
+            ),
+            &chrome(
+                0x404040, 0x262626, 0xe6e6e6, 0x999999, 0xeeeeee, 0xff6f7d, 0x555555,
+            ),
+        )
+    }
+
+    /// Off white: warm whites and ivory on dark — killi's `off-white` skin.
+    fn off_white() -> Self {
+        Self::build(
+            palette(
+                [
+                    0x34322e, 0xff6f7d, 0x9d9d98, 0xfff4d6, 0xdcdcd6, 0xf9f1f1, 0xc8c2ba, 0xf3e6e6,
+                    0x71706d, 0xff8c97, 0xb1b1ad, 0xfff6dc, 0xe3e3de, 0xfaf4f4, 0xd3cec8, 0xf4e8e8,
+                ],
+                0xfffff2,
+                0x161512,
+                0xfffff2,
+            ),
+            &chrome(
+                0x4a4640, 0x34322e, 0xfffff2, 0xc8c2ba, 0xfffff2, 0xff6f7d, 0x69645f,
+            ),
+        )
+    }
+
+    /// Red orange: amber through orange to red on dark — killi's `red-orange` skin.
+    fn red_orange() -> Self {
+        Self::build(
+            palette(
+                [
+                    0x402010, 0xff4d3c, 0x9c907a, 0xffc100, 0xffae4d, 0xff7400, 0xe68c40, 0xffd250,
+                    0x796358, 0xff7163, 0xb0a695, 0xffca26, 0xffbe71, 0xff9033, 0xeba366, 0xffd65e,
+                ],
+                0xffd250,
+                0x180c06,
+                0xff9a00,
+            ),
+            &chrome(
+                0x5c3014, 0x402010, 0xffd250, 0xe68c40, 0xff9a00, 0xff4d3c, 0x663a22,
+            ),
+        )
+    }
+
+    /// Snow and ice: white and ice cyan on dark — killi's `snow-and-ice` skin.
+    fn snow_and_ice() -> Self {
+        Self::build(
+            palette(
+                [
+                    0x123438, 0xff6f7d, 0x89a9a7, 0xffffff, 0x64cdd7, 0x86d6d8, 0x3fd0d4, 0xd2f4f5,
+                    0x597174, 0xff8c97, 0xa1bab9, 0xffffff, 0x83d7df, 0x9edee0, 0x65d9dd, 0xd6f5f6,
+                ],
+                0xffffff,
+                0x0c1a1c,
+                0x3fd0d4,
+            ),
+            &chrome(
+                0x184e54, 0x123438, 0xffffff, 0x6eafb4, 0x3fd0d4, 0xff6f7d, 0x32585c,
+            ),
         )
     }
 

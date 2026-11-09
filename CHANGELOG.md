@@ -6,6 +6,18 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.29 — 2026-11-09
+
+- **Themes now match killi.** The nine themes are killi's `/theme` skins — Batman, Iced
+  Coffee, Creamery Station, Pastel Tweencore, Cappuccino, Shades of Gray, Off White, Red
+  Orange and Snow and Ice — each painted from the skin's own palette. Night, Fjord, Ember and
+  Dusk are gone: `theme = "night"` no longer parses; use one of the nine names above.
+- **Remote panes for Agent on Edge.** `kil --remote` (or the standalone `kil-remote` binary)
+  wraps the session server's Unix socket in a paired TLS tunnel: the Mac prints a QR code
+  carrying the address, a one-time pairing code and the certificate's fingerprint, and after
+  pairing the bridge only pumps bytes between the TLS stream and the socket — the server's
+  wire protocol and its `peer_uid` trust check are untouched.
+
 ## 0.0.28 — 2026-11-09
 
 - **The sidebar follows the active tab.** With more tabs than fit, `⌘1…9`, `⌘⇧[` / `]`
