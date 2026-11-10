@@ -29,10 +29,12 @@ owns every process, PID and file descriptor it creates.
 ## Features
 
 - **Vertical tabs** in a sidebar. A ring marks a tab with a running job, and a dot marks one
-  whose job finished while you weren't looking. Drag a tab up or down to reorder it: it lifts
-  off the list and follows the pointer while the others slide out of its way. Double-click
-  it to rename it (IME works, Chinese included). A new tab is named for its folder. How much
-  of the blurred desktop shows through the sidebar is a setting.
+  whose job finished while you weren't looking. Right-click for **Pin Tab** / **Unpin Tab**:
+  pinning moves a tab to the end of the pinned group at the top, and unpinning to the start of
+  the unpinned group. Drag a tab up or down to reorder it within its group: it lifts off the
+  list and follows the pointer while the others slide out of its way. Pinning and tab order
+  survive relaunches. Double-click a tab to rename it (IME works, Chinese included). A new tab
+  is named for its folder. How much of the blurred desktop shows through the sidebar is a setting.
 - **Notifications from programs.** When a program posts one (OSC 9 or 777: killi, Claude
   Code and others do when a long job ends) and its tab isn't in view, macOS shows it —
   naming the job, tab and folder it came from — and the tab gets the dot; clicking the
@@ -196,8 +198,8 @@ The **Kil** menu has **Restart** (stop every job, then open Kil again), **Quit a
 Jobs**, and the usual Hide, Hide Others and Show All.
 
 Double-click a tab to rename it (Enter or clicking away saves, Esc cancels), right-click it
-for Rename / Close, drag it up or down to reorder, and double-click empty sidebar space for a
-new tab (the **New Tab** button at the bottom shows its shortcut when you hover it).
+for Pin / Unpin / Rename / Close, drag it within its group to reorder, and double-click empty
+sidebar space for a new tab (the **New Tab** button at the bottom shows its shortcut when you hover it).
 Double-click the top of the sidebar, beside the window buttons, to fill the screen and again
 to go back (it does what **System Settings ▸ Desktop & Dock** says a title-bar double-click
 does). Programs that report the mouse, like Claude Code's full-screen view, get the scroll

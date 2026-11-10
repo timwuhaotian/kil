@@ -107,6 +107,8 @@ struct Tab {
     focused: Entity<TerminalPane>,
     /// Set by the user (Rename Tab); otherwise the row follows the focused pane.
     name: Option<SharedString>,
+    /// Pinned tabs form a stable group above the others.
+    pinned: bool,
     /// A job ended here while the tab was not in view; cleared when it is.
     finished: bool,
     animating: bool,
@@ -245,6 +247,7 @@ struct RowPreview {
     title: SharedString,
     cwd: SharedString,
     status: TabStatus,
+    pinned: bool,
     chrome: Chrome,
     /// Where across the row it was taken, to keep it in the sidebar's column.
     grab_x: Pixels,
@@ -287,7 +290,8 @@ impl Render for RowPreview {
                                 .items_center()
                                 .gap(px(TITLE_INSET - STATUS_SLOT))
                                 .child(status_mark(self.status, chrome))
-                                .child(row_title(self.title.clone(), None, true, chrome)),
+                                .child(row_title(self.title.clone(), None, true, chrome))
+                                .when(self.pinned, |row| row.child(pin_mark(chrome))),
                         )
                         .child(row_cwd(self.cwd.clone(), chrome)),
                 ),
@@ -597,6 +601,7 @@ impl Workspace {
                     .name
                     .filter(|name| !name.trim().is_empty())
                     .map(Into::into),
+                pinned: tab.pinned,
                 finished: false,
                 animating: false,
                 memory: 0,
@@ -612,8 +617,16 @@ impl Workspace {
         let Some(last) = self.tabs.len().checked_sub(1) else {
             return false;
         };
-        // Set first, so the selection pill starts on the row instead of sliding to it.
+        // A hand-edited old save may mix the groups; pinned rows still reopen at the top.
         self.active = saved.active.min(last);
+        let active = self.tabs[self.active].id;
+        self.tabs.sort_by_key(|tab| !tab.pinned);
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active)
+            .unwrap_or(0);
+        // Set first, so the selection pill starts on the row instead of sliding to it.
         self.activate(self.active, window, cx);
         true
     }
@@ -695,6 +708,7 @@ impl Workspace {
             });
             tabs.push(SavedTab {
                 name: tab.name.as_ref().map(ToString::to_string),
+                pinned: tab.pinned,
                 focused: tab
                     .tree
                     .leaves()
@@ -770,6 +784,7 @@ impl Workspace {
             tree: PaneTree::new(pane.clone()),
             focused: pane,
             name: None,
+            pinned: false,
             finished: false,
             animating: false,
             memory: 0,
@@ -794,17 +809,45 @@ impl Workspace {
     }
 
     /// `cmd-1`…`cmd-8` pick that tab if it exists; `cmd-9` (`usize::MAX`) picks the last.
-    /// Puts tab `id` where tab `to` is, shifting the rows between; the same tab stays active.
+    /// Puts tab `id` where tab `to` is, within their shared pinned or unpinned group.
     fn move_tab(&mut self, id: TabId, to: TabId, cx: &mut Context<Self>) {
         let index = |tabs: &[Tab], id| tabs.iter().position(|tab| tab.id == id);
         let (Some(from), Some(to)) = (index(&self.tabs, id), index(&self.tabs, to)) else {
             return;
         };
+        if self.tabs[from].pinned != self.tabs[to].pinned {
+            return;
+        }
+        self.move_tab_to(from, to, cx);
+    }
+
+    fn toggle_pin(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let tab = &mut self.tabs[from];
+        tab.pinned = !tab.pinned;
+        let pinned = tab.pinned;
+        let pinned_count = self.tabs.iter().filter(|tab| tab.pinned).count();
+        // Pin after the existing pinned rows; unpin before the ordinary rows.
+        let to = if pinned {
+            pinned_count - 1
+        } else {
+            pinned_count
+        };
+        self.move_tab_to(from, to, cx);
+    }
+
+    /// Moves a row and keeps the active tab active, sliding the rows between over by one.
+    fn move_tab_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
         let active = self.tabs[self.active].id;
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
-        self.active = index(&self.tabs, active).unwrap_or(0);
-        // The rows between slide over by one, from where they are, rather than jump.
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active)
+            .unwrap_or(0);
         let now = Instant::now();
         let (between, by) = if from < to {
             (from..to, 1.)
@@ -1664,6 +1707,7 @@ impl Workspace {
             title: title.clone(),
             cwd: info.cwd.clone(),
             status,
+            pinned: tab.pinned,
             chrome,
             grab_x: px(0.),
         };
@@ -1739,6 +1783,7 @@ impl Workspace {
                     .gap(px(TITLE_INSET - STATUS_SLOT))
                     .child(status_mark(status, chrome))
                     .child(row_title(title, editing, active, chrome))
+                    .when(tab.pinned, |row| row.child(pin_mark(chrome)))
                     .when_some(shown_memory(tab.memory), |row, shown| {
                         row.child(memory_label(shown, chrome))
                     })
@@ -1764,12 +1809,14 @@ impl Workspace {
             .tabs
             .iter()
             .any(|tab| tab.id == id && tab.name.is_some());
+        let pinned = self.tabs.iter().any(|tab| tab.id == id && tab.pinned);
         let item = |key: &'static str,
                     label: &'static str,
                     run: fn(&mut Self, TabId, &mut Window, &mut Context<Self>),
                     cx: &mut Context<Self>| {
             div()
                 .id(key)
+                .debug_selector(move || key.to_owned())
                 .h(px(26.))
                 .px_2()
                 .flex()
@@ -1809,6 +1856,12 @@ impl Workspace {
                     this.close_menu(window, cx);
                 }
             }))
+            .child(item(
+                "menu-pin",
+                if pinned { "Unpin Tab" } else { "Pin Tab" },
+                |this, id, _, cx| this.toggle_pin(id, cx),
+                cx,
+            ))
             .child(item("menu-rename", "Rename Tab…", Self::start_rename, cx))
             .when(named, |panel| {
                 panel.child(item(
@@ -2285,6 +2338,36 @@ fn reorderable(
             }
         }),
     )
+}
+
+/// A pushpin in a pinned row's title line, drawn so Kil needs no icon font.
+fn pin_mark(chrome: Chrome) -> Div {
+    div()
+        .flex_none()
+        .relative()
+        .w(px(8.))
+        .h(px(11.))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top_0()
+                .h(px(4.))
+                .rounded_sm()
+                .border_1()
+                .border_color(chrome.muted),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(4.))
+                .bottom(px(1.))
+                .left(px(3.5))
+                .w(px(1.))
+                .bg(chrome.muted),
+        )
+        .debug_selector(|| "pinned-tab".to_owned())
 }
 
 /// A memory figure as the sidebar shows it: its label, and whether it warns. `None` below
@@ -2918,12 +3001,52 @@ mod tests {
         workspace.read_with(cx, |this, _| this.tabs[0].name.clone())
     }
 
-    /// Right-click the first row, then pick "Rename Tab…" (the menu's first item).
+    /// Right-click the first row, then pick "Rename Tab…".
     fn start_rename(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
         click(cx, ROW, MouseButton::Right, 1);
         assert!(workspace.read_with(cx, |this, _| this.menu.is_some()));
-        click(cx, ROW + point(px(20.), px(18.)), MouseButton::Left, 1);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let item = cx.debug_bounds("menu-rename").expect("rename item drawn");
+        click(cx, item.center(), MouseButton::Left, 1);
         assert!(workspace.read_with(cx, |this, _| this.menu.is_none() && this.rename.is_some()));
+    }
+
+    fn toggle_pin_from_menu(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+        index: usize,
+    ) {
+        let row = ROW
+            + point(
+                px(0.),
+                px(ROW_HEIGHT * f32::from(u16::try_from(index).expect("small test row"))),
+            );
+        click(cx, row, MouseButton::Right, 1);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let item = cx.debug_bounds("menu-pin").expect("pin item drawn");
+        click(cx, item.center(), MouseButton::Left, 1);
+        std::thread::sleep(motion::ROW_SHIFT + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |this, _| this.menu.is_none()));
+    }
+
+    fn tab_layout(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<SharedString>, Vec<bool>, Option<SharedString>) {
+        workspace.read_with(cx, |this, _| {
+            (
+                this.tabs
+                    .iter()
+                    .filter_map(|tab| tab.name.clone())
+                    .collect(),
+                this.tabs.iter().map(|tab| tab.pinned).collect(),
+                this.tabs[this.active].name.clone(),
+            )
+        })
     }
 
     #[gpui::test]
@@ -3143,6 +3266,128 @@ mod tests {
             (vec!["b".into(), "c".into(), "a".into()], Some("c".into()))
         );
         assert!(workspace.read_with(cx, |this, _| this.dragging.is_none()));
+    }
+
+    #[gpui::test]
+    fn pin_menu_should_group_tabs_and_keep_the_active_one(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        for _ in 0..3 {
+            cx.dispatch_action(NewTab);
+        }
+        workspace.update(cx, |this, _| {
+            for (tab, name) in this.tabs.iter_mut().zip(["a", "b", "c", "d"]) {
+                tab.name = Some(name.into());
+            }
+        });
+        std::thread::sleep(motion::ROW_IN + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        toggle_pin_from_menu(&workspace, cx, 2);
+        assert_eq!(
+            tab_layout(&workspace, cx),
+            (
+                vec!["c".into(), "a".into(), "b".into(), "d".into()],
+                vec![true, false, false, false],
+                Some("d".into()),
+            )
+        );
+        assert!(cx.debug_bounds("pinned-tab").is_some());
+
+        toggle_pin_from_menu(&workspace, cx, 2);
+        assert_eq!(
+            tab_layout(&workspace, cx),
+            (
+                vec!["c".into(), "b".into(), "a".into(), "d".into()],
+                vec![true, true, false, false],
+                Some("d".into()),
+            )
+        );
+
+        toggle_pin_from_menu(&workspace, cx, 0);
+        assert_eq!(
+            tab_layout(&workspace, cx),
+            (
+                vec!["b".into(), "c".into(), "a".into(), "d".into()],
+                vec![true, false, false, false],
+                Some("d".into()),
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_a_row_should_stay_in_its_pinned_group(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        for _ in 0..3 {
+            cx.dispatch_action(NewTab);
+        }
+        workspace.update(cx, |this, cx| {
+            for (tab, name) in this.tabs.iter_mut().zip(["a", "b", "c", "d"]) {
+                tab.name = Some(name.into());
+            }
+            this.toggle_pin(this.tabs[0].id, cx);
+            this.toggle_pin(this.tabs[1].id, cx);
+        });
+        std::thread::sleep(motion::ROW_IN + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let drag = |cx: &mut VisualTestContext, from: usize, to: usize| {
+            let start = ROW
+                + point(
+                    px(0.),
+                    px(ROW_HEIGHT * f32::from(u16::try_from(from).expect("small test row"))),
+                );
+            let end = ROW
+                + point(
+                    px(0.),
+                    px(ROW_HEIGHT * f32::from(u16::try_from(to).expect("small test row"))),
+                );
+            cx.simulate_event(MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                modifiers: Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            for step in (1..=8u8).map(f32::from) {
+                cx.simulate_event(gpui::MouseMoveEvent {
+                    position: start + (end - start) * (step / 8.),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::none(),
+                });
+            }
+            cx.simulate_event(MouseUpEvent {
+                position: end,
+                button: MouseButton::Left,
+                modifiers: Modifiers::none(),
+                click_count: 1,
+            });
+            std::thread::sleep(motion::ROW_DROP + Duration::from_millis(20));
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        };
+        // An ordinary row cannot take a pinned row's place.
+        drag(cx, 2, 1);
+        assert_eq!(
+            tab_layout(&workspace, cx).0,
+            vec![
+                SharedString::from("a"),
+                SharedString::from("b"),
+                SharedString::from("c"),
+                SharedString::from("d"),
+            ]
+        );
+        // It still reorders among ordinary rows, and the active tab stays active.
+        drag(cx, 2, 3);
+        assert_eq!(
+            tab_layout(&workspace, cx),
+            (
+                vec!["a".into(), "b".into(), "d".into(), "c".into()],
+                vec![true, true, false, false],
+                Some("d".into()),
+            )
+        );
     }
 
     #[gpui::test]
@@ -3991,11 +4236,13 @@ mod tests {
                 SavedTab {
                     name: None,
                     focused: 0,
+                    pinned: false,
                     root: shell_in("/", None),
                 },
                 SavedTab {
                     name: Some("构建".to_owned()),
                     focused: 2,
+                    pinned: true,
                     root: Shape::Split {
                         axis: Axis::Horizontal,
                         ratio: 0.3,
@@ -4014,10 +4261,11 @@ mod tests {
         store.save(store.ticket(), &saved, &[]).unwrap();
         let (workspace, cx) = workspace_saving_to(Some(store), cx);
         workspace.read_with(cx, |this, _| {
-            let tab = &this.tabs[1];
+            let tab = &this.tabs[0];
             let leaves = tab.tree.leaves();
-            assert_eq!((this.tabs.len(), this.active), (2, 1));
+            assert_eq!((this.tabs.len(), this.active), (2, 0));
             assert_eq!(tab.name, Some("构建".into()));
+            assert!(tab.pinned);
             assert_eq!(leaves.len(), 3);
             assert_eq!(tab.focused, *leaves[2]);
             assert!(!tab.tree.is_animating(Instant::now()));
@@ -4029,12 +4277,16 @@ mod tests {
         let dir = scratch_dir("quit");
         let (workspace, cx) = workspace_saving_to(Some(Store::at(dir.clone())), cx);
         cx.dispatch_action(SplitRight);
-        workspace.update(cx, |this, _| this.tabs[0].name = Some("dev".into()));
+        workspace.update(cx, |this, _| {
+            this.tabs[0].name = Some("dev".into());
+            this.tabs[0].pinned = true;
+        });
         cx.dispatch_action(Quit);
         cx.run_until_parked();
         let saved = saved_layout(&dir);
         assert_eq!(saved.tabs.len(), 1);
         assert_eq!(saved.tabs[0].name.as_deref(), Some("dev"));
+        assert!(saved.tabs[0].pinned);
         assert_eq!(saved.tabs[0].focused, 1);
         assert!(matches!(
             saved.tabs[0].root,
@@ -4260,6 +4512,7 @@ mod tests {
                     tree: crate::pane_tree::PaneTree::new(pane.clone()),
                     focused: pane.clone(),
                     name: Some(format!("t{n}").into()),
+                    pinned: false,
                     finished: false,
                     animating: false,
                     memory: 0,

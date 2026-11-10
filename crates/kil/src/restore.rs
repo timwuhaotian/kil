@@ -40,6 +40,8 @@ pub struct SavedTab {
     /// Index of the focused pane in leaf order.
     #[serde(default)]
     pub focused: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     pub root: Shape<SavedPane>,
 }
 
@@ -440,11 +442,13 @@ mod tests {
                 SavedTab {
                     name: None,
                     focused: 0,
+                    pinned: false,
                     root: Shape::Leaf(SavedPane::default()),
                 },
                 SavedTab {
                     name: Some("构建".to_owned()),
                     focused: 1,
+                    pinned: true,
                     root: Shape::Split {
                         axis: Axis::Horizontal,
                         ratio: 0.3,
@@ -459,10 +463,19 @@ mod tests {
                 },
             ],
         };
+        let text = toml::to_string(&saved).unwrap();
+        assert_eq!(text.matches("pinned = ").count(), 1);
+        assert!(text.contains("pinned = true"));
         let store = scratch("format");
         store.save(store.ticket(), &saved, &[]).unwrap();
         let restored = store.load().unwrap().unwrap();
         assert_eq!((restored.saved, restored.rerun), (saved, true));
+    }
+
+    #[test]
+    fn saved_tab_should_default_to_unpinned_in_an_old_session() {
+        let tab: SavedTab = toml::from_str("[root]\n").unwrap();
+        assert!(!tab.pinned);
     }
 
     #[test]
@@ -501,6 +514,7 @@ mod tests {
             tabs: vec![SavedTab {
                 name: None,
                 focused: 0,
+                pinned: false,
                 root: pane("kept-1", "/", None),
             }],
             ..SavedWorkspace::default()
