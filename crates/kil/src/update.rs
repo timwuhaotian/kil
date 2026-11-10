@@ -37,6 +37,7 @@ const DMG_URL: &str =
 const CHANGELOG_URL: &str = "https://raw.githubusercontent.com/timwuhaotian/kil/main/CHANGELOG.md";
 /// After launch, so the check never competes with reopening the session.
 const FIRST_CHECK: Duration = Duration::from_secs(5);
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 /// A terminal stays open for days; one wakeup in hours keeps idle CPU at zero (A12).
 const CHECK_EVERY: Duration = Duration::from_hours(6);
 /// How often a download's size is read, and the update window redraws its bar.
@@ -326,6 +327,31 @@ fn bundle_version(app: &Path) -> Result<String, String> {
     )
 }
 
+/// Registers `bundle` with `LaunchServices`, and pokes its modification time so the system
+/// re-reads it. The rename swap in [`install`] bypasses Finder, so without this the system
+/// keeps serving the old record — the old version, and the old icon in notifications.
+/// Best effort: the update itself has succeeded by now.
+fn register_bundle(bundle: &Path) {
+    if let Err(err) = run("/usr/bin/touch", &[bundle.as_os_str()]) {
+        log::warn!("touching {}: {err}", bundle.display());
+    }
+    if let Err(err) = run(LSREGISTER, &["-f".as_ref(), bundle.as_os_str()]) {
+        log::warn!(
+            "re-registering {} with LaunchServices: {err}",
+            bundle.display()
+        );
+    }
+}
+
+/// Drops `app` from `LaunchServices`. Staging a download registers the copy, and every
+/// staged copy shares Kil's bundle id; left behind, they pile up as dead records once the
+/// copy is deleted. Best effort: a leftover record is harmless, just cruft.
+fn unregister(app: &Path) {
+    if let Err(err) = run(LSREGISTER, &["-u".as_ref(), app.as_os_str()]) {
+        log::debug!("unregistering {} from LaunchServices: {err}", app.display());
+    }
+}
+
 /// Checks that `app` is Kil `version`, signed by `team` and notarized by Apple.
 fn verify(app: &Path, version: &str, team: &str) -> Result<(), String> {
     let shown = bundle_version(app)?;
@@ -356,6 +382,7 @@ fn verify(app: &Path, version: &str, team: &str) -> Result<(), String> {
         ],
     )
     .map_err(|err| format!("Apple hasn't notarized the download ({err})"))?;
+    unregister(app);
     Ok(())
 }
 
@@ -725,7 +752,11 @@ fn install_on_quit(cx: &mut App) {
     } else if let Err(err) = install(&ready.app, &ready.bundle) {
         log::error!("installing Kil {}: {err}", ready.version);
         return;
+    } else {
+        register_bundle(&ready.bundle);
     }
+    // Unregister again in case the registration landed after staging's own.
+    unregister(&ready.app);
     if let Some(dir) = ready.app.parent() {
         let _ = fs::remove_dir_all(dir);
     }
@@ -1084,7 +1115,16 @@ mod tests {
             }
         );
         assert!(verify(&staged, &manifest.version, "AAAAAAAAAA").is_err());
+        let staged = fs::canonicalize(&staged).unwrap();
         let _ = fs::remove_dir_all(&dir);
+        // Staging registers the copy; it must not stay behind as a dead record under Kil's
+        // id once the copy is gone (over two hundred accumulated on one machine).
+        let dump = Command::new(LSREGISTER).arg("-dump").output().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&dump.stdout).contains(staged.to_string_lossy().as_ref()),
+            "{} stayed registered",
+            staged.display()
+        );
     }
 
     #[gpui::test]

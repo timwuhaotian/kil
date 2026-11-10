@@ -6,6 +6,11 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Notifications show the current app icon.** The in-place update swapped the bundle
+  without telling the system, so notifications kept showing the previous icon; staged
+  downloads also lingered as dead records under Kil's id. Kil now re-registers the new
+  bundle after installing, and unregisters staged copies.
+
 ## 0.0.36 — 2026-11-10
 
 - **Pin shortcuts.** `⌘⇧P` pins the active tab and `⌥⌘⇧P` unpins it. Both commands appear in
