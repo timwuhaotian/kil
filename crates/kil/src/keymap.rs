@@ -12,6 +12,8 @@ use crate::{terminal_pane, workspace};
 pub enum Command {
     NewTab,
     CloseTab,
+    PinTab,
+    UnpinTab,
     ClosePane,
     SplitRight,
     SplitDown,
@@ -38,6 +40,8 @@ pub enum Command {
 const NAMED: &[(&str, Command)] = &[
     ("new_tab", Command::NewTab),
     ("close_tab", Command::CloseTab),
+    ("pin_tab", Command::PinTab),
+    ("unpin_tab", Command::UnpinTab),
     ("close_pane", Command::ClosePane),
     ("split_right", Command::SplitRight),
     ("split_down", Command::SplitDown),
@@ -63,6 +67,8 @@ const NAMED: &[(&str, Command)] = &[
 const DEFAULTS: &[(&str, &str)] = &[
     ("cmd-t", "new_tab"),
     ("cmd-shift-w", "close_tab"),
+    ("cmd-shift-p", "pin_tab"),
+    ("cmd-alt-shift-p", "unpin_tab"),
     ("cmd-shift-c", "close_pane"),
     ("cmd-shift-d", "split_right"),
     ("cmd-d", "split_down"),
@@ -131,6 +137,8 @@ impl Command {
         Some(match self {
             Self::NewTab => KeyBinding::new(keys, w::NewTab, cx),
             Self::CloseTab => KeyBinding::new(keys, w::CloseTab, cx),
+            Self::PinTab => KeyBinding::new(keys, w::PinTab, cx),
+            Self::UnpinTab => KeyBinding::new(keys, w::UnpinTab, cx),
             Self::ClosePane => KeyBinding::new(keys, w::ClosePane, cx),
             Self::SplitRight => KeyBinding::new(keys, w::SplitRight, cx),
             Self::SplitDown => KeyBinding::new(keys, w::SplitDown, cx),
@@ -180,6 +188,8 @@ impl Command {
         match self {
             Self::NewTab => "New tab".into(),
             Self::CloseTab => "Close tab".into(),
+            Self::PinTab => "Pin tab".into(),
+            Self::UnpinTab => "Unpin tab".into(),
             Self::ClosePane => "Close pane".into(),
             Self::SplitRight => "Split right".into(),
             Self::SplitDown => "Split down".into(),
@@ -236,7 +246,7 @@ pub struct KeymapError {
 pub const TEMPLATE: &str = r#"# Kil key bindings. Each entry replaces the default for its keys; "unbind" removes one.
 # Saved changes apply when Kil's window is focused again, and the menus show them.
 #
-# Commands: new_tab, close_tab, close_pane, split_right, split_down,
+# Commands: new_tab, close_tab, pin_tab, unpin_tab, close_pane, split_right, split_down,
 #   focus_left, focus_right, focus_up, focus_down, next_tab, prev_tab, select_tab_1 … select_tab_9,
 #   copy, paste, clear_scrollback, font_bigger, font_smaller, font_reset,
 #   open_settings, hide, hide_others, quit, unbind
@@ -249,6 +259,8 @@ pub const TEMPLATE: &str = r#"# Kil key bindings. Each entry replaces the defaul
 # "cmd-shift-c" = "close_pane"
 # "cmd-shift-w" = "close_tab"
 # "cmd-t"       = "new_tab"
+# "cmd-shift-p" = "pin_tab"
+# "cmd-alt-shift-p" = "unpin_tab"
 "#;
 
 #[derive(Deserialize)]

@@ -39,6 +39,8 @@ actions!(
     [
         NewTab,
         CloseTab,
+        PinTab,
+        UnpinTab,
         ClosePane,
         SplitRight,
         SplitDown,
@@ -822,12 +824,25 @@ impl Workspace {
     }
 
     fn toggle_pin(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(pinned) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| !tab.pinned)
+        else {
+            return;
+        };
+        self.set_pinned(id, pinned, cx);
+    }
+
+    fn set_pinned(&mut self, id: TabId, pinned: bool, cx: &mut Context<Self>) {
         let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
-        let tab = &mut self.tabs[from];
-        tab.pinned = !tab.pinned;
-        let pinned = tab.pinned;
+        if self.tabs[from].pinned == pinned {
+            return;
+        }
+        self.tabs[from].pinned = pinned;
         let pinned_count = self.tabs.iter().filter(|tab| tab.pinned).count();
         // Pin after the existing pinned rows; unpin before the ordinary rows.
         let to = if pinned {
@@ -2253,6 +2268,18 @@ impl Workspace {
         }
     }
 
+    fn pin_tab(&mut self, _: &PinTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) {
+            self.set_pinned(id, true, cx);
+        }
+    }
+
+    fn unpin_tab(&mut self, _: &UnpinTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) {
+            self.set_pinned(id, false, cx);
+        }
+    }
+
     fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pane) = self.tabs.get(self.active).map(|tab| tab.focused.clone()) else {
             return;
@@ -2754,6 +2781,8 @@ impl Focusable for Workspace {
 fn bind_actions(root: Stateful<Div>, cx: &mut Context<Workspace>) -> Stateful<Div> {
     root.on_action(cx.listener(Workspace::new_tab))
         .on_action(cx.listener(Workspace::close_tab))
+        .on_action(cx.listener(Workspace::pin_tab))
+        .on_action(cx.listener(Workspace::unpin_tab))
         .on_action(cx.listener(Workspace::close_pane))
         .on_action(cx.listener(Workspace::quit))
         .on_action(cx.listener(Workspace::quit_and_stop))
@@ -3311,6 +3340,48 @@ mod tests {
                 vec!["b".into(), "c".into(), "a".into(), "d".into()],
                 vec![true, false, false, false],
                 Some("d".into()),
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn pin_shortcuts_should_change_only_the_active_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        for _ in 0..2 {
+            cx.dispatch_action(NewTab);
+        }
+        workspace.update(cx, |this, _| {
+            for (tab, name) in this.tabs.iter_mut().zip(["a", "b", "c"]) {
+                tab.name = Some(name.into());
+            }
+        });
+        cx.update(|_, cx| {
+            let (table, errors) = crate::keymap::resolve(None);
+            assert_eq!(errors, Vec::new());
+            cx.bind_keys(crate::keymap::bindings(&table));
+        });
+
+        cx.simulate_keystrokes("cmd-shift-p");
+        let pinned = tab_layout(&workspace, cx);
+        assert_eq!(
+            pinned,
+            (
+                vec!["c".into(), "a".into(), "b".into()],
+                vec![true, false, false],
+                Some("c".into()),
+            )
+        );
+        // Pinning is idempotent, not a toggle.
+        cx.simulate_keystrokes("cmd-shift-p");
+        assert_eq!(tab_layout(&workspace, cx), pinned);
+
+        cx.simulate_keystrokes("cmd-alt-shift-p");
+        assert_eq!(
+            tab_layout(&workspace, cx),
+            (
+                vec!["c".into(), "a".into(), "b".into()],
+                vec![false, false, false],
+                Some("c".into()),
             )
         );
     }

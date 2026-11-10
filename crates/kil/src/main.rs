@@ -94,6 +94,8 @@ fn menus(cx: &App) -> Vec<Menu> {
             name: "Shell".into(),
             items: vec![
                 MenuItem::action("New Tab", w::NewTab),
+                MenuItem::action("Pin Tab", w::PinTab),
+                MenuItem::action("Unpin Tab", w::UnpinTab),
                 MenuItem::action("Split Right", w::SplitRight),
                 MenuItem::action("Split Down", w::SplitDown),
                 MenuItem::separator(),

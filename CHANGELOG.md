@@ -6,6 +6,9 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Pin shortcuts.** `⌘⇧P` pins the active tab and `⌥⌘⇧P` unpins it. Both commands appear in
+  Settings ▸ Keyboard and can be rebound as `pin_tab` and `unpin_tab` in `keymap.toml`.
+
 ## 0.0.35 — 2026-11-10
 
 - **Pin important sidebar tabs.** Right-click a tab for **Pin Tab** / **Unpin Tab**. Pinned tabs

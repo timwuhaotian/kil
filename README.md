@@ -184,6 +184,7 @@ copies read to find the update.
 | `⌘T` | New tab, in the default directory, else the focused pane's |
 | `⌘⇧D` / `⌘D` | Split right / split down |
 | `⌘⇧C` / `⌘⇧W` | Close pane / close tab |
+| `⌘⇧P` / `⌥⌘⇧P` | Pin / unpin the active tab |
 | `⌘⌥←→↑↓` | Focus the pane in that direction |
 | `⌘1`…`⌘9`, `⌘⇧[` / `⌘⇧]` | Select a tab, previous / next tab |
 | `⇧↩` | New line without sending, in Claude Code, kimi and other TUIs (sends ESC CR, like `⌥↩`) |
