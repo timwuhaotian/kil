@@ -19,8 +19,8 @@ anyhow.workspace = true
 env_logger.workspace = true
 log.workspace = true
 igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"] }
-qrcode = "0.13"
-rcgen = "0.13"
+qrcode = "0.14"
+rcgen = "0.14"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
