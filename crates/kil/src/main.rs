@@ -1,5 +1,6 @@
 //! Kil: a native macOS terminal.
 
+mod cli;
 mod config;
 mod keymap;
 mod keys;
@@ -262,52 +263,21 @@ pub(crate) fn restart_kil() -> bool {
     true
 }
 
-/// `kil --server <dir>` runs the session server instead of the app (DESIGN.md §14).
-fn server_dir() -> Option<PathBuf> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next()? != "--server" {
-        return None;
-    }
-    args.next().map(PathBuf::from)
-}
-
 /// `kil --remote` exposes the session server to Agent on Edge over a paired
 /// TLS tunnel, printing a QR code to scan. Keeps the same session server the
 /// app runs, so the panes on the phone are the panes on the desk.
-///
-/// Optional flags after `--remote`: `--host <ip>` (override the QR address),
-/// `--port <n>` (default: an OS-picked free port), and `--public` (set up a
-/// `UPnP` port mapping on the router and print a QR for the public IP).
-fn remote_config() -> Option<kil_remote::Config> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next()? != "--remote" {
-        return None;
-    }
-    let mut port = 0;
-    let mut host = None;
-    let mut public = false;
-    while let Some(arg) = args.next() {
-        match arg.to_str()? {
-            "--host" => host = Some(args.next()?.to_string_lossy().into_owned()),
-            "--port" => port = args.next()?.to_string_lossy().parse().ok()?,
-            "--public" => public = true,
-            other => {
-                eprintln!("kil --remote: ignoring unknown flag {other}");
-                return None;
-            }
-        }
-    }
+fn remote_config(host: Option<String>, port: u16, public: bool) -> kil_remote::Config {
     let dir = restore::Store::standard().map_or_else(
         || std::env::temp_dir().join("kil"),
         |store| store.dir().to_owned(),
     );
-    Some(kil_remote::Config {
+    kil_remote::Config {
         dir,
         port,
         host,
         launcher: std::env::current_exe().ok(),
         public,
-    })
+    }
 }
 
 fn serve(dir: &Path) {
@@ -344,17 +314,46 @@ fn session_server(dir: &Path, notices: &mut Vec<SharedString>) -> Option<Arc<Cli
         .ok()
 }
 
+/// Handles a command line that is not the GUI (`--help`, `--version`,
+/// `--server`, `--remote`, or a usage error). True when handled, so the app
+/// must not open.
+fn run_command(args: &[std::ffi::OsString]) -> bool {
+    let command = match cli::parse(args) {
+        Ok(command) => command,
+        Err(err) => {
+            eprintln!("{err}\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    match command {
+        cli::Command::Gui => false,
+        cli::Command::Help => {
+            println!("{}", cli::HELP);
+            true
+        }
+        cli::Command::Version => {
+            println!("kil {}", env!("CARGO_PKG_VERSION"));
+            true
+        }
+        cli::Command::Server { dir } => {
+            serve(&dir);
+            true
+        }
+        cli::Command::Remote { host, port, public } => {
+            let config = remote_config(host, port, public);
+            if let Err(err) = kil_remote::run(&config) {
+                eprintln!("kil --remote: {err:#}");
+                std::process::exit(1);
+            }
+            true
+        }
+    }
+}
+
 fn main() {
     forget_launcher_identity();
-    if let Some(dir) = server_dir() {
-        serve(&dir);
-        return;
-    }
-    if let Some(config) = remote_config() {
-        if let Err(err) = kil_remote::run(&config) {
-            eprintln!("kil --remote: {err:#}");
-            std::process::exit(1);
-        }
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if run_command(&args) {
         return;
     }
     env_logger::init();

@@ -35,8 +35,12 @@ fn main() -> Result<()> {
             "--public" => public = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>] [--public]"
+                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>] [--public]\n       kil-remote --version"
                 );
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("kil-remote {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             other => bail!("unknown argument: {other}"),

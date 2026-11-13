@@ -6,6 +6,15 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.38 — 2026-11-13
+
+- **The command line is strict.** `kil --help` (`-h`) and `kil --version` (`-V`)
+  print help and the version. Any other argument — a typo, a path, `-e` — is
+  rejected with exit code 2 instead of opening the window. `kil --server` still
+  takes exactly its directory, `kil --remote` keeps its `--host`/`--port`/`--public`
+  flags with errors instead of silently ignoring leftovers, and `kil-remote`
+  learned `--version`.
+
 ## 0.0.37 — 2026-11-11
 
 - **Notifications show the current app icon.** The in-place update swapped the bundle

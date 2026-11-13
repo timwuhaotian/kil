@@ -209,6 +209,11 @@ and release and own their selection (Shift-drag stays Kil's). Elsewhere the whee
 Kil's scrollback. Cmd-click a link — a bare URL, a markdown link's text, or a program's
 OSC 8 hyperlink — to open it in the default browser.
 
+**Command line.** `kil` opens the window. `kil --help` (`-h`) and `kil --version` (`-V`)
+print help and the version; any other argument is rejected with exit code 2 instead of
+opening the window. `kil --server <dir>` and `kil --remote` are internal (the session
+server, and the Agent on Edge bridge).
+
 **Rebinding is in the app.** **Settings ▸ Keyboard** lists every command and the keys it runs on.
 Click a shortcut, press the new one, and it is saved and applied at once — the old keys stop
 working, a key another command already has is refused by name, and **Reset** brings the default
