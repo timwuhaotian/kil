@@ -446,6 +446,20 @@ impl Session {
         self.events.is_dirty()
     }
 
+    /// The last title the program set, for a roster naming panes nobody is drawing
+    /// (server side).
+    pub(crate) fn title(&self) -> Option<String> {
+        self.events.title()
+    }
+
+    /// Where the pane is working: the foreground process's directory, else the shell's own
+    /// (server side, best-effort).
+    pub(crate) fn cwd(&self) -> Option<PathBuf> {
+        self.foreground()
+            .and_then(|process| process.cwd)
+            .or_else(|| self.shell_cwd())
+    }
+
     /// Clears [`Self::is_dirty`] without a snapshot and returns what it was.
     ///
     /// For a session nobody is drawing (a background tab): a dirty session sends no further

@@ -35,6 +35,20 @@ pub(crate) struct Identity {
     pub(crate) size: GridSize,
 }
 
+/// One session as a roster describes it, for a client choosing among panes without
+/// attaching to each: empty strings are unknown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionDesc {
+    /// The session's id, as in [`Frame::Sessions`].
+    pub id: String,
+    /// The last title its program set.
+    pub title: String,
+    /// Its foreground process's working directory, else the shell's.
+    pub cwd: String,
+    /// A job other than the shell is in the foreground.
+    pub busy: bool,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Frame {
     /// The first frame on every connection, both ways.
@@ -63,6 +77,8 @@ pub(crate) enum Frame {
     Remote,
     /// Asks which sessions a phone recently typed in; answered with [`Frame::Controlling`].
     Controllers,
+    /// Asks for every session described; answered with [`Frame::Roster`].
+    Describe,
     // Server to client.
     Sessions(Vec<String>),
     Stopped,
@@ -84,6 +100,10 @@ pub(crate) enum Frame {
     /// not just watching. Asked with [`Frame::Controllers`] on its own connection, so an
     /// older server hanging up on the unknown frame disturbs nothing.
     Controlling(Vec<String>),
+    /// Every session, described: a phone's roster names panes it has never shown, where
+    /// [`Frame::Sessions`] gives bare ids. Asked with [`Frame::Describe`] on its own
+    /// connection, so an older server hanging up on the unknown frame disturbs nothing.
+    Roster(Vec<SessionDesc>),
 }
 
 impl Frame {
@@ -110,6 +130,8 @@ impl Frame {
             Self::Remote => 19,
             Self::Controllers => 20,
             Self::Controlling(_) => 21,
+            Self::Describe => 22,
+            Self::Roster(_) => 23,
         }
     }
 
@@ -128,7 +150,8 @@ impl Frame {
             | Self::Missing
             | Self::Watchers
             | Self::Remote
-            | Self::Controllers => {}
+            | Self::Controllers
+            | Self::Describe => {}
             Self::Spawn { id, config } => {
                 put.str(id);
                 put.config(config);
@@ -148,6 +171,15 @@ impl Frame {
                 put.u64(identity.start_usec);
                 put.u32(identity.tty);
                 put.size(identity.size);
+            }
+            Self::Roster(descriptions) => {
+                put.len(descriptions.len());
+                for desc in descriptions {
+                    put.str(&desc.id);
+                    put.str(&desc.title);
+                    put.str(&desc.cwd);
+                    put.0.push(u8::from(desc.busy));
+                }
             }
             Self::Failed(message) => put.str(message),
             Self::Exited(status) => put.u32(status.into_raw().cast_unsigned()),
@@ -200,6 +232,11 @@ impl Frame {
             21 => {
                 let count = get.len()?;
                 Self::Controlling((0..count).map(|_| get.str()).collect::<io::Result<_>>()?)
+            }
+            22 => Self::Describe,
+            23 => {
+                let count = get.len()?;
+                Self::Roster((0..count).map(|_| get.desc()).collect::<io::Result<_>>()?)
             }
             _ => return Err(invalid("unknown frame kind")),
         };
@@ -363,6 +400,15 @@ impl Get<'_> {
             r: rgb[0],
             g: rgb[1],
             b: rgb[2],
+        })
+    }
+
+    fn desc(&mut self) -> io::Result<SessionDesc> {
+        Ok(SessionDesc {
+            id: self.str()?,
+            title: self.str()?,
+            cwd: self.str()?,
+            busy: self.u8()? != 0,
         })
     }
 
@@ -563,6 +609,21 @@ mod tests {
             Frame::Remote,
             Frame::Controllers,
             Frame::Controlling(vec!["a-1".into()]),
+            Frame::Describe,
+            Frame::Roster(vec![
+                SessionDesc {
+                    id: "a-1".into(),
+                    title: "killi".into(),
+                    cwd: "/Users/me/code/kil".into(),
+                    busy: true,
+                },
+                SessionDesc {
+                    id: "b-2".into(),
+                    title: String::new(),
+                    cwd: String::new(),
+                    busy: false,
+                },
+            ]),
         ];
         for frame in frames {
             assert_eq!(round_trip(&frame), frame);

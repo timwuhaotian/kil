@@ -180,6 +180,8 @@ async fn a_phone_through_the_bridge_is_reported_watching_and_driving() {
         host: Some("127.0.0.1".to_owned()),
         launcher: None,
         public: false,
+        tunnel_hostname: None,
+        tunnel_token: None,
     })
     .unwrap();
     let qr = {

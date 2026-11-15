@@ -6,6 +6,21 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.40 — 2026-11-15
+
+- **Public internet runs on your own Cloudflare Tunnel now.** Instead of an
+  anonymous Quick Tunnel with a random hostname, the Agent on Edge bridge
+  connects a tunnel from your Cloudflare account: put its public hostname and
+  token in Settings ▸ Agent on Edge (`tunnel_hostname`/`tunnel_token` in
+  `config.toml`), point the tunnel's ingress at `http://127.0.0.1:48242`, and
+  the QR names your domain — stable across restarts, still ciphertext-only to
+  Cloudflare, and the QR still carries the LAN address for at home.
+- **The session server can describe its panes.** A new roster query answers
+  with each session's title, working directory and busy state, so Agent on
+  Edge opens onto every tab by name instead of landing in one pane. Older
+  clients and servers are unaffected; a server that doesn't know the query
+  just hangs up that one connection.
+
 ## 0.0.39 — 2026-11-15
 
 - **Public internet no longer asks the router for anything.** The Agent on Edge

@@ -57,9 +57,11 @@ owns every process, PID and file descriptor it creates.
   The pairing code never expires — the first phone spends it and its token reconnects for as
   long as the bridge runs — and the bridge belongs to Kil rather than to the panel, so closing
   Settings leaves it up; **New QR** makes a fresh certificate, code and port for a second phone
-  or a re-pair. Ticking Public internet opens a Cloudflare Quick Tunnel (`cloudflared` dials
-  out, so no router setup) and prints a QR that works from anywhere; the pinned TLS rides inside
-  the tunnel, so Cloudflare relays ciphertext only, the QR also carries the LAN address for at
+  or a re-pair. Ticking Public internet runs your own Cloudflare Tunnel — on your Cloudflare
+  account and domain, its hostname and token set in Settings ▸ Agent on Edge (or
+  `tunnel_hostname` / `tunnel_token` in `config.toml`) — and prints a QR that works from
+  anywhere; `cloudflared` dials out, so no router setup, the pinned TLS rides inside the
+  tunnel, so Cloudflare relays ciphertext only, the QR also carries the LAN address for at
   home, and the tunnel closes when the bridge stops.
 
   While a phone is attached, its tab's row in the sidebar is outlined in the theme's accent and
@@ -244,6 +246,8 @@ option_as_meta = true
 cursor_blink = true
 sidebar_opacity = 0.6            # 0–1; leave out for the theme's own
 auto_update = true               # check, download and install updates when Kil quits
+tunnel_hostname = "kil.example.com"  # your Cloudflare Tunnel, for public Agent on Edge
+tunnel_token = "…"               # its token, from Cloudflare Zero Trust
 ```
 
 **`~/Library/Application Support/kil/`** holds what Kil reopens: `session.toml` (layout),

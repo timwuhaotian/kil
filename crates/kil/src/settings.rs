@@ -23,6 +23,10 @@ pub struct Settings {
     pub sidebar_opacity: Option<f32>,
     /// Check for, download and install updates without being asked (DESIGN.md §15).
     pub auto_update: bool,
+    /// The user's own Cloudflare Tunnel's public hostname, for public Agent on Edge.
+    pub tunnel_hostname: Option<String>,
+    /// That tunnel's token, from Cloudflare Zero Trust.
+    pub tunnel_token: Option<String>,
 }
 
 impl Global for Settings {}
@@ -39,6 +43,8 @@ impl Default for Settings {
             default_directory: None,
             sidebar_opacity: None,
             auto_update: true,
+            tunnel_hostname: None,
+            tunnel_token: None,
         }
     }
 }
@@ -55,6 +61,8 @@ struct SettingsFile {
     default_directory: Option<String>,
     sidebar_opacity: Option<f32>,
     auto_update: Option<bool>,
+    tunnel_hostname: Option<String>,
+    tunnel_token: Option<String>,
 }
 
 impl Settings {
@@ -85,8 +93,17 @@ impl Settings {
             default_directory: file.default_directory.as_deref().and_then(expand_home),
             sidebar_opacity,
             auto_update: file.auto_update.unwrap_or(defaults.auto_update),
+            tunnel_hostname: trimmed(file.tunnel_hostname),
+            tunnel_token: trimmed(file.tunnel_token),
         })
     }
+}
+
+/// `value` trimmed; empty is no value.
+fn trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// `~` and `~/…` under `$HOME`; an empty path is no path.
@@ -206,6 +223,21 @@ mod tests {
     fn parse_should_treat_an_empty_default_directory_as_none() {
         let settings = Settings::parse("default_directory = \"\"").unwrap();
         assert_eq!(settings.default_directory, None);
+    }
+
+    #[test]
+    fn parse_should_read_the_tunnel_settings_trimmed_and_treat_blank_as_none() {
+        let settings =
+            Settings::parse("tunnel_hostname = \" kil.example.com \"\ntunnel_token = \" tok \"\n")
+                .unwrap();
+        assert_eq!(
+            (settings.tunnel_hostname, settings.tunnel_token),
+            (Some("kil.example.com".into()), Some("tok".into()))
+        );
+        let absent = Settings::parse("").unwrap();
+        assert_eq!((absent.tunnel_hostname, absent.tunnel_token), (None, None));
+        let blank = Settings::parse("tunnel_hostname = \"  \"\ntunnel_token = \"\"\n").unwrap();
+        assert_eq!((blank.tunnel_hostname, blank.tunnel_token), (None, None));
     }
 
     #[test]

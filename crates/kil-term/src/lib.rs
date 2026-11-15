@@ -41,6 +41,7 @@ pub use session::{
 };
 pub use snapshot::{CellFlags, CursorShape, CursorSnapshot, Frame, Palette, RenderCell, Rgba};
 pub use transcript::Transcript;
+pub use wire::SessionDesc;
 
 /// What the system itself is doing with memory (DESIGN.md §5.2).
 pub mod system {

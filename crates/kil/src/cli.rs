@@ -8,7 +8,7 @@ use std::{ffi::OsString, path::PathBuf};
 pub const USAGE: &str = "usage: kil [--help] [--version]\n       kil --server <dir>\n       kil --remote [--host <ip>] [--port <n>] [--public]";
 
 /// Full help, printed for `--help`.
-pub const HELP: &str = "Kil: a native macOS terminal.\n\nusage:\n  kil                         open the window\n  kil --server <dir>          run the session server (internal: owns every pane's PTY)\n  kil --remote [--host <ip>] [--port <n>] [--public]\n                              expose the session server to Agent on Edge\n  kil --help, -h              show this help\n  kil --version, -V           show the version\n\nAny other argument is rejected (exit 2) instead of opening the window.";
+pub const HELP: &str = "Kil: a native macOS terminal.\n\nusage:\n  kil                         open the window\n  kil --server <dir>          run the session server (internal: owns every pane's PTY)\n  kil --remote [--host <ip>] [--port <n>] [--public]\n                              expose the session server to Agent on Edge\n                              (--public uses tunnel_hostname/tunnel_token from config.toml)\n  kil --help, -h              show this help\n  kil --version, -V           show the version\n\nAny other argument is rejected (exit 2) instead of opening the window.";
 
 /// What the process should do.
 #[derive(Debug)]

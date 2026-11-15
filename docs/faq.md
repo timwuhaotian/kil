@@ -38,11 +38,11 @@ Download `Kil-arm64.dmg` from `releases/`, drag Kil to Applications, and verify 
 
 ## How does the iPhone remote (Agent on Edge) work?
 
-Settings ▸ Agent on Edge shows a QR code that pairs an iPhone to the same session server through a TLS tunnel, so the phone's panes are the desk's panes. Ticking Public internet opens an outbound Cloudflare Tunnel (no router setup; the pinned TLS rides inside, so Cloudflare relays ciphertext only), and the tab row shows a phone badge that turns solid while the phone types.
+Settings ▸ Agent on Edge shows a QR code that pairs an iPhone to the same session server through a TLS tunnel, so the phone's panes are the desk's panes. Ticking Public internet runs your own outbound Cloudflare Tunnel, on your account and domain — hostname and token in Settings ▸ Agent on Edge or `config.toml` (no router setup; the pinned TLS rides inside, so Cloudflare relays ciphertext only, and the QR also carries the LAN address for at home) — and the tab row shows a phone badge that turns solid while the phone types.
 
 ## Where are Kil's config files?
 
-Keys live in `~/.config/kil/keymap.toml` (Kil ▸ Keyboard Shortcuts… opens it) and settings in `~/.config/kil/config.toml` (`$XDG_CONFIG_HOME` respected), covering theme, font, scrollback lines (default 10,000), sidebar opacity, and auto-update. Saved layout and screens sit under `~/Library/Application Support/kil/`.
+Keys live in `~/.config/kil/keymap.toml` (Kil ▸ Keyboard Shortcuts… opens it) and settings in `~/.config/kil/config.toml` (`$XDG_CONFIG_HOME` respected), covering theme, font, scrollback lines (default 10,000), sidebar opacity, auto-update, and the Cloudflare Tunnel hostname/token for public Agent on Edge. Saved layout and screens sit under `~/Library/Application Support/kil/`.
 
 ## How does Kil compare to tmux?
 

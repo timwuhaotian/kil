@@ -27,7 +27,7 @@ use crate::{
     server,
     session::{GridSize, Session, SessionConfig, term_config},
     snapshot::Palette,
-    wire::{self, Frame, Inbox, MIN_PROTOCOL, PROTOCOL},
+    wire::{self, Frame, Inbox, MIN_PROTOCOL, PROTOCOL, SessionDesc},
 };
 
 /// How long a request to the server may take before it counts as gone.
@@ -137,6 +137,25 @@ impl Client {
         wire::send(&mut stream, &Frame::Controllers)?;
         match wire::receive(&mut stream)? {
             Some(Frame::Controlling(ids)) => Ok(ids),
+            None => Ok(Vec::new()),
+            Some(other) => Err(unexpected(&other)),
+        }
+    }
+
+    /// Every session, described — title, working directory, busy — for naming panes
+    /// without attaching to them.
+    ///
+    /// Asked on its own connection: a server older than the `Describe` frame hangs up
+    /// on it, which reads as no descriptions rather than disturbing the control
+    /// connection.
+    ///
+    /// # Errors
+    /// If the server is gone.
+    pub fn roster(&self) -> io::Result<Vec<SessionDesc>> {
+        let mut stream = self.connection()?;
+        wire::send(&mut stream, &Frame::Describe)?;
+        match wire::receive(&mut stream)? {
+            Some(Frame::Roster(descriptions)) => Ok(descriptions),
             None => Ok(Vec::new()),
             Some(other) => Err(unexpected(&other)),
         }

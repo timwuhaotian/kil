@@ -271,12 +271,15 @@ fn remote_config(host: Option<String>, port: u16, public: bool) -> kil_remote::C
         || std::env::temp_dir().join("kil"),
         |store| store.dir().to_owned(),
     );
+    let settings = config::read_settings().unwrap_or_default();
     kil_remote::Config {
         dir,
         port,
         host,
         launcher: std::env::current_exe().ok(),
         public,
+        tunnel_hostname: settings.tunnel_hostname,
+        tunnel_token: settings.tunnel_token,
     }
 }
 

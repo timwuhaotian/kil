@@ -1,6 +1,7 @@
 //! The standalone bridge binary: `kil-remote [--dir <dir>] [--port <port>]
-//! [--host <ip>] [--launcher <exe>] [--public]`. Prefer `kil --remote`, which
-//! also knows how to start the session server.
+//! [--host <ip>] [--launcher <exe>] [--public] [--tunnel-hostname <host>]`.
+//! The tunnel token comes only from the `TUNNEL_TOKEN` environment variable.
+//! Prefer `kil --remote`, which also knows how to start the session server.
 
 use std::path::PathBuf;
 
@@ -21,6 +22,8 @@ fn main() -> Result<()> {
     let mut host = None;
     let mut launcher = None;
     let mut public = false;
+    let mut tunnel_hostname = None;
+    let tunnel_token = std::env::var("TUNNEL_TOKEN").ok();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -33,9 +36,12 @@ fn main() -> Result<()> {
                 ));
             }
             "--public" => public = true,
+            "--tunnel-hostname" => {
+                tunnel_hostname = Some(args.next().context("--tunnel-hostname needs a value")?);
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>] [--public]\n       kil-remote --version"
+                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>] [--public] [--tunnel-hostname <host>]\n       kil-remote --version"
                 );
                 return Ok(());
             }
@@ -53,6 +59,8 @@ fn main() -> Result<()> {
         host,
         launcher,
         public,
+        tunnel_hostname,
+        tunnel_token,
     })?;
     Ok(())
 }

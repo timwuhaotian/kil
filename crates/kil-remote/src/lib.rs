@@ -17,13 +17,15 @@
 //!
 //! - **LAN** (default): the Mac listens on a TCP port and the QR carries the
 //!   Mac's LAN address.
-//! - **Public** (`--public`): the bridge opens a Cloudflare Quick Tunnel
-//!   (`cloudflared`, outbound-only, so no router setup) to a loopback
-//!   WebSocket shim, and the pinned TLS byte stream rides inside WebSocket
-//!   binary frames. The QR works from anywhere — and also carries the LAN
-//!   address, which the phone tries first at home — and the tunnel closes
-//!   when the bridge stops. Cloudflare relays ciphertext only: the TLS
-//!   session still ends at this bridge, pinned by the QR fingerprint.
+//! - **Public** (`--public`): the bridge runs the user's own Cloudflare
+//!   Tunnel (`cloudflared`, remotely-managed on their account and domain,
+//!   outbound-only, so no router setup) to a loopback WebSocket shim, and
+//!   the pinned TLS byte stream rides inside WebSocket binary frames. The
+//!   QR carries the tunnel's stable hostname and works from anywhere — and
+//!   also carries the LAN address, which the phone tries first at home —
+//!   and the tunnel closes when the bridge stops. Cloudflare relays
+//!   ciphertext only: the TLS session still ends at this bridge, pinned by
+//!   the QR fingerprint.
 //!
 //! The [`Bridge`] type runs the same machinery inside the Kil app, so the
 //! Settings window can show the QR without a separate command line.
@@ -65,9 +67,15 @@ pub struct Config {
     pub host: Option<String>,
     /// A binary that can run `--server <dir>` if no session server is running.
     pub launcher: Option<PathBuf>,
-    /// Expose the bridge through a Cloudflare Quick Tunnel so the QR works
-    /// from anywhere (requires `cloudflared`; no router setup).
+    /// Expose the bridge through the user's own Cloudflare Tunnel so the QR
+    /// works from anywhere (requires `cloudflared`; no router setup).
     pub public: bool,
+    /// The public hostname of the user's own Cloudflare Tunnel (e.g.
+    /// `kil.example.com`); it goes in the QR. Required when `public`.
+    pub tunnel_hostname: Option<String>,
+    /// The token of the user's own remotely-managed Cloudflare Tunnel,
+    /// handed to `cloudflared` via its environment. Required when `public`.
+    pub tunnel_token: Option<String>,
 }
 
 /// What the phone needs to pair, ready for a QR code or a settings panel.
@@ -124,6 +132,31 @@ impl Auth {
     }
 }
 
+/// The user's tunnel for a public bridge — its hostname and token, trimmed —
+/// or `None` for a LAN-only bridge. Public mode rides that tunnel, so both
+/// halves are required; a blank string is no tunnel at all.
+fn public_tunnel(config: &Config) -> Result<Option<(String, String)>> {
+    if !config.public {
+        return Ok(None);
+    }
+    let hostname = config
+        .tunnel_hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|hostname| !hostname.is_empty());
+    let token = config
+        .tunnel_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let (Some(hostname), Some(token)) = (hostname, token) else {
+        bail!(
+            "Public internet needs your Cloudflare Tunnel: set tunnel_hostname and tunnel_token in config.toml"
+        );
+    };
+    Ok(Some((hostname.to_owned(), token.to_owned())))
+}
+
 /// An embeddable bridge: the same TLS tunnel as `kil --remote`, running on a
 /// background thread so the Kil app can show the QR in its Settings window.
 pub struct Bridge {
@@ -144,8 +177,11 @@ impl Bridge {
     /// mode) the tunnel are ready.
     ///
     /// # Errors
-    /// If the TLS identity cannot be generated or the port cannot be bound.
+    /// If public mode lacks the user's Cloudflare Tunnel, the TLS identity
+    /// cannot be generated, or the port cannot be bound.
     pub fn start(config: &Config) -> Result<Arc<Self>> {
+        let tunnel_config = public_tunnel(config)?;
+
         // If a provider is already installed (GPUI's HTTP client installs one), keep it.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -193,17 +229,16 @@ impl Bridge {
                     thread_tags.store(tags, Ordering::Release);
 
                     let tls_port = listener.local_addr()?.port();
-                    let mut tunnel = if config.public {
-                        Some(PublicTunnel::start(tls_port).await?)
-                    } else {
-                        None
+                    let mut tunnel = match tunnel_config.as_ref() {
+                        Some((_, token)) => Some(PublicTunnel::start(tls_port, token).await?),
+                        None => None,
                     };
                     let lan_host = match config.host.as_deref() {
                         Some(host) => host.to_owned(),
                         None => lan_ip()?.to_string(),
                     };
-                    let (host, port, url) = if let Some(tunnel) = tunnel.as_ref() {
-                        let host = tunnel.hostname.clone();
+                    let (host, port, url) = if let Some((hostname, _)) = tunnel_config.as_ref() {
+                        let host = hostname.clone();
                         let url = format!(
                             "kil://{host}:443?code={code}&fp=sha256:{fingerprint}&v=1&tun=ws&lan={lan_host}:{tls_port}"
                         );
@@ -319,7 +354,8 @@ struct Relay {
 /// If the bridge cannot start or the QR payload never becomes ready.
 pub fn run(config: &Config) -> Result<()> {
     let bridge = Bridge::start(config)?;
-    // Public mode waits on cloudflared handing out a hostname (30s budget there).
+    // Public mode waits on cloudflared registering the tunnel (30s budget
+    // there; normally a matter of seconds).
     let timeout = Duration::from_secs(if config.public { 45 } else { 15 });
     let qr = wait_for_qr(&bridge, timeout)?;
     print_qr(
@@ -352,40 +388,42 @@ fn wait_for_qr(bridge: &Bridge, timeout: Duration) -> Result<QrPayload> {
     }
 }
 
-/// A Cloudflare Quick Tunnel to the bridge: `cloudflared` dials out, so no
-/// router or NAT setup is involved, and forwards the phone's `wss://`
+/// The fixed loopback port of the WebSocket shim: the ingress rule in the
+/// Cloudflare dashboard points at `http://127.0.0.1:48242`, so it cannot be
+/// random.
+const SHIM_PORT: u16 = 48242;
+
+/// The user's own Cloudflare Tunnel to the bridge: `cloudflared` dials out
+/// with their tunnel's token, so no router or NAT setup is involved, and
+/// the ingress rule on their account forwards the phone's `wss://`
 /// connection to the loopback WebSocket shim below. The pinned TLS stream
 /// rides inside the WebSocket frames, so Cloudflare relays ciphertext only.
 struct PublicTunnel {
     child: Child,
-    hostname: String,
 }
 
 impl PublicTunnel {
-    async fn start(tls_port: u16) -> Result<Self> {
-        let shim = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    async fn start(tls_port: u16, token: &str) -> Result<Self> {
+        let shim = TcpListener::bind((Ipv4Addr::LOCALHOST, SHIM_PORT))
             .await
-            .context("bind the WebSocket shim")?;
-        let shim_port = shim.local_addr()?.port();
+            .with_context(|| format!("bind the WebSocket shim on 127.0.0.1:{SHIM_PORT}"))?;
         tokio::spawn(ws_shim_loop(shim, tls_port));
 
         let Some(cloudflared) = find_cloudflared() else {
             bail!("Public internet needs cloudflared (brew install cloudflared)");
         };
+        // The token travels only in the environment, never on the command
+        // line where other processes could read it.
         let mut child = Command::new(cloudflared)
-            .args([
-                "tunnel",
-                "--no-autoupdate",
-                "--url",
-                &format!("http://127.0.0.1:{shim_port}"),
-            ])
+            .args(["tunnel", "--no-autoupdate", "run"])
+            .env("TUNNEL_TOKEN", token)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("start cloudflared")?;
-        let hostname = wait_for_tunnel_hostname(&mut child).await?;
-        Ok(Self { child, hostname })
+        wait_for_tunnel_ready(&mut child).await?;
+        Ok(Self { child })
     }
 
     async fn stop(&mut self) {
@@ -416,9 +454,9 @@ fn find_cloudflared() -> Option<PathBuf> {
     .find(|candidate| candidate.is_file())
 }
 
-/// Drains `cloudflared`'s output until it prints the Quick Tunnel URL, then
-/// keeps draining in the background so the pipe never blocks the child.
-async fn wait_for_tunnel_hostname(child: &mut Child) -> Result<String> {
+/// Drains `cloudflared`'s output until it registers a tunnel connection,
+/// then keeps draining in the background so the pipe never blocks the child.
+async fn wait_for_tunnel_ready(child: &mut Child) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(128);
     if let Some(stdout) = child.stdout.take() {
         forward_lines(stdout, tx.clone());
@@ -429,11 +467,11 @@ async fn wait_for_tunnel_hostname(child: &mut Child) -> Result<String> {
     let mut recent: Vec<String> = Vec::new();
     let found = tokio::time::timeout(
         Duration::from_secs(30),
-        read_tunnel_hostname(&mut rx, &mut recent),
+        read_until_registered(&mut rx, &mut recent),
     )
     .await;
-    let hostname = match found {
-        Ok(Ok(hostname)) => hostname,
+    match found {
+        Ok(Ok(())) => {}
         Ok(Err(err)) => {
             let _ = child.kill().await;
             return Err(err);
@@ -441,27 +479,27 @@ async fn wait_for_tunnel_hostname(child: &mut Child) -> Result<String> {
         Err(_) => {
             let _ = child.kill().await;
             bail!(
-                "cloudflared did not hand out a tunnel in 30s; its last output:\n{}",
+                "cloudflared did not register a tunnel connection in 30s; its last output:\n{}",
                 recent.join("\n")
             );
         }
-    };
+    }
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
             log::debug!("cloudflared: {line}");
         }
     });
-    Ok(hostname)
+    Ok(())
 }
 
-async fn read_tunnel_hostname(
+async fn read_until_registered(
     rx: &mut mpsc::Receiver<String>,
     recent: &mut Vec<String>,
-) -> Result<String> {
+) -> Result<()> {
     while let Some(line) = rx.recv().await {
         log::debug!("cloudflared: {line}");
-        if let Some(hostname) = tunnel_hostname(&line) {
-            return Ok(hostname);
+        if tunnel_registered(&line) {
+            return Ok(());
         }
         recent.push(line);
         if recent.len() > 20 {
@@ -469,7 +507,7 @@ async fn read_tunnel_hostname(
         }
     }
     bail!(
-        "cloudflared exited before handing out a tunnel; its last output:\n{}",
+        "cloudflared exited before registering a tunnel connection; its last output:\n{}",
         recent.join("\n")
     )
 }
@@ -488,17 +526,9 @@ where
     });
 }
 
-/// The `*.trycloudflare.com` hostname in a line of `cloudflared` output, if
-/// the line carries a Quick Tunnel URL.
-fn tunnel_hostname(line: &str) -> Option<String> {
-    let after_scheme = line.split("https://").nth(1)?;
-    let end = after_scheme
-        .find(|c: char| c.is_whitespace() || c == '/' || c == '"' || c == '\'' || c == '|')
-        .unwrap_or(after_scheme.len());
-    let hostname = &after_scheme[..end];
-    hostname
-        .ends_with(".trycloudflare.com")
-        .then(|| hostname.to_owned())
+/// Whether a line of `cloudflared` output says a tunnel connection is up.
+fn tunnel_registered(line: &str) -> bool {
+    line.contains("Registered tunnel connection")
 }
 
 /// The WebSocket shim the tunnel points at: each upgrade dials the bridge's
@@ -995,8 +1025,9 @@ fn print_qr(payload: &str, code: &str, fingerprint: &str, dir: &Path, public: bo
     println!("  paste URL:     {payload}");
     if public {
         println!(
-            "  public: this bridge is reachable from anywhere through a Cloudflare Tunnel — outbound-only,"
+            "  public: this bridge is reachable from anywhere through your own Cloudflare Tunnel, on your"
         );
+        println!("          account and domain — outbound-only,");
         println!("          no router setup; the tunnel closes when the bridge stops.");
         println!(
             "          Traffic stays end-to-end encrypted to Kil; Cloudflare relays ciphertext only."
@@ -1172,18 +1203,16 @@ mod tests {
     }
 
     #[test]
-    fn the_tunnel_hostname_comes_out_of_cloudflared_noise() {
-        assert_eq!(
-            tunnel_hostname("2026-01-01 INF |  https://bright-river-1234.trycloudflare.com  |")
-                .as_deref(),
-            Some("bright-river-1234.trycloudflare.com")
-        );
-        assert_eq!(
-            tunnel_hostname("visit https://bright-river-1234.trycloudflare.com/").as_deref(),
-            Some("bright-river-1234.trycloudflare.com")
-        );
-        assert!(tunnel_hostname("INF Thank you for trying Cloudflare Tunnel").is_none());
-        assert!(tunnel_hostname("see https://developers.cloudflare.com/").is_none());
+    fn only_the_registration_line_says_the_tunnel_is_up() {
+        assert!(tunnel_registered(
+            "2026-01-01T00:00:00Z INF Registered tunnel connection connIndex=0 location=sjc"
+        ));
+        assert!(!tunnel_registered(
+            "2026-01-01T00:00:00Z INF Starting tunnel tunnelID=abc"
+        ));
+        assert!(!tunnel_registered(
+            "2026-01-01T00:00:00Z INF Connection 0 registered connIndex=0"
+        ));
     }
 
     /// A scripted session server on a socket of its own: `script` answers the probe's
@@ -1261,6 +1290,8 @@ mod tests {
             host: None,
             launcher: None,
             public: false,
+            tunnel_hostname: None,
+            tunnel_token: None,
         })
         .expect("the bridge starts")
     }

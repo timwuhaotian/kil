@@ -76,6 +76,8 @@ pub struct SettingsWindow {
     font_family: Entity<TextField>,
     scrollback: Entity<TextField>,
     directory: Entity<TextField>,
+    tunnel_hostname: Entity<TextField>,
+    tunnel_token: Entity<TextField>,
     /// `keymap.toml` resolved over the defaults: which keys run which command.
     keys: Vec<(String, Command)>,
     /// The command whose next keypress is being recorded.
@@ -116,13 +118,30 @@ impl SettingsWindow {
         let scrollback =
             cx.new(|cx| TextField::new(&file.scrollback_lines.to_string(), window, cx));
         let directory = cx.new(|cx| TextField::new(&shown_directory(&file), window, cx));
+        let tunnel_hostname = cx.new(|cx| {
+            TextField::new(
+                file.tunnel_hostname.as_deref().unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        let tunnel_token = cx
+            .new(|cx| TextField::new(file.tunnel_token.as_deref().unwrap_or_default(), window, cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&font_family, window, Self::font_family_edited),
             cx.subscribe_in(&scrollback, window, Self::scrollback_edited),
             cx.subscribe_in(&directory, window, Self::directory_edited),
+            cx.subscribe_in(&tunnel_hostname, window, Self::tunnel_hostname_edited),
+            cx.subscribe_in(&tunnel_token, window, Self::tunnel_token_edited),
         ];
         // A field taking focus stands recording down: the next keystroke is typed text.
-        for field in [&font_family, &scrollback, &directory] {
+        for field in [
+            &font_family,
+            &scrollback,
+            &directory,
+            &tunnel_hostname,
+            &tunnel_token,
+        ] {
             subscriptions.push(cx.on_focus(&field.focus_handle(cx), window, |this, _, cx| {
                 this.cancel_recording(cx);
             }));
@@ -133,6 +152,8 @@ impl SettingsWindow {
             font_family,
             scrollback,
             directory,
+            tunnel_hostname,
+            tunnel_token,
             keys: Vec::new(),
             recording: None,
             recorder: None,
@@ -225,6 +246,51 @@ impl SettingsWindow {
         let shown = shown_directory(&self.file);
         self.directory
             .update(cx, |field, cx| field.set_text(&shown, cx));
+    }
+
+    fn tunnel_hostname_edited(
+        &mut self,
+        field: &Entity<TextField>,
+        event: &FieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tunnel_edited("tunnel_hostname", field, event, window, cx);
+    }
+
+    fn tunnel_token_edited(
+        &mut self,
+        field: &Entity<TextField>,
+        event: &FieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tunnel_edited("tunnel_token", field, event, window, cx);
+    }
+
+    fn tunnel_edited(
+        &mut self,
+        key: &'static str,
+        field: &Entity<TextField>,
+        event: &FieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let FieldEvent::Confirmed(text) = event else {
+            return;
+        };
+        let value = text.trim();
+        self.write(key, &value.into(), cx);
+        let shown = match key {
+            "tunnel_hostname" => self.file.tunnel_hostname.clone(),
+            _ => self.file.tunnel_token.clone(),
+        }
+        .unwrap_or_default();
+        field.update(cx, |field, cx| field.set_text(&shown, cx));
+        if self.error.is_none() && self.remote_public && cx.global::<Remote>().on() {
+            self.remote_stop(cx);
+            self.remote_start(window, cx);
+        }
     }
 
     fn directory_edited(
@@ -975,7 +1041,7 @@ impl SettingsWindow {
 
     /// The "Agent on Edge remote" section: enable the bridge, choose public
     /// mode, and once running show the QR, pairing code and connection state.
-    fn remote_rows(&self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn remote_rows(&self, c: Colors, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let on = cx.global::<Remote>().on();
         let mut rows = vec![
             row(
@@ -1000,7 +1066,9 @@ impl SettingsWindow {
             ),
             row(
                 "Public internet",
-                Some("Via a Cloudflare Tunnel — works away from this network, no router setup"),
+                Some(
+                    "Through your own Cloudflare Tunnel — works away from this network, no router setup",
+                ),
                 c,
                 None,
                 toggle("remote-public", self.remote_public, c).on_click(cx.listener(
@@ -1014,6 +1082,20 @@ impl SettingsWindow {
                         }
                     },
                 )),
+            ),
+            row(
+                "Tunnel hostname",
+                Some("Your Cloudflare Tunnel's public hostname, e.g. kil.example.com"),
+                c,
+                Some(self.tunnel_hostname.focus_handle(cx)),
+                field_box(&self.tunnel_hostname, 260., window, c, cx),
+            ),
+            row(
+                "Tunnel token",
+                Some("From Cloudflare Zero Trust ▸ Networks ▸ Tunnels — stored in config.toml"),
+                c,
+                Some(self.tunnel_token.focus_handle(cx)),
+                field_box(&self.tunnel_token, 260., window, c, cx),
             ),
         ];
 
@@ -1108,12 +1190,15 @@ impl SettingsWindow {
             cx.notify();
             return;
         };
+        let settings = cx.global::<Settings>();
         let config = Config {
             dir,
             port: 0,
             host: None,
             launcher: std::env::current_exe().ok(),
             public: self.remote_public,
+            tunnel_hostname: settings.tunnel_hostname.clone(),
+            tunnel_token: settings.tunnel_token.clone(),
         };
         match cx.global_mut::<Remote>().start(&config) {
             Ok(()) => {
@@ -1231,7 +1316,7 @@ impl Render for SettingsWindow {
         let appearance = self.appearance_rows(c, cx);
         let keyboard = self.keyboard_rows(c, cx);
         let updates = self.update_rows(c, cx);
-        let remote = self.remote_rows(c, cx);
+        let remote = self.remote_rows(c, window, cx);
         let files = vec![row(
             "Config files",
             Some("config.toml, keymap.toml"),

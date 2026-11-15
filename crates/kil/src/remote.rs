@@ -75,6 +75,8 @@ mod tests {
             host: None,
             launcher: None,
             public: false,
+            tunnel_hostname: None,
+            tunnel_token: None,
         }
     }
 

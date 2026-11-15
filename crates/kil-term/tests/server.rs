@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use common::{SIZE, program, screen, sh, wait_for_text, wait_until};
+use common::{SIZE, program, screen, sh, wait_for_foreground, wait_for_text, wait_until, zsh};
 use kil_term::{Client, Session, SessionConfig, SessionEvent, diagnostics, server};
 
 /// A server of its own, so the tests don't share sessions.
@@ -77,6 +77,36 @@ fn watchers_should_list_sessions_with_another_client_attached() {
         .watchers()
         .is_ok_and(|watched| watched.is_empty())));
     drop(first);
+    client.stop_all().unwrap();
+}
+
+#[test]
+fn roster_should_describe_sessions_without_attaching() {
+    // A phone names every pane from the roster alone: title, working directory, and
+    // whether a job runs — where `List` still gives bare ids to older clients.
+    let (_dir, client) = server("roster");
+    let mut config = zsh();
+    config.cwd = Some("/private/tmp".into());
+    let session = spawn(&client, "a-1", &config);
+    assert!(wait_until(Duration::from_secs(5), || session
+        .foreground()
+        .is_some_and(|fg| fg.is_shell)));
+    session.write(b"printf '\\033]2;roster-title\\007'; /bin/sleep 600\n".as_slice());
+    assert!(wait_for_foreground(&session, "sleep"));
+    assert!(
+        wait_until(Duration::from_secs(5), || client.roster().is_ok_and(
+            |roster| {
+                roster.len() == 1
+                    && roster[0].id == "a-1"
+                    && roster[0].title == "roster-title"
+                    && roster[0].cwd == "/private/tmp"
+                    && roster[0].busy
+            }
+        )),
+        "{:?}",
+        client.roster().unwrap()
+    );
+    assert_eq!(client.sessions().unwrap(), ["a-1"]);
     client.stop_all().unwrap();
 }
 

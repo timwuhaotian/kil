@@ -30,7 +30,7 @@ use crate::{
     reaper,
     session::Session,
     spawn, sys,
-    wire::{self, Frame, MIN_PROTOCOL, PROTOCOL},
+    wire::{self, Frame, MIN_PROTOCOL, PROTOCOL, SessionDesc},
 };
 
 /// With no session and no client for this long, the server exits.
@@ -328,6 +328,7 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
                     .collect();
                 wire::send(&mut stream, &Frame::Watching(watched))?;
             }
+            Frame::Describe => wire::send(&mut stream, &Frame::Roster(roster(registry)))?,
             Frame::Controllers => {
                 let controlling = registry
                     .lock()
@@ -396,6 +397,23 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
             }
         }
     }
+}
+
+/// Every session described, for a client naming panes it has not attached to.
+fn roster(registry: &Registry) -> Vec<SessionDesc> {
+    registry
+        .lock()
+        .iter()
+        .map(|(id, (_, session))| SessionDesc {
+            id: id.clone(),
+            title: session.title().unwrap_or_default(),
+            cwd: session
+                .cwd()
+                .map(|cwd| cwd.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            busy: session.is_busy(),
+        })
+        .collect()
 }
 
 /// Hangs every session up, then gives their programs a moment before the reaper's SIGKILL.
