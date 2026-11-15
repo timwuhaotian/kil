@@ -6,9 +6,12 @@
 //! drive the same panes:
 //!
 //! 1. The Mac prints a QR code carrying the address, a one-time pairing code
-//!    and the SHA-256 fingerprint of a fresh self-signed certificate.
-//! 2. Agent on Edge scans it, proves the code over TLS, and receives a session
-//!    token it can reuse for its other connections.
+//!    and the SHA-256 fingerprint of a persistent self-signed certificate
+//!    (stored owner-only under the session dir; only a pairing reset rotates it).
+//! 2. Agent on Edge scans it, proves the code over TLS, and receives a device
+//!    token. The Mac keeps only a verifier — SHA-256 of the token bytes — so
+//!    later connections prove the token by challenge-response (`KIL3`) without
+//!    the token ever being stored on the Mac or re-sent after first pairing.
 //! 3. The bridge then does nothing but pump bytes between the TLS stream and
 //!    the session server's Unix socket. It never parses terminal output, so
 //!    the server's wire protocol and its `peer_uid` trust check are untouched.
@@ -45,6 +48,7 @@ use anyhow::{Context, Result, bail};
 use qrcode::render::unicode;
 use ring::{
     digest::{SHA1_FOR_LEGACY_USE_ONLY, SHA256, digest},
+    hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -52,9 +56,14 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, copy, split},
     net::{TcpListener, TcpStream, UnixStream},
     process::{Child, Command},
-    sync::{mpsc, watch},
+    sync::{Semaphore, mpsc, watch},
 };
 use tokio_rustls::TlsAcceptor;
+
+/// The user-facing default port for the bridge. A remembered phone dials the
+/// port from its QR, so the Mac must keep listening on the same one across
+/// restarts; `0` (a fresh free port) remains available to library callers/tests.
+pub const DEFAULT_PORT: u16 = 48231;
 
 /// How a caller wants the bridge to behave.
 #[derive(Clone)]
@@ -76,6 +85,9 @@ pub struct Config {
     /// The token of the user's own remotely-managed Cloudflare Tunnel,
     /// handed to `cloudflared` via its environment. Required when `public`.
     pub tunnel_token: Option<String>,
+    /// Discard the persisted certificate, pairing code and device-token
+    /// verifier on start and generate all fresh, revoking the old phone.
+    pub reset_pairing: bool,
 }
 
 /// What the phone needs to pair, ready for a QR code or a settings panel.
@@ -88,47 +100,285 @@ pub struct QrPayload {
     pub url: String,
 }
 
-/// A fresh self-signed identity for the tunnel: the SHA-256 fingerprint of
-/// the certificate the phone pins (it goes in the QR), and the acceptor that
-/// serves it. A new one per bridge start is what makes **New QR** a re-pair.
-fn tls_identity() -> Result<(String, TlsAcceptor)> {
-    let certified = rcgen::generate_simple_self_signed(vec!["kil".into()])
-        .context("generate a self-signed certificate")?;
-    let fingerprint = fingerprint(certified.cert.der());
-    let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
-    let tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![certified.cert.der().clone()], key)
-        .context("build the TLS server config")?;
-    Ok((fingerprint, TlsAcceptor::from(Arc::new(tls))))
+/// Bounds on unauthenticated work: a successful bridge connection can type as
+/// the Mac user, so connection count, auth serialization and read timeouts are
+/// security-critical, not niceties.
+const MAX_CONNECTIONS: usize = 16;
+const MAX_SHIM_CONNECTIONS: usize = 16;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_AUTH_LINE: usize = 128;
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const FAILURE_BUDGET: u32 = 5;
+const MAX_FAILURE_IPS: usize = 4096;
+
+const CERT_FILE: &str = "bridge-cert.der";
+const KEY_FILE: &str = "bridge-key.der";
+const PAIRING_FILE: &str = "bridge-pairing.txt";
+
+/// The pairing state persisted under `Config.dir`: the certificate the phone
+/// pins, its key, the unspent pairing code, and — once paired — the device
+/// token's verifier only, never the token itself. All files are owner-only.
+struct PairingState {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    fingerprint: String,
+    fingerprint_bytes: [u8; 32],
+    code: String,
+    verifier: Option<[u8; 32]>,
 }
 
-/// The one-time pairing secret, the token issued after the first use, and a
-/// per-IP failure ledger that throttles pairing-code brute force. The code
-/// never expires: it is good until the bridge stops, and the first phone to
-/// spend it holds the token from then on.
+fn acceptor_for(cert_der: &[u8], key_der: &[u8]) -> Result<TlsAcceptor> {
+    // If a provider is already installed (GPUI's HTTP client installs one), keep it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let key = PrivateKeyDer::Pkcs8(key_der.to_vec().into());
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![CertificateDer::from(cert_der.to_vec())], key)
+        .context("build the TLS server config")?;
+    Ok(TlsAcceptor::from(Arc::new(tls)))
+}
+
+/// Loads the persisted pairing state, or generates and persists a fresh one
+/// on first use or an explicit reset. Existing but invalid state is an error:
+/// only `reset` may revoke paired devices or rotate the pinned identity.
+fn load_or_create_state(dir: &Path, reset: bool) -> Result<(PairingState, TlsAcceptor)> {
+    if !reset && let Some(loaded) = load_state(dir)? {
+        let acceptor = acceptor_for(&loaded.cert_der, &loaded.key_der)
+            .context("persisted bridge identity is unusable; explicitly reset pairing")?;
+        return Ok((loaded, acceptor));
+    }
+    let certified = rcgen::generate_simple_self_signed(vec!["kil".into()])
+        .context("generate a self-signed certificate")?;
+    let fp = fingerprint(certified.cert.der());
+    let fingerprint_bytes = *digest(&SHA256, certified.cert.der().as_ref())
+        .as_ref()
+        .first_chunk::<32>()
+        .context("SHA-256 digest is 32 bytes")?;
+    let state = PairingState {
+        cert_der: certified.cert.der().as_ref().to_vec(),
+        key_der: certified.key_pair.serialize_der(),
+        fingerprint: fp,
+        fingerprint_bytes,
+        code: random_hex32()?,
+        verifier: None,
+    };
+    save_state(dir, &state).context("persist the bridge pairing state")?;
+    let acceptor = acceptor_for(&state.cert_der, &state.key_der)?;
+    Ok((state, acceptor))
+}
+
+/// The persisted state, strictly parsed. No files is first use; a partial,
+/// unreadable or malformed state needs an explicit reset, never silent repair.
+fn load_state(dir: &Path) -> Result<Option<PairingState>> {
+    let cert_path = dir.join(CERT_FILE);
+    let key_path = dir.join(KEY_FILE);
+    let pairing_path = dir.join(PAIRING_FILE);
+    if !cert_path.exists() && !key_path.exists() && !pairing_path.exists() {
+        return Ok(None);
+    }
+    let cert_der = std::fs::read(&cert_path).context("read the persisted bridge certificate")?;
+    let key_der = std::fs::read(&key_path).context("read the persisted bridge private key")?;
+    let text =
+        std::fs::read_to_string(&pairing_path).context("read the persisted pairing state")?;
+    let state = parse_state(cert_der, key_der, &text)
+        .context("persisted pairing state is invalid; explicitly reset pairing")?;
+    // Files we wrote are 0600; tighten any that were loosened since.
+    for path in [&cert_path, &key_path, &pairing_path] {
+        set_owner_only(path).context("secure the persisted bridge files")?;
+    }
+    Ok(Some(state))
+}
+
+fn parse_state(cert_der: Vec<u8>, key_der: Vec<u8>, text: &str) -> Option<PairingState> {
+    let mut fingerprint = None;
+    let mut code = None;
+    let mut verifier: Option<Option<[u8; 32]>> = None;
+    let mut seen_version = false;
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "v" => {
+                if value != "1" || seen_version {
+                    return None;
+                }
+                seen_version = true;
+            }
+            "fingerprint" => {
+                if fingerprint.is_some() {
+                    return None;
+                }
+                fingerprint = Some(value.to_owned());
+            }
+            "code" => {
+                if code.is_some() {
+                    return None;
+                }
+                code = Some(value.to_owned());
+            }
+            "verifier" => {
+                if verifier.is_some() {
+                    return None;
+                }
+                verifier = Some(if value.is_empty() {
+                    None
+                } else {
+                    Some(decode_hex32(value)?)
+                });
+            }
+            _ => return None,
+        }
+    }
+    let fingerprint = fingerprint?;
+    let code = code?;
+    let verifier = verifier?;
+    if !seen_version || decode_hex32(&code).is_none() {
+        return None;
+    }
+    let digest_bytes = digest(&SHA256, &cert_der);
+    let fingerprint_bytes = *digest_bytes.as_ref().first_chunk::<32>()?;
+    if fingerprint != to_hex(&fingerprint_bytes) || cert_der.is_empty() || key_der.is_empty() {
+        return None;
+    }
+    Some(PairingState {
+        cert_der,
+        key_der,
+        fingerprint,
+        fingerprint_bytes,
+        code,
+        verifier,
+    })
+}
+
+fn set_owner_only(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Writes `bytes` owner-only via a temp file renamed over `path`.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        set_owner_only(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(err) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    set_owner_only(path)?;
+    Ok(())
+}
+
+fn pairing_text(state: &PairingState) -> String {
+    let verifier = state
+        .verifier
+        .as_ref()
+        .map_or_else(String::new, |v| to_hex(v));
+    format!(
+        "v=1\nfingerprint={}\ncode={}\nverifier={verifier}\n",
+        state.fingerprint, state.code
+    )
+}
+
+fn save_state(dir: &Path, state: &PairingState) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_private(&dir.join(CERT_FILE), &state.cert_der)?;
+    write_private(&dir.join(KEY_FILE), &state.key_der)?;
+    save_pairing_file(dir, state)
+}
+
+fn save_pairing_file(dir: &Path, state: &PairingState) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_private(&dir.join(PAIRING_FILE), pairing_text(state).as_bytes())
+}
+
+/// The unspent pairing code, the device-token verifier once paired, and the
+/// failure ledger throttling brute force. The code never expires on a clock:
+/// it is good until spent or the pairing is reset, and it persists across
+/// restarts so an unscanned QR still works.
 struct Auth {
+    dir: PathBuf,
+    fingerprint: String,
+    fingerprint_bytes: [u8; 32],
     code: String,
-    token: Option<String>,
+    verifier: Option<[u8; 32]>,
     failures: HashMap<IpAddr, (u32, std::time::Instant)>,
+    global_failures: (u32, std::time::Instant),
 }
 
 impl Auth {
-    /// Records a failed pairing from `ip`. Returns `true` once the IP has
-    /// exceeded the per-minute budget and should be throttled hard. Call with
-    /// the [`Auth`] mutex already held.
-    fn note_failure(&mut self, ip: IpAddr) -> bool {
-        if self.failures.len() >= 4096 {
-            self.failures.clear();
+    fn from_state(dir: &Path, state: &PairingState) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            fingerprint: state.fingerprint.clone(),
+            fingerprint_bytes: state.fingerprint_bytes,
+            code: state.code.clone(),
+            verifier: state.verifier,
+            failures: HashMap::new(),
+            global_failures: (0, std::time::Instant::now()),
         }
-        let now = std::time::Instant::now();
-        let (count, since) = self.failures.entry(ip).or_insert((0, now));
-        if now.duration_since(*since) > Duration::from_secs(60) {
-            *count = 0;
+    }
+
+    /// Records a failed attempt from `ip` at `now` and returns how long the
+    /// caller must wait (holding the auth gate) before answering. The global
+    /// ledger matters because tunnel peers all arrive as 127.0.0.1; flooding
+    /// the per-IP map never resets it — a full map keeps only live-window
+    /// entries and simply stops learning new IPs. Call with the mutex held.
+    fn failure_delay(&mut self, ip: IpAddr, now: std::time::Instant) -> Duration {
+        let (global, since) = &mut self.global_failures;
+        if now.duration_since(*since) > FAILURE_WINDOW {
+            *global = 0;
             *since = now;
         }
-        *count += 1;
-        *count > 5
+        *global += 1;
+        let global = *global;
+        if self.failures.len() >= MAX_FAILURE_IPS && !self.failures.contains_key(&ip) {
+            self.failures
+                .retain(|_, (_, at)| now.duration_since(*at) <= FAILURE_WINDOW);
+        }
+        let per_ip = if self.failures.len() < MAX_FAILURE_IPS || self.failures.contains_key(&ip) {
+            let (count, since) = self.failures.entry(ip).or_insert((0, now));
+            if now.duration_since(*since) > FAILURE_WINDOW {
+                *count = 0;
+                *since = now;
+            }
+            *count += 1;
+            *count
+        } else {
+            0
+        };
+        if global > FAILURE_BUDGET || per_ip > FAILURE_BUDGET {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(2)
+        }
+    }
+
+    fn note_success(&mut self, ip: IpAddr) {
+        self.failures.remove(&ip);
+        self.global_failures = (0, std::time::Instant::now());
     }
 }
 
@@ -185,17 +435,14 @@ impl Bridge {
         // If a provider is already installed (GPUI's HTTP client installs one), keep it.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (fingerprint, acceptor) = tls_identity()?;
-        let code = random_code()?;
+        let (state, acceptor) = load_or_create_state(&config.dir, config.reset_pairing)?;
+        let fingerprint = state.fingerprint.clone();
+        let code = state.code.clone();
         let listener = StdTcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.port)))
             .with_context(|| format!("bind port {}", config.port))?;
         listener.set_nonblocking(true)?;
 
-        let auth = Arc::new(Mutex::new(Auth {
-            code: code.clone(),
-            token: None,
-            failures: HashMap::new(),
-        }));
+        let auth = Arc::new(Mutex::new(Auth::from_state(&config.dir, &state)));
         let qr = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
         let tags_remote = Arc::new(AtomicBool::new(false));
@@ -312,12 +559,13 @@ impl Bridge {
             .clone()
     }
 
-    /// Whether an iPhone has already spent the one-time pairing code.
+    /// Whether a phone has already spent the pairing code — true immediately
+    /// after a restart too, since the verifier is persisted.
     pub fn paired(&self) -> bool {
         self.auth
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .token
+            .verifier
             .is_some()
     }
 
@@ -540,11 +788,17 @@ fn tunnel_registered(line: &str) -> bool {
 /// pairing throttle buckets them all together. That is acceptable: failed
 /// pairings are still delayed, the bucket just is not per-phone.
 async fn ws_shim_loop(listener: TcpListener, tls_port: u16) {
+    let slots = Arc::new(Semaphore::new(MAX_SHIM_CONNECTIONS));
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
+        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = handle_ws_connection(stream, tls_port).await {
                 log::info!("tunneled connection ended: {err:#}");
             }
@@ -577,7 +831,10 @@ async fn ws_upgrade(stream: &mut TcpStream) -> Result<bool> {
 }
 
 async fn handle_ws_connection(mut stream: TcpStream, tls_port: u16) -> Result<()> {
-    if !ws_upgrade(&mut stream).await? {
+    let upgraded = tokio::time::timeout(AUTH_TIMEOUT, ws_upgrade(&mut stream))
+        .await
+        .context("WebSocket upgrade timed out")??;
+    if !upgraded {
         return Ok(());
     }
 
@@ -647,7 +904,10 @@ async fn handle_ws_connection(mut stream: TcpStream, tls_port: u16) -> Result<()
 
 /// HTTP headers up to the blank line, read a byte at a time so nothing past
 /// the headers is swallowed before the frame loop takes over.
-async fn read_http_headers(stream: &mut TcpStream) -> Result<String> {
+async fn read_http_headers<R>(stream: &mut R) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     while !bytes.ends_with(b"\r\n\r\n") {
@@ -826,15 +1086,23 @@ async fn serve(
     auth: Arc<Mutex<Auth>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let auth_gate = Arc::new(Semaphore::new(1));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (tcp, peer) = accepted?;
+                let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                    drop(tcp);
+                    continue;
+                };
                 let acceptor = acceptor.clone();
                 let auth = Arc::clone(&auth);
                 let relay = relay.clone();
+                let gate = Arc::clone(&auth_gate);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(acceptor, tcp, peer, relay, auth).await {
+                    let _permit = permit;
+                    if let Err(err) = handle_connection(acceptor, tcp, peer, relay, auth, gate).await {
                         log::info!("remote connection from {peer} ended: {err:#}");
                     }
                 });
@@ -849,40 +1117,86 @@ async fn serve(
     }
 }
 
+/// Waits out one failed attempt's penalty. Called with the auth gate held,
+/// so the delay is a real attempt-rate limit, not a courtesy sleep in an
+/// unbounded spawned task.
+async fn fail_penalty(auth: &Mutex<Auth>, ip: IpAddr) {
+    let delay = {
+        let mut guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.failure_delay(ip, std::time::Instant::now())
+    };
+    tokio::time::sleep(delay).await;
+}
+
+/// One auth line: at most [`MAX_AUTH_LINE`] bytes, newline-terminated,
+/// within [`AUTH_TIMEOUT`]. `None` on EOF, oversize, timeout or error.
+async fn read_auth_line<R>(reader: &mut R) -> Option<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let read = async {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match reader.read(&mut byte).await {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {}
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            bytes.push(byte[0]);
+            if bytes.len() > MAX_AUTH_LINE {
+                return None;
+            }
+        }
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    tokio::time::timeout(AUTH_TIMEOUT, read).await.ok()?
+}
+
 async fn handle_connection(
     acceptor: TlsAcceptor,
     tcp: TcpStream,
     peer: SocketAddr,
     relay: Relay,
     auth: Arc<Mutex<Auth>>,
+    auth_gate: Arc<Semaphore>,
 ) -> Result<()> {
-    let tls = acceptor.accept(tcp).await.context("TLS handshake")?;
-    let mut reader = BufReader::new(tls);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("read the pairing line")?;
-
-    let line = line.trim();
-
-    let Some(token) = authenticate(line, &auth) else {
-        // Public exposure makes the pairing code brute-forceable in theory;
-        // each failed attempt costs two seconds, and an IP that fails more
-        // than five times a minute is throttled to thirty seconds per try.
-        let throttled = {
-            let mut guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
-            guard.note_failure(peer.ip())
-        };
-        tokio::time::sleep(if throttled {
-            Duration::from_secs(30)
-        } else {
-            Duration::from_secs(2)
-        })
-        .await;
-        reply(&mut reader, "ERR rejected").await?;
+    // Serialize authentication (TLS handshake included) so no number of
+    // sockets parallelizes guessing; a phone's quick success releases it.
+    let Ok(Ok(auth_permit)) = tokio::time::timeout(AUTH_TIMEOUT, auth_gate.acquire_owned()).await
+    else {
         return Ok(());
     };
+    let deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+    let Ok(Ok(tls)) = tokio::time::timeout_at(deadline, acceptor.accept(tcp)).await else {
+        fail_penalty(&auth, peer.ip()).await;
+        return Ok(());
+    };
+    let mut reader = BufReader::new(tls);
+    let outcome = tokio::time::timeout_at(deadline, authenticate(&mut reader, &auth))
+        .await
+        .ok()
+        .flatten();
+    let Some(ok_reply) = outcome else {
+        fail_penalty(&auth, peer.ip()).await;
+        let _ = reply(&mut reader, "ERR rejected").await;
+        return Ok(());
+    };
+    {
+        let mut guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.note_success(peer.ip());
+    }
+
+    // Authentication is complete; deliver its reply before fallible relay setup.
+    tokio::time::timeout(AUTH_TIMEOUT, reply(&mut reader, &ok_reply))
+        .await
+        .context("send the authentication reply")??;
+    drop(auth_permit);
 
     let mut unix = UnixStream::connect(&relay.socket_path)
         .await
@@ -895,11 +1209,16 @@ async fn handle_connection(
             .await
             .context("declare the relay a phone's")?;
     }
-    reply(&mut reader, &format!("OK {token}")).await?;
 
-    // The client only starts the wire protocol after reading `OK`, so nothing
-    // is left inside the buffered reader. From here on it is a pure byte pump.
+    // A client may pipeline its first wire frame with KIL3's RESP. Preserve
+    // anything the line reader buffered instead of dropping it at into_inner.
+    let pending = reader.buffer().to_vec();
     let tls = reader.into_inner();
+    if !pending.is_empty() {
+        unix.write_all(&pending)
+            .await
+            .context("forward pipelined wire bytes")?;
+    }
     let (mut a, mut b) = split(tls);
     let (mut c, mut d) = split(unix);
     let mut t1 = tokio::spawn(async move {
@@ -961,10 +1280,7 @@ async fn read_kind(stream: &mut UnixStream) -> Result<u8> {
     Ok(body[0])
 }
 
-async fn reply(
-    reader: &mut BufReader<tokio_rustls::server::TlsStream<TcpStream>>,
-    text: &str,
-) -> Result<()> {
+async fn reply(reader: &mut TlsReader, text: &str) -> Result<()> {
     let writer = reader.get_mut();
     writer.write_all(text.as_bytes()).await?;
     writer.write_all(b"\n").await?;
@@ -972,24 +1288,112 @@ async fn reply(
     Ok(())
 }
 
-fn authenticate(line: &str, auth: &Mutex<Auth>) -> Option<String> {
-    let mut guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
+type TlsReader = BufReader<tokio_rustls::server::TlsStream<TcpStream>>;
+
+/// Runs one auth exchange over the TLS stream and returns the `OK …` reply
+/// on success. `KIL1` spends the pairing code and issues the device token;
+/// `KIL2` is the legacy bearer reconnect; `KIL3` proves the token by
+/// HMAC challenge-response so it never crosses the wire again.
+async fn authenticate(reader: &mut TlsReader, auth: &Mutex<Auth>) -> Option<String> {
+    let line = read_auth_line(reader).await?;
     if let Some(code) = line.strip_prefix("KIL1 ") {
-        if guard.token.is_some() {
-            return None; // The one-time code is already spent.
-        }
-        if constant_time_eq(code.as_bytes(), guard.code.as_bytes()) {
-            let token = random_token().ok()?;
-            guard.token = Some(token.clone());
-            return Some(token);
-        }
-        return None;
+        return pair_with_code(code, auth).map(|token| format!("OK {token}"));
     }
     if let Some(token) = line.strip_prefix("KIL2 ") {
-        let expected = guard.token.as_ref()?;
-        return constant_time_eq(token.as_bytes(), expected.as_bytes()).then(|| expected.clone());
+        // Legacy clients retain the OK payload as their session token.
+        return check_bearer(token, auth).then(|| format!("OK {}", token.trim()));
+    }
+    if line == "KIL3" {
+        let (verifier, fingerprint_bytes) = {
+            let guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
+            (guard.verifier?, guard.fingerprint_bytes)
+        };
+        let nonce = random_bytes32().ok()?;
+        reply(reader, &format!("CHAL {}", to_hex(&nonce)))
+            .await
+            .ok()?;
+        let response = read_auth_line(reader).await?;
+        let presented = decode_hex32(response.strip_prefix("RESP ")?)?;
+        let expected = kil3_response(&verifier, &nonce, &fingerprint_bytes);
+        return constant_time_eq(&presented, &expected).then(|| "OK device".to_owned());
     }
     None
+}
+
+/// `KIL1`: the code works once, ever, until a local reset. The new token's
+/// verifier is persisted before the token is handed out; if that write
+/// fails, the pairing does not happen.
+fn pair_with_code(code: &str, auth: &Mutex<Auth>) -> Option<String> {
+    let mut guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
+    if guard.verifier.is_some() {
+        return None;
+    }
+    if !constant_time_eq(code.as_bytes(), guard.code.as_bytes()) {
+        return None;
+    }
+    let token_bytes = random_bytes32().ok()?;
+    let verifier = verifier_of(&token_bytes);
+    let snapshot = PairingState {
+        cert_der: Vec::new(),
+        key_der: Vec::new(),
+        fingerprint: guard.fingerprint.clone(),
+        fingerprint_bytes: guard.fingerprint_bytes,
+        code: guard.code.clone(),
+        verifier: Some(verifier),
+    };
+    save_pairing_file(&guard.dir, &snapshot).ok()?;
+    guard.verifier = Some(verifier);
+    Some(to_hex(&token_bytes))
+}
+
+/// `KIL2` legacy bearer: derive the verifier from the presented token and
+/// compare in constant time. The bridge holds no token plaintext.
+fn check_bearer(token: &str, auth: &Mutex<Auth>) -> bool {
+    let guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(expected) = guard.verifier else {
+        return false;
+    };
+    decode_hex32(token).is_some_and(|bytes| constant_time_eq(&verifier_of(&bytes), &expected))
+}
+
+/// The verifier/key bytes for a device token: SHA-256 of its 32 raw bytes.
+fn verifier_of(token_bytes: &[u8; 32]) -> [u8; 32] {
+    let digest_bytes = digest(&SHA256, token_bytes);
+    *digest_bytes
+        .as_ref()
+        .first_chunk::<32>()
+        .unwrap_or(&[0u8; 32])
+}
+
+/// The `KIL3` signed message: domain, nonce and the pinned certificate
+/// fingerprint, NUL-separated, so a response is bound to this bridge.
+fn kil3_message(nonce: &[u8; 32], fingerprint_bytes: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(11 + 1 + 32 + 1 + 32);
+    message.extend_from_slice(b"kil-auth-v3");
+    message.push(0);
+    message.extend_from_slice(nonce);
+    message.push(0);
+    message.extend_from_slice(fingerprint_bytes);
+    message
+}
+
+fn kil3_response(verifier: &[u8; 32], nonce: &[u8; 32], fingerprint_bytes: &[u8; 32]) -> [u8; 32] {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, verifier);
+    let tag = hmac::sign(&key, &kil3_message(nonce, fingerprint_bytes));
+    *tag.as_ref().first_chunk::<32>().unwrap_or(&[0u8; 32])
+}
+
+/// Exactly 64 hex chars → 32 bytes; anything else is no value.
+fn decode_hex32(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(text.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Compares two byte slices without an early exit on the first difference.
@@ -1033,7 +1437,9 @@ fn print_qr(payload: &str, code: &str, fingerprint: &str, dir: &Path, public: bo
             "          Traffic stays end-to-end encrypted to Kil; Cloudflare relays ciphertext only."
         );
     }
-    println!("  The code is spent by the first phone and stays good until this bridge stops.");
+    println!(
+        "  The code is spent by the first phone; the pairing persists across restarts until reset."
+    );
     println!();
 }
 
@@ -1045,25 +1451,17 @@ fn lan_ip() -> Result<IpAddr> {
     Ok(socket.local_addr()?.ip())
 }
 
-const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-fn random_code() -> Result<String> {
+fn random_bytes32() -> Result<[u8; 32]> {
     let rng = SystemRandom::new();
-    let mut bytes = [0u8; 6];
+    let mut bytes = [0u8; 32];
     rng.fill(&mut bytes)
         .map_err(|_| anyhow::anyhow!("system RNG failed"))?;
-    Ok(bytes
-        .iter()
-        .map(|b| CODE_ALPHABET[usize::from(*b) % CODE_ALPHABET.len()] as char)
-        .collect())
+    Ok(bytes)
 }
 
-fn random_token() -> Result<String> {
-    let rng = SystemRandom::new();
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("system RNG failed"))?;
-    Ok(to_hex(&bytes))
+/// A 256-bit secret as 64 lowercase hex chars (pairing codes, device tokens).
+fn random_hex32() -> Result<String> {
+    Ok(to_hex(&random_bytes32()?))
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1085,60 +1483,166 @@ fn fingerprint(cert: &CertificateDer<'_>) -> String {
 mod tests {
     use super::*;
 
-    fn auth_with(code: &str, token: Option<&str>) -> Mutex<Auth> {
+    const TEST_CODE: &str = "abababababababababababababababababababababababababababababababab";
+    // Shared with the Dart KilConnection tests: same token/nonce/fingerprint.
+    const VECTOR_TOKEN: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const VECTOR_NONCE: &str = "ffeeddccbbaa9988776655443322110000112233445566778899aabbccddeeff";
+    const VECTOR_FP: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const VECTOR_VERIFIER: &str =
+        "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd";
+    const VECTOR_HMAC: &str = "959d4759b29834e5ad283c5092754532c28650d6db81406f786965127c000822";
+
+    fn auth_with(dir: &Path, code: &str, verifier: Option<[u8; 32]>) -> Mutex<Auth> {
         Mutex::new(Auth {
+            dir: dir.to_owned(),
+            fingerprint: VECTOR_FP.to_owned(),
+            fingerprint_bytes: decode_hex32(VECTOR_FP).unwrap(),
             code: code.to_owned(),
-            token: token.map(str::to_owned),
+            verifier,
             failures: HashMap::new(),
+            global_failures: (0, std::time::Instant::now()),
         })
     }
 
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kil-auth-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
-    fn the_first_connection_spends_the_code_and_gets_a_token() {
-        let auth = auth_with("ABCDEF", None);
-        let token = authenticate("KIL1 ABCDEF", &auth).expect("the code should work");
-        assert_eq!(token.len(), 32);
-        // A second phone with the same QR is rejected.
-        assert!(authenticate("KIL1 ABCDEF", &auth).is_none());
-        // The issued token reconnects.
-        assert_eq!(
-            authenticate(&format!("KIL2 {token}"), &auth).as_deref(),
-            Some(token.as_str())
+    fn kil1_spends_the_code_persists_only_the_verifier_and_kil2_reconnects() {
+        let dir = scratch_dir("kil1");
+        let auth = auth_with(&dir, TEST_CODE, None);
+        let token = pair_with_code(TEST_CODE, &auth).expect("the code should work");
+        assert_eq!(token.len(), 64);
+        assert!(decode_hex32(&token).is_some());
+        // A second phone with the same QR is rejected, forever.
+        assert!(pair_with_code(TEST_CODE, &auth).is_none());
+        // The issued token reconnects via the legacy bearer path.
+        assert!(check_bearer(&token, &auth));
+        assert!(!check_bearer(TEST_CODE, &auth));
+        // The verifier reached disk before the token was handed out, and the
+        // token plaintext is nowhere in the persisted state.
+        let persisted = std::fs::read_to_string(dir.join(PAIRING_FILE)).unwrap();
+        assert!(persisted.contains(&to_hex(&verifier_of(&decode_hex32(&token).unwrap()))));
+        assert!(!persisted.contains(&token), "no token plaintext on disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrong_code_is_rejected_and_leaves_no_verifier() {
+        let dir = scratch_dir("wrong");
+        let auth = auth_with(&dir, TEST_CODE, None);
+        assert!(pair_with_code("cdcd", &auth).is_none());
+        assert!(!check_bearer(TEST_CODE, &auth));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kil3_matches_the_shared_known_answer_vector() {
+        let token = decode_hex32(VECTOR_TOKEN).unwrap();
+        let verifier = verifier_of(&token);
+        assert_eq!(to_hex(&verifier), VECTOR_VERIFIER);
+        let nonce = decode_hex32(VECTOR_NONCE).unwrap();
+        let fp = decode_hex32(VECTOR_FP).unwrap();
+        assert_eq!(to_hex(&kil3_response(&verifier, &nonce, &fp)), VECTOR_HMAC);
+        // A response for another nonce or bridge does not verify.
+        let other = kil3_response(&verifier, &[0u8; 32], &fp);
+        assert!(!constant_time_eq(
+            &other,
+            &decode_hex32(VECTOR_HMAC).unwrap()
+        ));
+    }
+
+    #[test]
+    fn new_secrets_are_256_bit_lowercase_hex() {
+        let secret = random_hex32().unwrap();
+        assert_eq!(secret.len(), 64);
+        assert!(
+            secret
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
     }
 
     #[test]
-    fn a_wrong_code_is_rejected_and_leaves_no_token() {
-        let auth = auth_with("ABCDEF", None);
-        assert!(authenticate("KIL1 WRONG", &auth).is_none());
-        assert!(authenticate("KIL2 anything", &auth).is_none());
-    }
-
-    #[test]
-    fn a_bogus_line_is_rejected() {
-        let auth = auth_with("ABCDEF", None);
-        assert!(authenticate("HELLO", &auth).is_none());
-    }
-
-    #[test]
-    fn the_code_alphabet_skips_ambiguous_characters() {
-        assert!(!CODE_ALPHABET.contains(&b'0'));
-        assert!(!CODE_ALPHABET.contains(&b'1'));
-        assert!(!CODE_ALPHABET.contains(&b'I'));
-        assert!(!CODE_ALPHABET.contains(&b'O'));
-    }
-
-    #[test]
-    fn failure_throttling_kicks_in_after_the_budget() {
-        let auth = auth_with("ABCDEF", None);
-        let ip: IpAddr = "203.0.113.7"
-            .parse()
-            .unwrap_or_else(|_| Ipv4Addr::LOCALHOST.into());
+    fn failure_delay_grows_after_the_budget_globally_and_per_ip() {
+        let dir = scratch_dir("throttle");
+        let auth = auth_with(&dir, TEST_CODE, None);
+        let now = std::time::Instant::now();
         let mut guard = auth.lock().unwrap_or_else(PoisonError::into_inner);
-        for _ in 0..5 {
-            assert!(!guard.note_failure(ip), "first five failures are budgeted");
+        // Five failures from five different IPs still trip the global ledger:
+        // tunnel peers collapse to 127.0.0.1, so per-IP alone is not enough.
+        for octet in 0..5u8 {
+            let ip = IpAddr::from(Ipv4Addr::new(203, 0, 113, octet));
+            assert_eq!(guard.failure_delay(ip, now), Duration::from_secs(2));
         }
-        assert!(guard.note_failure(ip), "the sixth failure is throttled");
+        let sixth = IpAddr::from(Ipv4Addr::new(198, 51, 100, 9));
+        assert_eq!(guard.failure_delay(sixth, now), Duration::from_secs(30));
+        // A new window resets the budget.
+        let later = now + FAILURE_WINDOW + Duration::from_secs(1);
+        assert_eq!(guard.failure_delay(sixth, later), Duration::from_secs(2));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_lines_are_bounded_and_need_a_newline() {
+        let mut ok: &[u8] = b"KIL3\n";
+        assert_eq!(read_auth_line(&mut ok).await.as_deref(), Some("KIL3"));
+        let mut crlf: &[u8] = b"KIL3\r\n";
+        assert_eq!(read_auth_line(&mut crlf).await.as_deref(), Some("KIL3"));
+        let mut no_newline: &[u8] = b"KIL3";
+        assert_eq!(read_auth_line(&mut no_newline).await, None);
+        let long = vec![b'A'; MAX_AUTH_LINE + 2];
+        let mut oversize: &[u8] = &long;
+        assert_eq!(read_auth_line(&mut oversize).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auth_and_websocket_header_reads_time_out() {
+        let (_auth_writer, mut auth_reader) = tokio::io::duplex(1);
+        assert_eq!(read_auth_line(&mut auth_reader).await, None);
+
+        let (_header_writer, mut header_reader) = tokio::io::duplex(1);
+        let result =
+            tokio::time::timeout(AUTH_TIMEOUT, read_http_headers(&mut header_reader)).await;
+        assert!(result.is_err(), "incomplete HTTP headers hit the 5 s limit");
+    }
+
+    #[test]
+    fn invalid_persisted_state_requires_an_explicit_reset() {
+        let dir = scratch_dir("corrupt");
+        let (first, _) = load_or_create_state(&dir, false).unwrap();
+        std::fs::write(dir.join(PAIRING_FILE), b"v=1\ncode=nope\n").unwrap();
+        assert!(load_or_create_state(&dir, false).is_err());
+        // Reset is the only operation that repairs it, rotating the identity.
+        let (second, _) = load_or_create_state(&dir, true).unwrap();
+        assert_ne!(second.fingerprint, first.fingerprint);
+        assert_eq!(second.code.len(), 64);
+        let (third, _) = load_or_create_state(&dir, false).unwrap();
+        assert_eq!(third.fingerprint, second.fingerprint);
+        assert_eq!(third.code, second.code);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for name in [CERT_FILE, KEY_FILE, PAIRING_FILE] {
+                let mode = std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "{name} is owner-only");
+            }
+        }
+        // A key that does not belong to the certificate is never served.
+        let other = scratch_dir("otherkey");
+        load_or_create_state(&other, false).unwrap();
+        std::fs::copy(other.join(KEY_FILE), dir.join(KEY_FILE)).unwrap();
+        assert!(load_or_create_state(&dir, false).is_err());
+        let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1284,14 +1788,19 @@ mod tests {
     }
 
     fn bridge_on(dir: &Path) -> Arc<Bridge> {
+        bridge_on_reset(dir, false)
+    }
+
+    fn bridge_on_reset(dir: &Path, reset_pairing: bool) -> Arc<Bridge> {
         Bridge::start(&Config {
             dir: dir.to_owned(),
             port: 0,
-            host: None,
+            host: Some("127.0.0.1".to_owned()),
             launcher: None,
             public: false,
             tunnel_hostname: None,
             tunnel_token: None,
+            reset_pairing,
         })
         .expect("the bridge starts")
     }

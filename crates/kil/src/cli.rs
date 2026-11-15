@@ -5,10 +5,10 @@
 use std::{ffi::OsString, path::PathBuf};
 
 /// Short usage, printed with every usage error.
-pub const USAGE: &str = "usage: kil [--help] [--version]\n       kil --server <dir>\n       kil --remote [--host <ip>] [--port <n>] [--public]";
+pub const USAGE: &str = "usage: kil [--help] [--version]\n       kil --server <dir>\n       kil --remote [--host <ip>] [--port <n>] [--public] [--reset-pairing]";
 
 /// Full help, printed for `--help`.
-pub const HELP: &str = "Kil: a native macOS terminal.\n\nusage:\n  kil                         open the window\n  kil --server <dir>          run the session server (internal: owns every pane's PTY)\n  kil --remote [--host <ip>] [--port <n>] [--public]\n                              expose the session server to Agent on Edge\n                              (--public uses tunnel_hostname/tunnel_token from config.toml)\n  kil --help, -h              show this help\n  kil --version, -V           show the version\n\nAny other argument is rejected (exit 2) instead of opening the window.";
+pub const HELP: &str = "Kil: a native macOS terminal.\n\nusage:\n  kil                         open the window\n  kil --server <dir>          run the session server (internal: owns every pane's PTY)\n  kil --remote [--host <ip>] [--port <n>] [--public] [--reset-pairing]\n                              expose the session server to Agent on Edge\n                              (--public uses tunnel_hostname/tunnel_token from config.toml;\n                               --reset-pairing revokes the paired phone and makes a fresh QR)\n  kil --help, -h              show this help\n  kil --version, -V           show the version\n\nAny other argument is rejected (exit 2) instead of opening the window.";
 
 /// What the process should do.
 #[derive(Debug)]
@@ -28,10 +28,12 @@ pub enum Command {
     Remote {
         /// Override the QR address.
         host: Option<String>,
-        /// Port to listen on; 0 picks a free one.
+        /// Port to listen on; defaults to the bridge's remembered port.
         port: u16,
         /// Open a Cloudflare Tunnel and print a QR that works from anywhere.
         public: bool,
+        /// Revoke the paired phone: fresh certificate, code and verifier.
+        reset_pairing: bool,
     },
 }
 
@@ -100,8 +102,9 @@ fn parse_server(rest: &[OsString]) -> Result<Command, String> {
 
 fn parse_remote(rest: &[OsString]) -> Result<Command, String> {
     let mut host = None;
-    let mut port = 0;
+    let mut port = kil_remote::DEFAULT_PORT;
     let mut public = false;
+    let mut reset_pairing = false;
     let mut index = 0;
     while let Some(arg) = rest.get(index) {
         let Some(flag) = arg.to_str() else {
@@ -140,10 +143,19 @@ fn parse_remote(rest: &[OsString]) -> Result<Command, String> {
                 public = true;
                 index += 1;
             }
+            "--reset-pairing" => {
+                reset_pairing = true;
+                index += 1;
+            }
             _ => return Err(remote_unknown(flag)),
         }
     }
-    Ok(Command::Remote { host, port, public })
+    Ok(Command::Remote {
+        host,
+        port,
+        public,
+        reset_pairing,
+    })
 }
 
 fn remote_unknown(flag: &str) -> String {
@@ -223,18 +235,28 @@ mod tests {
     #[test]
     fn parse_should_run_the_bridge_with_defaults_when_given_no_bridge_flags() {
         let command = parse(&args(&["--remote"])).unwrap();
-        assert!(matches!(command, Command::Remote { host, port, public }
-                if host.is_none() && port == 0 && !public));
+        assert!(
+            matches!(command, Command::Remote { host, port, public, reset_pairing }
+                if host.is_none() && port == kil_remote::DEFAULT_PORT && !public && !reset_pairing)
+        );
     }
 
     #[test]
     fn parse_should_pass_the_bridge_flags_through() {
         let command = parse(&args(&[
-            "--remote", "--host", "10.0.0.2", "--port", "8080", "--public",
+            "--remote",
+            "--host",
+            "10.0.0.2",
+            "--port",
+            "8080",
+            "--public",
+            "--reset-pairing",
         ]))
         .unwrap();
-        assert!(matches!(command, Command::Remote { host, port, public }
-                if host.as_deref() == Some("10.0.0.2") && port == 8080 && public));
+        assert!(
+            matches!(command, Command::Remote { host, port, public, reset_pairing }
+                if host.as_deref() == Some("10.0.0.2") && port == 8080 && public && reset_pairing)
+        );
     }
 
     #[test]

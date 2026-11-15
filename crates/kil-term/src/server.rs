@@ -2,7 +2,7 @@
 //! so they outlive the app that shows them.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions, Permissions},
     io::{self, ErrorKind},
     os::{
@@ -30,7 +30,7 @@ use crate::{
     reaper,
     session::Session,
     spawn, sys,
-    wire::{self, Frame, MIN_PROTOCOL, PROTOCOL, SessionDesc},
+    wire::{self, Frame, MIN_PROTOCOL, PROTOCOL, SessionDesc, TabDesc},
 };
 
 /// With no session and no client for this long, the server exits.
@@ -166,6 +166,9 @@ fn listen(dir: &Path) -> io::Result<Option<Listening>> {
 /// Sessions by id. A generation tells a session apart from a later one with the same id.
 struct Registry {
     sessions: Mutex<HashMap<String, (u64, Session)>>,
+    /// The app's tabs as last published, in sidebar order; filtered to live sessions
+    /// when a phone asks. Empty until the app publishes (e.g. no window is open).
+    tabs: Mutex<Vec<TabDesc>>,
     generation: AtomicU64,
     /// Connections being served that are not (yet) a session's.
     clients: AtomicUsize,
@@ -178,6 +181,7 @@ impl Registry {
     fn new() -> io::Result<Self> {
         Ok(Self {
             sessions: Mutex::default(),
+            tabs: Mutex::default(),
             generation: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
             poller: Poller::new()?,
@@ -186,6 +190,32 @@ impl Registry {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, Session)>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn publish_tabs(&self, tabs: Vec<TabDesc>) {
+        *self.tabs.lock().unwrap_or_else(PoisonError::into_inner) = tabs;
+    }
+
+    /// The published tabs with dead panes dropped, order preserved: a tab whose focused
+    /// pane died falls back to its first surviving pane, and one with none left goes.
+    fn tabs(&self) -> Vec<TabDesc> {
+        let live: HashSet<String> = self.lock().keys().cloned().collect();
+        let stored = self
+            .tabs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        stored
+            .into_iter()
+            .filter_map(|mut tab| {
+                tab.panes.retain(|pane| live.contains(pane));
+                let first = tab.panes.first()?;
+                if !live.contains(&tab.session) {
+                    tab.session.clone_from(first);
+                }
+                Some(tab)
+            })
+            .collect()
     }
 
     fn is_idle(&self) -> bool {
@@ -318,17 +348,12 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
                 let ids = registry.lock().keys().cloned().collect();
                 wire::send(&mut stream, &Frame::Sessions(ids))?;
             }
-            Frame::Watchers => {
-                // The app holds one client per pane it shows; any extra is a watcher.
-                let watched = registry
-                    .lock()
-                    .iter()
-                    .filter(|(_, (_, session))| session.attached_clients() > 1)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                wire::send(&mut stream, &Frame::Watching(watched))?;
-            }
+            Frame::Watchers => wire::send(&mut stream, &Frame::Watching(watched(registry)))?,
             Frame::Describe => wire::send(&mut stream, &Frame::Roster(roster(registry)))?,
+            // Only the app may say what its tabs are; a phone's snapshot is dropped.
+            Frame::PublishTabs(tabs) if !remote => registry.publish_tabs(tabs),
+            Frame::PublishTabs(_) => {}
+            Frame::DescribeTabs => wire::send(&mut stream, &Frame::Tabs(registry.tabs()))?,
             Frame::Controllers => {
                 let controlling = registry
                     .lock()
@@ -397,6 +422,17 @@ fn serve_client(mut stream: UnixStream, registry: &Arc<Registry>) -> io::Result<
             }
         }
     }
+}
+
+/// Sessions with more than one client: the app holds one per pane it shows, so any
+/// extra is a watcher.
+fn watched(registry: &Registry) -> Vec<String> {
+    registry
+        .lock()
+        .iter()
+        .filter(|(_, (_, session))| session.attached_clients() > 1)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Every session described, for a client naming panes it has not attached to.

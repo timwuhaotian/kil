@@ -19,7 +19,7 @@ use gpui::{
     Subscription, Task, WeakEntity, Window, actions, anchored, deferred, div, prelude::*, px,
     relative,
 };
-use kil_term::Client;
+use kil_term::{Client, TabDesc};
 
 use crate::{
     config, keymap,
@@ -1561,18 +1561,60 @@ impl Workspace {
         }
     }
 
-    /// Asks the server which sessions a phone watches, every [`WATCHERS_INTERVAL`].
+    /// This window's tabs as the sidebar shows them, for the server to hand a phone:
+    /// sidebar order, the user's name or the focused pane's title, its folder, every
+    /// split pane's session, pinned, active, and the row's status. Taken here, on the
+    /// UI thread; only the socket round trip leaves it.
+    fn tab_descriptions(&self, cx: &App) -> Vec<TabDesc> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let focused = tab.focused.read(cx);
+                TabDesc {
+                    title: tab.title(cx).to_string(),
+                    cwd: focused.info().cwd.to_string(),
+                    session: focused.id().to_owned(),
+                    panes: tab
+                        .tree
+                        .leaves()
+                        .iter()
+                        .map(|pane| pane.read(cx).id().to_owned())
+                        .collect(),
+                    pinned: tab.pinned,
+                    active: index == self.active,
+                    status: match tab.status(cx) {
+                        TabStatus::Idle => 0,
+                        TabStatus::Running => 1,
+                        TabStatus::Done => 2,
+                        TabStatus::Failed => 3,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Asks the server which sessions a phone watches, every [`WATCHERS_INTERVAL`],
+    /// publishing this window's tabs in the same round trip so a phone's roster mirrors
+    /// the sidebar. The first round runs at once, not after an interval.
     fn start_watchers_watch(&mut self, cx: &mut Context<Self>) {
         let client = Arc::clone(&self.client);
         self.watchers_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(WATCHERS_INTERVAL).await;
+                let Ok(tabs) = this.update(cx, |this, cx| this.tab_descriptions(cx)) else {
+                    break;
+                };
                 // A socket round trip: keep it off the UI thread, like panes spawning.
+                // A failed publish (an older server hangs up on it) is ignored: presence
+                // polling carries on either way.
                 let (watched, controlling) = cx
                     .background_executor()
                     .spawn({
                         let client = Arc::clone(&client);
-                        async move { (client.watchers(), client.controlling()) }
+                        async move {
+                            let _ = client.publish_tabs(&tabs);
+                            (client.watchers(), client.controlling())
+                        }
                     })
                     .await;
                 if this
@@ -1581,6 +1623,7 @@ impl Workspace {
                 {
                     break;
                 }
+                cx.background_executor().timer(WATCHERS_INTERVAL).await;
             }
         }));
     }

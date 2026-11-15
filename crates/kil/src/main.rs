@@ -266,7 +266,12 @@ pub(crate) fn restart_kil() -> bool {
 /// `kil --remote` exposes the session server to Agent on Edge over a paired
 /// TLS tunnel, printing a QR code to scan. Keeps the same session server the
 /// app runs, so the panes on the phone are the panes on the desk.
-fn remote_config(host: Option<String>, port: u16, public: bool) -> kil_remote::Config {
+fn remote_config(
+    host: Option<String>,
+    port: u16,
+    public: bool,
+    reset_pairing: bool,
+) -> kil_remote::Config {
     let dir = restore::Store::standard().map_or_else(
         || std::env::temp_dir().join("kil"),
         |store| store.dir().to_owned(),
@@ -280,6 +285,7 @@ fn remote_config(host: Option<String>, port: u16, public: bool) -> kil_remote::C
         public,
         tunnel_hostname: settings.tunnel_hostname,
         tunnel_token: settings.tunnel_token,
+        reset_pairing,
     }
 }
 
@@ -342,8 +348,13 @@ fn run_command(args: &[std::ffi::OsString]) -> bool {
             serve(&dir);
             true
         }
-        cli::Command::Remote { host, port, public } => {
-            let config = remote_config(host, port, public);
+        cli::Command::Remote {
+            host,
+            port,
+            public,
+            reset_pairing,
+        } => {
+            let config = remote_config(host, port, public, reset_pairing);
             if let Err(err) = kil_remote::run(&config) {
                 eprintln!("kil --remote: {err:#}");
                 std::process::exit(1);

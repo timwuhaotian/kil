@@ -49,6 +49,26 @@ pub struct SessionDesc {
     pub busy: bool,
 }
 
+/// One desktop tab as the app's sidebar shows it, published by the app so a phone's roster
+/// can match the desktop's order, name and state rather than bare session ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabDesc {
+    /// The user-set name, else the focused pane's program title.
+    pub title: String,
+    /// The focused pane's working directory, as the sidebar shows it.
+    pub cwd: String,
+    /// The focused pane's session id: the one a one-pane client opens for this tab.
+    pub session: String,
+    /// Every pane's session id, in split-tree order.
+    pub panes: Vec<String>,
+    /// The tab is pinned.
+    pub pinned: bool,
+    /// The tab is the desktop's active one.
+    pub active: bool,
+    /// 0 idle, 1 running, 2 done, 3 failed.
+    pub status: u8,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Frame {
     /// The first frame on every connection, both ways.
@@ -79,6 +99,11 @@ pub(crate) enum Frame {
     Controllers,
     /// Asks for every session described; answered with [`Frame::Roster`].
     Describe,
+    /// The app publishing its tabs, in sidebar order; no reply. Only a non-remote
+    /// connection may publish.
+    PublishTabs(Vec<TabDesc>),
+    /// Asks for the tabs the app published; answered with [`Frame::Tabs`].
+    DescribeTabs,
     // Server to client.
     Sessions(Vec<String>),
     Stopped,
@@ -104,6 +129,10 @@ pub(crate) enum Frame {
     /// [`Frame::Sessions`] gives bare ids. Asked with [`Frame::Describe`] on its own
     /// connection, so an older server hanging up on the unknown frame disturbs nothing.
     Roster(Vec<SessionDesc>),
+    /// The app's tabs as last published, filtered to sessions still live, in published
+    /// order. Asked with [`Frame::DescribeTabs`] on its own connection, so an older server
+    /// hanging up on the unknown frame disturbs nothing.
+    Tabs(Vec<TabDesc>),
 }
 
 impl Frame {
@@ -132,6 +161,9 @@ impl Frame {
             Self::Controlling(_) => 21,
             Self::Describe => 22,
             Self::Roster(_) => 23,
+            Self::PublishTabs(_) => 24,
+            Self::DescribeTabs => 25,
+            Self::Tabs(_) => 26,
         }
     }
 
@@ -151,7 +183,8 @@ impl Frame {
             | Self::Watchers
             | Self::Remote
             | Self::Controllers
-            | Self::Describe => {}
+            | Self::Describe
+            | Self::DescribeTabs => {}
             Self::Spawn { id, config } => {
                 put.str(id);
                 put.config(config);
@@ -179,6 +212,12 @@ impl Frame {
                     put.str(&desc.title);
                     put.str(&desc.cwd);
                     put.0.push(u8::from(desc.busy));
+                }
+            }
+            Self::PublishTabs(tabs) | Self::Tabs(tabs) => {
+                put.len(tabs.len());
+                for tab in tabs {
+                    put.tab(tab);
                 }
             }
             Self::Failed(message) => put.str(message),
@@ -238,6 +277,15 @@ impl Frame {
                 let count = get.len()?;
                 Self::Roster((0..count).map(|_| get.desc()).collect::<io::Result<_>>()?)
             }
+            24 => {
+                let count = get.len()?;
+                Self::PublishTabs((0..count).map(|_| get.tab()).collect::<io::Result<_>>()?)
+            }
+            25 => Self::DescribeTabs,
+            26 => {
+                let count = get.len()?;
+                Self::Tabs((0..count).map(|_| get.tab()).collect::<io::Result<_>>()?)
+            }
             _ => return Err(invalid("unknown frame kind")),
         };
         Ok(frame)
@@ -278,6 +326,19 @@ impl Put<'_> {
 
     fn os(&mut self, text: &OsString) {
         self.bytes(text.as_encoded_bytes());
+    }
+
+    fn tab(&mut self, tab: &TabDesc) {
+        self.str(&tab.title);
+        self.str(&tab.cwd);
+        self.str(&tab.session);
+        self.len(tab.panes.len());
+        for pane in &tab.panes {
+            self.str(pane);
+        }
+        self.0.push(u8::from(tab.pinned));
+        self.0.push(u8::from(tab.active));
+        self.0.push(tab.status);
     }
 
     fn size(&mut self, size: GridSize) {
@@ -400,6 +461,23 @@ impl Get<'_> {
             r: rgb[0],
             g: rgb[1],
             b: rgb[2],
+        })
+    }
+
+    fn tab(&mut self) -> io::Result<TabDesc> {
+        let title = self.str()?;
+        let cwd = self.str()?;
+        let session = self.str()?;
+        let count = self.len()?;
+        let panes = (0..count).map(|_| self.str()).collect::<io::Result<_>>()?;
+        Ok(TabDesc {
+            title,
+            cwd,
+            session,
+            panes,
+            pinned: self.u8()? != 0,
+            active: self.u8()? != 0,
+            status: self.u8()?,
         })
     }
 
@@ -624,6 +702,25 @@ mod tests {
                     busy: false,
                 },
             ]),
+            Frame::PublishTabs(vec![TabDesc {
+                title: "build".into(),
+                cwd: "~/code/kil".into(),
+                session: "a-2".into(),
+                panes: vec!["a-1".into(), "a-2".into()],
+                pinned: true,
+                active: false,
+                status: 1,
+            }]),
+            Frame::DescribeTabs,
+            Frame::Tabs(vec![TabDesc {
+                title: String::new(),
+                cwd: String::new(),
+                session: "b-1".into(),
+                panes: vec!["b-1".into()],
+                pinned: false,
+                active: true,
+                status: 3,
+            }]),
         ];
         for frame in frames {
             assert_eq!(round_trip(&frame), frame);

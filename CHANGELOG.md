@@ -6,6 +6,19 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.41 — 2026-11-15
+
+- **Pair once, reconnect from anywhere.** The first phone still spends the one-time QR code,
+  but its device key and the bridge identity now survive Kil and bridge restarts. Reconnects
+  use a certificate-bound challenge-response, the Mac stores only the key verifier, and
+  **Reset pairing** explicitly revokes the old phone. The enabled and Public internet switches
+  are remembered too. Authentication is bounded and throttled, and public WebSocket relays
+  retain the pinned TLS connection, so Cloudflare still sees only ciphertext.
+- **The phone follows Kil's whole sidebar.** Kil publishes tab titles, folders, order, active
+  and pinned state alongside their live panes, letting Agent on Edge stay on the full tab list
+  and keep it in sync instead of dropping straight into an arbitrary pane. Older servers still
+  use the roster fallback.
+
 ## 0.0.40 — 2026-11-15
 
 - **Public internet runs on your own Cloudflare Tunnel now.** Instead of an

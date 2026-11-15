@@ -18,10 +18,11 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let mut dir = default_dir();
-    let mut port = 0;
+    let mut port = kil_remote::DEFAULT_PORT;
     let mut host = None;
     let mut launcher = None;
     let mut public = false;
+    let mut reset_pairing = false;
     let mut tunnel_hostname = None;
     let tunnel_token = std::env::var("TUNNEL_TOKEN").ok();
     let mut args = std::env::args().skip(1);
@@ -36,12 +37,13 @@ fn main() -> Result<()> {
                 ));
             }
             "--public" => public = true,
+            "--reset-pairing" => reset_pairing = true,
             "--tunnel-hostname" => {
                 tunnel_hostname = Some(args.next().context("--tunnel-hostname needs a value")?);
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>] [--public] [--tunnel-hostname <host>]\n       kil-remote --version"
+                    "usage: kil-remote [--dir <dir>] [--port <port>] [--host <ip>] [--launcher <exe>] [--public] [--tunnel-hostname <host>] [--reset-pairing]\n       kil-remote --version"
                 );
                 return Ok(());
             }
@@ -61,6 +63,7 @@ fn main() -> Result<()> {
         public,
         tunnel_hostname,
         tunnel_token,
+        reset_pairing,
     })?;
     Ok(())
 }

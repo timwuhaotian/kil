@@ -54,15 +54,17 @@ owns every process, PID and file descriptor it creates.
   panes on the desk; `kil --remote` does the same from a terminal, and the standalone
   `kil-remote` binary without starting the server.
 
-  The pairing code never expires — the first phone spends it and its token reconnects for as
-  long as the bridge runs — and the bridge belongs to Kil rather than to the panel, so closing
-  Settings leaves it up; **New QR** makes a fresh certificate, code and port for a second phone
-  or a re-pair. Ticking Public internet runs your own Cloudflare Tunnel — on your Cloudflare
-  account and domain, its hostname and token set in Settings ▸ Agent on Edge (or
-  `tunnel_hostname` / `tunnel_token` in `config.toml`) — and prints a QR that works from
-  anywhere; `cloudflared` dials out, so no router setup, the pinned TLS rides inside the
-  tunnel, so Cloudflare relays ciphertext only, the QR also carries the LAN address for at
-  home, and the tunnel closes when the bridge stops.
+  The pairing code never expires — the first phone spends it and its device key reconnects
+  after Kil or the bridge restarts, without scanning again. The Mac stores only the key's
+  verifier; reconnects answer a certificate-bound challenge instead of sending the key.
+  **Reset pairing** explicitly revokes the phone and makes a fresh certificate and code. The
+  bridge belongs to Kil rather than to the panel, so closing Settings leaves it up, and its
+  enabled/public switches are restored on launch. Ticking Public internet runs your own
+  Cloudflare Tunnel — on your Cloudflare account and domain, its hostname and token set in
+  Settings ▸ Agent on Edge (or `tunnel_hostname` / `tunnel_token` in `config.toml`) — and
+  prints a QR that works from anywhere; `cloudflared` dials out, so no router setup, the
+  pinned TLS rides inside the tunnel, so Cloudflare relays ciphertext only, the QR also
+  carries the LAN address for at home, and the tunnel closes when the bridge stops.
 
   While a phone is attached, its tab's row in the sidebar is outlined in the theme's accent and
   carries a small phone badge; when the phone types, both turn solid — driving, not just
@@ -248,6 +250,8 @@ sidebar_opacity = 0.6            # 0–1; leave out for the theme's own
 auto_update = true               # check, download and install updates when Kil quits
 tunnel_hostname = "kil.example.com"  # your Cloudflare Tunnel, for public Agent on Edge
 tunnel_token = "…"               # its token, from Cloudflare Zero Trust
+remote_enabled = false             # restore the Agent on Edge bridge on launch
+remote_public = false              # restore its Cloudflare Tunnel too
 ```
 
 **`~/Library/Application Support/kil/`** holds what Kil reopens: `session.toml` (layout),

@@ -27,7 +27,7 @@ use crate::{
     server,
     session::{GridSize, Session, SessionConfig, term_config},
     snapshot::Palette,
-    wire::{self, Frame, Inbox, MIN_PROTOCOL, PROTOCOL, SessionDesc},
+    wire::{self, Frame, Inbox, MIN_PROTOCOL, PROTOCOL, SessionDesc, TabDesc},
 };
 
 /// How long a request to the server may take before it counts as gone.
@@ -156,6 +156,36 @@ impl Client {
         wire::send(&mut stream, &Frame::Describe)?;
         match wire::receive(&mut stream)? {
             Some(Frame::Roster(descriptions)) => Ok(descriptions),
+            None => Ok(Vec::new()),
+            Some(other) => Err(unexpected(&other)),
+        }
+    }
+
+    /// Publishes the app's tabs, in sidebar order, for a phone's roster to mirror.
+    ///
+    /// Sent on its own connection, never the control one: a server older than the
+    /// `PublishTabs` frame hangs up on it, and there is no reply to wait for.
+    ///
+    /// # Errors
+    /// If the server is gone.
+    pub fn publish_tabs(&self, tabs: &[TabDesc]) -> io::Result<()> {
+        let mut stream = self.connection()?;
+        wire::send(&mut stream, &Frame::PublishTabs(tabs.to_vec()))
+    }
+
+    /// The app's tabs as last published — order, names, pinned and active — filtered to
+    /// sessions still live.
+    ///
+    /// Asked on its own connection: a server older than the `DescribeTabs` frame hangs up
+    /// on it, which reads as no tabs rather than disturbing the control connection.
+    ///
+    /// # Errors
+    /// If the server is gone.
+    pub fn tabs(&self) -> io::Result<Vec<TabDesc>> {
+        let mut stream = self.connection()?;
+        wire::send(&mut stream, &Frame::DescribeTabs)?;
+        match wire::receive(&mut stream)? {
+            Some(Frame::Tabs(tabs)) => Ok(tabs),
             None => Ok(Vec::new()),
             Some(other) => Err(unexpected(&other)),
         }

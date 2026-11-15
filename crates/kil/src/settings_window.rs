@@ -10,14 +10,12 @@ use gpui::{
     PathPromptOptions, RenderImage, SharedString, Stateful, Subscription, Task, TitlebarOptions,
     Window, WindowBounds, WindowOptions, actions, div, img, point, prelude::*, px, size,
 };
-use kil_remote::Config;
 
 use crate::{
     config,
     keymap::{self, Command},
     qr,
     remote::Remote,
-    restore,
     settings::{Settings, abbreviate_home, config_dir, expand_home},
     text_field::{FieldEvent, TextField},
     theme::{Theme, ThemeName, hsla},
@@ -146,6 +144,7 @@ impl SettingsWindow {
                 this.cancel_recording(cx);
             }));
         }
+        let remote_public = file.remote_public;
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             file,
@@ -162,7 +161,7 @@ impl SettingsWindow {
             remote_qr: None,
             remote_code: None,
             remote_fingerprint: None,
-            remote_public: false,
+            remote_public,
             remote_paired: false,
             remote_error: None,
             remote_warning: None,
@@ -170,6 +169,10 @@ impl SettingsWindow {
             _subscriptions: subscriptions,
         };
         this.load_keys();
+        // A panel opened on an auto-started bridge shows its state and QR.
+        if cx.global::<Remote>().on() {
+            this.remote_watch(window, cx);
+        }
         this
     }
 
@@ -288,8 +291,7 @@ impl SettingsWindow {
         .unwrap_or_default();
         field.update(cx, |field, cx| field.set_text(&shown, cx));
         if self.error.is_none() && self.remote_public && cx.global::<Remote>().on() {
-            self.remote_stop(cx);
-            self.remote_start(window, cx);
+            self.remote_restart(window, cx, false);
         }
     }
 
@@ -1056,11 +1058,7 @@ impl SettingsWindow {
                 toggle("agent-on-edge-remote", on, c).on_click(cx.listener(
                     |this, _: &ClickEvent, window, cx| {
                         this.cancel_recording(cx);
-                        if cx.global::<Remote>().on() {
-                            this.remote_stop(cx);
-                        } else {
-                            this.remote_start(window, cx);
-                        }
+                        this.remote_set_enabled(!cx.global::<Remote>().on(), window, cx);
                     },
                 )),
             ),
@@ -1074,11 +1072,10 @@ impl SettingsWindow {
                 toggle("remote-public", self.remote_public, c).on_click(cx.listener(
                     |this, _: &ClickEvent, window, cx| {
                         this.remote_public = !this.remote_public;
+                        let public = this.remote_public;
+                        this.write("remote_public", &public.into(), cx);
                         if cx.global::<Remote>().on() {
-                            this.remote_stop(cx);
-                            this.remote_start(window, cx);
-                        } else {
-                            cx.notify();
+                            this.remote_restart(window, cx, false);
                         }
                     },
                 )),
@@ -1135,8 +1132,8 @@ impl SettingsWindow {
         rows
     }
 
-    /// The running bridge's QR, pairing code, connection state, and the button
-    /// for a fresh one.
+    /// The running bridge's QR, pairing code, connection state, and the
+    /// pairing-reset button.
     fn remote_qr(&self, image: &Arc<RenderImage>, c: Colors, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
@@ -1166,39 +1163,52 @@ impl SettingsWindow {
                         c.muted
                     })
                     .child(if self.remote_paired {
-                        "● Paired — iPhone connected"
+                        "● Paired — reconnects without scanning"
                     } else {
                         "○ Waiting for scan…"
                     }),
             )
             .child(
-                // The code is spent by the first phone, so a fresh one — for a
-                // second phone, or a re-pair — is a click away.
-                button("remote-new-qr", "New QR", c)
+                // Pairing persists across restarts, so this is the revoke: a
+                // fresh certificate and code, and the old phone is cut off.
+                button("remote-new-qr", "Reset pairing", c)
                     .text_size(px(11.))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.cancel_recording(cx);
-                        this.remote_restart(window, cx);
+                        this.remote_restart(window, cx, true);
                     })),
             )
             .into_any_element()
     }
 
-    fn remote_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = restore::Store::standard().map(|store| store.dir().to_owned()) else {
+    /// The user's bridge toggle: persists `remote_enabled` to match. The
+    /// enabled=true write happens only after the bridge actually starts, so
+    /// the file never claims a bridge the UI shows as off.
+    fn remote_set_enabled(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if on {
+            if self.remote_start_inner(window, cx, false) {
+                self.write("remote_enabled", &true.into(), cx);
+            }
+        } else {
+            self.remote_stop_inner(cx);
+            self.write("remote_enabled", &false.into(), cx);
+        }
+    }
+
+    /// Starts the bridge without touching the persisted switch (internal
+    /// restarts keep whatever the user chose). False when it did not start.
+    fn remote_start_inner(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        reset_pairing: bool,
+    ) -> bool {
+        let Some(config) =
+            crate::remote::bridge_config(&self.file, self.remote_public, reset_pairing)
+        else {
             self.remote_error = Some("No session server directory available.".into());
             cx.notify();
-            return;
-        };
-        let settings = cx.global::<Settings>();
-        let config = Config {
-            dir,
-            port: 0,
-            host: None,
-            launcher: std::env::current_exe().ok(),
-            public: self.remote_public,
-            tunnel_hostname: settings.tunnel_hostname.clone(),
-            tunnel_token: settings.tunnel_token.clone(),
+            return false;
         };
         match cx.global_mut::<Remote>().start(&config) {
             Ok(()) => {
@@ -1210,10 +1220,12 @@ impl SettingsWindow {
                 self.remote_paired = false;
                 cx.notify();
                 self.remote_watch(window, cx);
+                true
             }
             Err(err) => {
                 self.remote_error = Some(err.into());
                 cx.notify();
+                false
             }
         }
     }
@@ -1249,7 +1261,7 @@ impl SettingsWindow {
         }));
     }
 
-    fn remote_stop(&mut self, cx: &mut Context<Self>) {
+    fn remote_stop_inner(&mut self, cx: &mut Context<Self>) {
         cx.global_mut::<Remote>().stop();
         // Dropping the task ends the loop at once; leaving it to notice the
         // bridge is gone would run two loops after a restart.
@@ -1263,12 +1275,15 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    /// A fresh QR: the bridge restarts, which makes a new certificate, pairing
-    /// code and port. For a second phone, or a re-pair — the code never expires,
-    /// so there is no clock to beat.
-    fn remote_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remote_stop(cx);
-        self.remote_start(window, cx);
+    /// Restarts the bridge in place (public toggle, tunnel edits, pairing
+    /// reset) without changing the persisted `remote_enabled` — unless the
+    /// restart fails, in which case the file is brought in line with the
+    /// now-off bridge rather than claiming one is running.
+    fn remote_restart(&mut self, window: &mut Window, cx: &mut Context<Self>, reset: bool) {
+        self.remote_stop_inner(cx);
+        if !self.remote_start_inner(window, cx, reset) {
+            self.write("remote_enabled", &false.into(), cx);
+        }
     }
 
     /// Called on a timer while the bridge runs: materialize the QR once it is

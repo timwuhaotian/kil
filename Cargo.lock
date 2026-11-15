@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "kil"
-version = "0.0.40"
+version = "0.0.41"
 dependencies = [
  "anyhow",
  "async-io",
@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "kil-remote"
-version = "0.0.40"
+version = "0.0.41"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -3180,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "kil-term"
-version = "0.0.40"
+version = "0.0.41"
 dependencies = [
  "alacritty_terminal",
  "libc",

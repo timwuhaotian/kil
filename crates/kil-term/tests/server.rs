@@ -12,7 +12,7 @@ use std::{
 };
 
 use common::{SIZE, program, screen, sh, wait_for_foreground, wait_for_text, wait_until, zsh};
-use kil_term::{Client, Session, SessionConfig, SessionEvent, diagnostics, server};
+use kil_term::{Client, Session, SessionConfig, SessionEvent, TabDesc, diagnostics, server};
 
 /// A server of its own, so the tests don't share sessions.
 #[expect(clippy::unwrap_used, reason = "test helper: a failure fails the test")]
@@ -107,6 +107,86 @@ fn roster_should_describe_sessions_without_attaching() {
         client.roster().unwrap()
     );
     assert_eq!(client.sessions().unwrap(), ["a-1"]);
+    client.stop_all().unwrap();
+}
+
+#[test]
+fn published_tabs_should_come_back_in_order_filtered_to_live_sessions() {
+    // The app publishes its sidebar; a phone asks and gets that order and those names,
+    // with dead panes dropped, a dead focused pane falling back to the first survivor,
+    // and an all-dead tab gone. `List` and the roster are untouched by it.
+    let (dir, client) = server("tabs");
+    let one = spawn(&client, "a-1", &sh("exec /bin/sleep 600"));
+    let two = spawn(&client, "a-2", &sh("exec /bin/sleep 600"));
+    let tab = |title: &str, session: &str, panes: &[&str], status: u8| TabDesc {
+        title: title.into(),
+        cwd: "~/code/kil".into(),
+        session: session.into(),
+        panes: panes.iter().map(|pane| (*pane).to_owned()).collect(),
+        pinned: title == "second",
+        active: title == "first",
+        status,
+    };
+    client
+        .publish_tabs(&[
+            tab("second", "dead", &["dead", "a-2"], 1),
+            tab("first", "a-1", &["a-1"], 2),
+            tab("gone", "dead", &["dead"], 0),
+        ])
+        .unwrap();
+    // Publishing has no reply, on its own connection: poll until the server took it.
+    assert!(
+        wait_until(Duration::from_secs(5), || client.tabs().is_ok_and(|tabs| {
+            tabs.len() == 2
+                && tabs[0].title == "second"
+                && tabs[0].session == "a-2"
+                && tabs[0].panes == ["a-2"]
+                && tabs[0].pinned
+                && !tabs[0].active
+                && tabs[0].status == 1
+                && tabs[1].title == "first"
+                && tabs[1].session == "a-1"
+                && tabs[1].active
+                && tabs[1].status == 2
+        })),
+        "{:?}",
+        client.tabs().unwrap()
+    );
+    let mut ids = client.sessions().unwrap();
+    ids.sort();
+    assert_eq!(ids, ["a-1", "a-2"]);
+    assert_eq!(client.roster().unwrap().len(), 2);
+
+    // A phone's connection is remote: its forged tabs are ignored. Asking for the list
+    // on the same connection afterwards proves the server saw, and dropped, the publish.
+    let mut phone = UnixStream::connect(server::socket_path(&dir)).unwrap();
+    let mut forged = 1_u32.to_le_bytes().to_vec();
+    for text in ["forged", "", "a-1"] {
+        forged.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
+        forged.extend_from_slice(text.as_bytes());
+    }
+    forged.extend_from_slice(&1_u32.to_le_bytes());
+    forged.extend_from_slice(&3_u32.to_le_bytes());
+    forged.extend_from_slice(b"a-1");
+    forged.extend_from_slice(&[0, 1, 0]);
+    phone
+        .write_all(&frame(19, &[]))
+        .and_then(|()| phone.write_all(&frame(1, &2_u32.to_le_bytes())))
+        .and_then(|()| phone.write_all(&frame(24, &forged)))
+        .and_then(|()| phone.write_all(&frame(2, &[])))
+        .unwrap();
+    assert!(
+        std::iter::from_fn(|| read_frame(&mut phone)).any(|(kind, _)| kind == 9),
+        "the list reply follows the ignored publish"
+    );
+    assert!(
+        client
+            .tabs()
+            .unwrap()
+            .iter()
+            .all(|tab| tab.title != "forged")
+    );
+    drop((one, two, phone));
     client.stop_all().unwrap();
 }
 

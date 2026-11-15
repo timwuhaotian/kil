@@ -8,6 +8,10 @@ use serde::Deserialize;
 use crate::theme::ThemeName;
 
 /// User settings; every key is optional in the file.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent persisted switches, not states of one machine"
+)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub font_family: SharedString,
@@ -27,6 +31,10 @@ pub struct Settings {
     pub tunnel_hostname: Option<String>,
     /// That tunnel's token, from Cloudflare Zero Trust.
     pub tunnel_token: Option<String>,
+    /// Run the Agent on Edge bridge; remembered so it restarts with Kil.
+    pub remote_enabled: bool,
+    /// Expose that bridge through the user's Cloudflare Tunnel.
+    pub remote_public: bool,
 }
 
 impl Global for Settings {}
@@ -45,6 +53,8 @@ impl Default for Settings {
             auto_update: true,
             tunnel_hostname: None,
             tunnel_token: None,
+            remote_enabled: false,
+            remote_public: false,
         }
     }
 }
@@ -63,6 +73,8 @@ struct SettingsFile {
     auto_update: Option<bool>,
     tunnel_hostname: Option<String>,
     tunnel_token: Option<String>,
+    remote_enabled: Option<bool>,
+    remote_public: Option<bool>,
 }
 
 impl Settings {
@@ -95,6 +107,8 @@ impl Settings {
             auto_update: file.auto_update.unwrap_or(defaults.auto_update),
             tunnel_hostname: trimmed(file.tunnel_hostname),
             tunnel_token: trimmed(file.tunnel_token),
+            remote_enabled: file.remote_enabled.unwrap_or(defaults.remote_enabled),
+            remote_public: file.remote_public.unwrap_or(defaults.remote_public),
         })
     }
 }
@@ -238,6 +252,14 @@ mod tests {
         assert_eq!((absent.tunnel_hostname, absent.tunnel_token), (None, None));
         let blank = Settings::parse("tunnel_hostname = \"  \"\ntunnel_token = \"\"\n").unwrap();
         assert_eq!((blank.tunnel_hostname, blank.tunnel_token), (None, None));
+    }
+
+    #[test]
+    fn parse_should_default_remote_off_and_read_the_remembered_bridge_switches() {
+        let absent = Settings::parse("").unwrap();
+        assert!(!absent.remote_enabled && !absent.remote_public);
+        let on = Settings::parse("remote_enabled = true\nremote_public = true\n").unwrap();
+        assert!(on.remote_enabled && on.remote_public);
     }
 
     #[test]
