@@ -30,7 +30,7 @@ pub enum Command {
         host: Option<String>,
         /// Port to listen on; 0 picks a free one.
         port: u16,
-        /// Set up a `UPnP` port mapping and print a QR for the public IP.
+        /// Open a Cloudflare Tunnel and print a QR that works from anywhere.
         public: bool,
     },
 }

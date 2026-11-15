@@ -17,10 +17,13 @@
 //!
 //! - **LAN** (default): the Mac listens on a TCP port and the QR carries the
 //!   Mac's LAN address.
-//! - **Public** (`--public`): the bridge asks the user's own router (`UPnP` IGD)
-//!   for a port mapping to the Mac's public static IP, prints a QR that works
-//!   from anywhere, and removes the mapping when it stops. No cloud service is
-//!   involved — the router is the user's own device.
+//! - **Public** (`--public`): the bridge opens a Cloudflare Quick Tunnel
+//!   (`cloudflared`, outbound-only, so no router setup) to a loopback
+//!   WebSocket shim, and the pinned TLS byte stream rides inside WebSocket
+//!   binary frames. The QR works from anywhere — and also carries the LAN
+//!   address, which the phone tries first at home — and the tunnel closes
+//!   when the bridge stops. Cloudflare relays ciphertext only: the TLS
+//!   session still ends at this bridge, pinned by the QR fingerprint.
 //!
 //! The [`Bridge`] type runs the same machinery inside the Kil app, so the
 //! Settings window can show the QR without a separate command line.
@@ -37,17 +40,17 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use igd_next::{PortMappingProtocol, SearchOptions, aio};
 use qrcode::render::unicode;
 use ring::{
-    digest::{SHA256, digest},
+    digest::{SHA1_FOR_LEGACY_USE_ONLY, SHA256, digest},
     rand::{SecureRandom, SystemRandom},
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy, split},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, copy, split},
     net::{TcpListener, TcpStream, UnixStream},
-    sync::watch,
+    process::{Child, Command},
+    sync::{mpsc, watch},
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -62,8 +65,8 @@ pub struct Config {
     pub host: Option<String>,
     /// A binary that can run `--server <dir>` if no session server is running.
     pub launcher: Option<PathBuf>,
-    /// Expose the bridge through the router's `UPnP` port mapping so the QR
-    /// works from the public internet (requires a public IP on the WAN side).
+    /// Expose the bridge through a Cloudflare Quick Tunnel so the QR works
+    /// from anywhere (requires `cloudflared`; no router setup).
     pub public: bool,
 }
 
@@ -138,7 +141,7 @@ pub struct Bridge {
 impl Bridge {
     /// Starts the bridge on a background thread. The QR payload becomes
     /// available through [`Bridge::qr`] once the listener and (in `--public`
-    /// mode) the router's port mapping are ready.
+    /// mode) the tunnel are ready.
     ///
     /// # Errors
     /// If the TLS identity cannot be generated or the port cannot be bound.
@@ -189,22 +192,28 @@ impl Bridge {
                     let tags = server_tags_remote(&socket_path).await;
                     thread_tags.store(tags, Ordering::Release);
 
-                    let public = if config.public {
-                        Some(PublicMapping::create(listener.local_addr()?).await?)
+                    let tls_port = listener.local_addr()?.port();
+                    let mut tunnel = if config.public {
+                        Some(PublicTunnel::start(tls_port).await?)
                     } else {
                         None
                     };
-                    let (host, port) = if let Some(p) = public.as_ref() {
-                        (p.external_ip.to_string(), p.external_port)
-                    } else {
-                        let host = match config.host.as_deref() {
-                            Some(host) => host.to_owned(),
-                            None => lan_ip()?.to_string(),
-                        };
-                        (host, listener.local_addr()?.port())
+                    let lan_host = match config.host.as_deref() {
+                        Some(host) => host.to_owned(),
+                        None => lan_ip()?.to_string(),
                     };
-                    let url =
-                        format!("kil://{host}:{port}?code={code}&fp=sha256:{fingerprint}&v=1");
+                    let (host, port, url) = if let Some(tunnel) = tunnel.as_ref() {
+                        let host = tunnel.hostname.clone();
+                        let url = format!(
+                            "kil://{host}:443?code={code}&fp=sha256:{fingerprint}&v=1&tun=ws&lan={lan_host}:{tls_port}"
+                        );
+                        (host, 443, url)
+                    } else {
+                        let url = format!(
+                            "kil://{lan_host}:{tls_port}?code={code}&fp=sha256:{fingerprint}&v=1"
+                        );
+                        (lan_host, tls_port, url)
+                    };
                     *qr_ready.lock().unwrap_or_else(PoisonError::into_inner) = Some(QrPayload {
                         host,
                         port,
@@ -224,8 +233,8 @@ impl Bridge {
                         shutdown_rx,
                     )
                     .await;
-                    if let Some(public) = public.as_ref() {
-                        public.remove().await;
+                    if let Some(tunnel) = tunnel.as_mut() {
+                        tunnel.stop().await;
                     }
                     result
                 });
@@ -246,7 +255,7 @@ impl Bridge {
     }
 
     /// Stops the bridge: signals the server loop, joins the background thread,
-    /// and removes the router port mapping if one was created.
+    /// and closes the tunnel if one was created.
     pub fn stop(&self) {
         let _ = self.shutdown.send(true);
         if let Some(handle) = self
@@ -310,7 +319,9 @@ struct Relay {
 /// If the bridge cannot start or the QR payload never becomes ready.
 pub fn run(config: &Config) -> Result<()> {
     let bridge = Bridge::start(config)?;
-    let qr = wait_for_qr(&bridge, Duration::from_secs(15))?;
+    // Public mode waits on cloudflared handing out a hostname (30s budget there).
+    let timeout = Duration::from_secs(if config.public { 45 } else { 15 });
+    let qr = wait_for_qr(&bridge, timeout)?;
     print_qr(
         &qr.url,
         &qr.code,
@@ -341,46 +352,386 @@ fn wait_for_qr(bridge: &Bridge, timeout: Duration) -> Result<QrPayload> {
     }
 }
 
-/// A `UPnP` port mapping set up on the user's own router. No third-party or
-/// cloud service is involved: the router is the user's device, and the bridge
-/// only ever forwards TLS ciphertext through it.
-struct PublicMapping {
-    gateway: aio::Gateway<aio::tokio::Tokio>,
-    external_ip: IpAddr,
-    external_port: u16,
+/// A Cloudflare Quick Tunnel to the bridge: `cloudflared` dials out, so no
+/// router or NAT setup is involved, and forwards the phone's `wss://`
+/// connection to the loopback WebSocket shim below. The pinned TLS stream
+/// rides inside the WebSocket frames, so Cloudflare relays ciphertext only.
+struct PublicTunnel {
+    child: Child,
+    hostname: String,
 }
 
-impl PublicMapping {
-    async fn create(listener_local: SocketAddr) -> Result<Self> {
-        let gateway = aio::tokio::search_gateway(SearchOptions::default())
+impl PublicTunnel {
+    async fn start(tls_port: u16) -> Result<Self> {
+        let shim = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
-            .context("UPnP: no router found — is UPnP enabled on the router?")?;
-        let external_ip = gateway
-            .get_external_ip()
-            .await
-            .context("UPnP: could not read the router's external IP")?;
-        let lan = lan_ip().context("UPnP: could not determine this Mac's LAN address")?;
-        let local_addr = SocketAddr::new(lan, listener_local.port());
-        let external_port = gateway
-            .add_any_port(PortMappingProtocol::TCP, local_addr, 0, "kil --remote")
-            .await
-            .context("UPnP: could not add the port mapping")?;
-        Ok(Self {
-            gateway,
-            external_ip,
-            external_port,
-        })
+            .context("bind the WebSocket shim")?;
+        let shim_port = shim.local_addr()?.port();
+        tokio::spawn(ws_shim_loop(shim, tls_port));
+
+        let Some(cloudflared) = find_cloudflared() else {
+            bail!("Public internet needs cloudflared (brew install cloudflared)");
+        };
+        let mut child = Command::new(cloudflared)
+            .args([
+                "tunnel",
+                "--no-autoupdate",
+                "--url",
+                &format!("http://127.0.0.1:{shim_port}"),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("start cloudflared")?;
+        let hostname = wait_for_tunnel_hostname(&mut child).await?;
+        Ok(Self { child, hostname })
     }
 
-    async fn remove(&self) {
-        if let Err(err) = self
-            .gateway
-            .remove_port(PortMappingProtocol::TCP, self.external_port)
-            .await
-        {
-            log::warn!("UPnP: failed to remove the port mapping: {err}");
+    async fn stop(&mut self) {
+        if let Err(err) = self.child.kill().await {
+            log::warn!("cloudflared: failed to stop the tunnel: {err}");
+        }
+        let _ = self.child.wait().await;
+    }
+}
+
+/// `cloudflared` on the `PATH` or where Homebrew puts it — a GUI launch
+/// often has neither `/opt/homebrew/bin` nor `/usr/local/bin` on its `PATH`.
+fn find_cloudflared() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("cloudflared");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
+    [
+        "/opt/homebrew/bin/cloudflared",
+        "/usr/local/bin/cloudflared",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|candidate| candidate.is_file())
+}
+
+/// Drains `cloudflared`'s output until it prints the Quick Tunnel URL, then
+/// keeps draining in the background so the pipe never blocks the child.
+async fn wait_for_tunnel_hostname(child: &mut Child) -> Result<String> {
+    let (tx, mut rx) = mpsc::channel::<String>(128);
+    if let Some(stdout) = child.stdout.take() {
+        forward_lines(stdout, tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward_lines(stderr, tx);
+    }
+    let mut recent: Vec<String> = Vec::new();
+    let found = tokio::time::timeout(
+        Duration::from_secs(30),
+        read_tunnel_hostname(&mut rx, &mut recent),
+    )
+    .await;
+    let hostname = match found {
+        Ok(Ok(hostname)) => hostname,
+        Ok(Err(err)) => {
+            let _ = child.kill().await;
+            return Err(err);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!(
+                "cloudflared did not hand out a tunnel in 30s; its last output:\n{}",
+                recent.join("\n")
+            );
+        }
+    };
+    tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            log::debug!("cloudflared: {line}");
+        }
+    });
+    Ok(hostname)
+}
+
+async fn read_tunnel_hostname(
+    rx: &mut mpsc::Receiver<String>,
+    recent: &mut Vec<String>,
+) -> Result<String> {
+    while let Some(line) = rx.recv().await {
+        log::debug!("cloudflared: {line}");
+        if let Some(hostname) = tunnel_hostname(&line) {
+            return Ok(hostname);
+        }
+        recent.push(line);
+        if recent.len() > 20 {
+            recent.remove(0);
+        }
+    }
+    bail!(
+        "cloudflared exited before handing out a tunnel; its last output:\n{}",
+        recent.join("\n")
+    )
+}
+
+fn forward_lines<R>(reader: R, tx: mpsc::Sender<String>)
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// The `*.trycloudflare.com` hostname in a line of `cloudflared` output, if
+/// the line carries a Quick Tunnel URL.
+fn tunnel_hostname(line: &str) -> Option<String> {
+    let after_scheme = line.split("https://").nth(1)?;
+    let end = after_scheme
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '"' || c == '\'' || c == '|')
+        .unwrap_or(after_scheme.len());
+    let hostname = &after_scheme[..end];
+    hostname
+        .ends_with(".trycloudflare.com")
+        .then(|| hostname.to_owned())
+}
+
+/// The WebSocket shim the tunnel points at: each upgrade dials the bridge's
+/// own TLS listener on loopback and pumps bytes between WebSocket binary
+/// payloads and the TCP stream, so the pairing lines and wire frames inside
+/// the TLS session never know the tunnel exists.
+///
+/// Tunneled connections reach the TLS listener from 127.0.0.1, so the per-IP
+/// pairing throttle buckets them all together. That is acceptable: failed
+/// pairings are still delayed, the bucket just is not per-phone.
+async fn ws_shim_loop(listener: TcpListener, tls_port: u16) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(err) = handle_ws_connection(stream, tls_port).await {
+                log::info!("tunneled connection ended: {err:#}");
+            }
+        });
+    }
+}
+
+/// Answers the HTTP request: a WebSocket upgrade gets a 101 (and `true`),
+/// anything else a plain health-check response.
+async fn ws_upgrade(stream: &mut TcpStream) -> Result<bool> {
+    let headers = read_http_headers(stream).await?;
+    let Some(key) = header_value(&headers, "sec-websocket-key") else {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nkil bridge",
+            )
+            .await?;
+        return Ok(false);
+    };
+    let accept = ws_accept(&key);
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    Ok(true)
+}
+
+async fn handle_ws_connection(mut stream: TcpStream, tls_port: u16) -> Result<()> {
+    if !ws_upgrade(&mut stream).await? {
+        return Ok(());
+    }
+
+    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, tls_port))
+        .await
+        .context("dial the bridge's TLS listener")?;
+    let (mut ws_read, mut ws_write) = stream.into_split();
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    // One writer task owns the WebSocket side: TCP bytes become binary
+    // frames, and pongs/close from the frame loop go through the same queue.
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if ws_write.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let pump_tx = out_tx.clone();
+    let pump = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            match tcp_read.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    log::debug!("ws shim: tcp read ended");
+                    // The TLS side ended: close the WebSocket too, so the
+                    // phone does not hang on a dead tunnel.
+                    let _ = pump_tx.send(encode_ws_frame(8, &[])).await;
+                    break;
+                }
+                Ok(n) => {
+                    if pump_tx.send(encode_ws_frame(2, &buf[..n])).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // The payloads are one byte stream: continuation and binary (and,
+    // defensively, text) payloads just append to the TCP side — there is no
+    // message to reassemble.
+    loop {
+        let (opcode, payload) = match read_ws_frame(&mut ws_read).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                log::debug!("ws shim: frame read ended: {err:#}");
+                break;
+            }
+        };
+        if (0..=2).contains(&opcode) {
+            if tcp_write.write_all(&payload).await.is_err() {
+                break;
+            }
+        } else if opcode == 8 {
+            let _ = out_tx.send(encode_ws_frame(8, &payload)).await;
+            break;
+        } else if opcode == 9 && out_tx.send(encode_ws_frame(10, &payload)).await.is_err() {
+            break;
+        }
+    }
+    pump.abort();
+    writer.abort();
+    Ok(())
+}
+
+/// HTTP headers up to the blank line, read a byte at a time so nothing past
+/// the headers is swallowed before the frame loop takes over.
+async fn read_http_headers(stream: &mut TcpStream) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    while !bytes.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await?;
+        bytes.push(byte[0]);
+        if bytes.len() > (16 << 10) {
+            bail!("HTTP headers too large");
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_owned())
+    })
+}
+
+/// The `Sec-WebSocket-Accept` answer for a client's key (RFC 6455 §1.3):
+/// SHA-1 of the key and the protocol's fixed GUID, base64-encoded.
+fn ws_accept(key: &str) -> String {
+    let mut input = key.to_owned();
+    input.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64_encode(digest(&SHA1_FOR_LEGACY_USE_ONLY, input.as_bytes()).as_ref())
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        for shift in [18, 12, 6, 0] {
+            out.push(BASE64[usize::try_from((triple >> shift) & 0x3f).unwrap_or(0)] as char);
+        }
+        for _ in chunk.len()..3 {
+            out.pop();
+        }
+        for _ in chunk.len()..3 {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// One client frame, unmasked: its opcode and payload. Client frames are
+/// masked; a single frame is capped at 16 MiB.
+async fn read_ws_frame<R>(reader: &mut R) -> Result<(u8, Vec<u8>)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut head = [0u8; 2];
+    reader.read_exact(&mut head).await?;
+    let opcode = head[0] & 0x0f;
+    let masked = head[1] & 0x80 != 0;
+    let len: u64 = match head[1] & 0x7f {
+        126 => {
+            let mut ext = [0u8; 2];
+            reader.read_exact(&mut ext).await?;
+            u64::from(u16::from_be_bytes(ext))
+        }
+        127 => {
+            let mut ext = [0u8; 8];
+            reader.read_exact(&mut ext).await?;
+            u64::from_be_bytes(ext)
+        }
+        len => u64::from(len),
+    };
+    if len > (16 << 20) {
+        bail!("WebSocket frame too large");
+    }
+    let mask = if masked {
+        let mut mask = [0u8; 4];
+        reader.read_exact(&mut mask).await?;
+        Some(mask)
+    } else {
+        None
+    };
+    let len = usize::try_from(len).map_err(|_| anyhow::anyhow!("WebSocket frame too large"))?;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await?;
+    if let Some(mask) = mask {
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
+        }
+    }
+    Ok((opcode, payload))
+}
+
+/// One unmasked server frame (FIN set) carrying `payload`.
+fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 10);
+    frame.push(0x80 | opcode);
+    match payload.len() {
+        0..=125 => frame.push(u8::try_from(payload.len()).unwrap_or(125)),
+        126..=65_535 => {
+            frame.push(126);
+            let len = u16::try_from(payload.len()).unwrap_or(u16::MAX);
+            frame.extend_from_slice(&len.to_be_bytes());
+        }
+        _ => {
+            frame.push(127);
+            let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+            frame.extend_from_slice(&len.to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(payload);
+    frame
 }
 
 /// Makes sure Kil's session server is up: the Kil app normally runs it, and
@@ -644,9 +995,12 @@ fn print_qr(payload: &str, code: &str, fingerprint: &str, dir: &Path, public: bo
     println!("  paste URL:     {payload}");
     if public {
         println!(
-            "  public: this bridge is reachable from the internet through your router's UPnP mapping;"
+            "  public: this bridge is reachable from anywhere through a Cloudflare Tunnel — outbound-only,"
         );
-        println!("          the mapping is removed when this process stops.");
+        println!("          no router setup; the tunnel closes when the bridge stops.");
+        println!(
+            "          Traffic stays end-to-end encrypted to Kil; Cloudflare relays ciphertext only."
+        );
     }
     println!("  The code is spent by the first phone and stays good until this bridge stops.");
     println!();
@@ -754,6 +1108,82 @@ mod tests {
             assert!(!guard.note_failure(ip), "first five failures are budgeted");
         }
         assert!(guard.note_failure(ip), "the sixth failure is throttled");
+    }
+
+    #[test]
+    fn the_accept_key_matches_the_rfc6455_vector() {
+        assert_eq!(
+            ws_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    /// A client frame as the phone sends it: FIN set, masked with 1,2,3,4.
+    fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [1u8, 2, 3, 4];
+        let mut frame = vec![0x80 | opcode];
+        match payload.len() {
+            0..=125 => frame.push(0x80 | u8::try_from(payload.len()).unwrap_or(125)),
+            126..=65_535 => {
+                frame.push(0xfe);
+                let len = u16::try_from(payload.len()).unwrap_or(u16::MAX);
+                frame.extend_from_slice(&len.to_be_bytes());
+            }
+            _ => {
+                frame.push(0xff);
+                let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+                frame.extend_from_slice(&len.to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ mask[i % 4]),
+        );
+        frame
+    }
+
+    #[tokio::test]
+    async fn masked_client_frames_decode_at_every_length() {
+        for payload in [vec![7u8; 3], vec![7u8; 200], vec![7u8; 70_000]] {
+            let frame = masked_frame(2, &payload);
+            let mut reader: &[u8] = &frame;
+            let (opcode, decoded) = read_ws_frame(&mut reader).await.unwrap();
+            assert_eq!(opcode, 2);
+            assert_eq!(decoded, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn server_frames_encode_unmasked_and_round_trip() {
+        for payload in [vec![9u8; 3], vec![9u8; 200], vec![9u8; 70_000]] {
+            let frame = encode_ws_frame(2, &payload);
+            assert_eq!(frame[0], 0x82);
+            assert_eq!(frame[1] & 0x80, 0, "server frames are unmasked");
+            let mut reader: &[u8] = &frame;
+            let (opcode, decoded) = read_ws_frame(&mut reader).await.unwrap();
+            assert_eq!(opcode, 2);
+            assert_eq!(decoded, payload);
+        }
+        assert_eq!(encode_ws_frame(2, &[0u8; 200])[1], 126);
+        assert_eq!(encode_ws_frame(2, &vec![0u8; 70_000])[1], 127);
+    }
+
+    #[test]
+    fn the_tunnel_hostname_comes_out_of_cloudflared_noise() {
+        assert_eq!(
+            tunnel_hostname("2026-01-01 INF |  https://bright-river-1234.trycloudflare.com  |")
+                .as_deref(),
+            Some("bright-river-1234.trycloudflare.com")
+        );
+        assert_eq!(
+            tunnel_hostname("visit https://bright-river-1234.trycloudflare.com/").as_deref(),
+            Some("bright-river-1234.trycloudflare.com")
+        );
+        assert!(tunnel_hostname("INF Thank you for trying Cloudflare Tunnel").is_none());
+        assert!(tunnel_hostname("see https://developers.cloudflare.com/").is_none());
     }
 
     /// A scripted session server on a socket of its own: `script` answers the probe's

@@ -9,7 +9,7 @@ Kil renders with GPUI on Metal, parses VT sequences with `alacritty_terminal`, a
 - [Vertical tabs](https://github.com/timwuhaotian/kil#features): sidebar tabs with running-job rings, finished-job dots, drag reorder, and rename.
 - [Session persistence](https://github.com/timwuhaotian/kil#features): quit, crash, or update without losing jobs; layout saved within 2 s, screens every 30 s.
 - [Split panes](https://github.com/timwuhaotian/kil#features): animated splits that share the tab evenly, with draggable dividers.
-- [iPhone remote](https://github.com/timwuhaotian/kil#features): Agent on Edge pairs a phone by QR over TLS; optional UPnP port forward, no cloud service.
+- [iPhone remote](https://github.com/timwuhaotian/kil#features): Agent on Edge pairs a phone by QR over pinned TLS; optional Cloudflare Tunnel for away-from-home (ciphertext relay only).
 - [Size and performance](https://github.com/timwuhaotian/kil#size): 8.6 MB installed, against 65.0 MB for Ghostty, 202.9 MB for iTerm2, and 913.7 MB for Warp.
 - [Per-tab memory](https://github.com/timwuhaotian/kil#features): each tab shows what its programs cost, plus a total for every tab.
 - [Nine themes](https://github.com/timwuhaotian/kil#features): Batman, Iced Coffee, Creamery Station, Pastel Tweencore, Cappuccino, Shades of Gray, Off White, Red Orange, Snow and Ice.

@@ -38,7 +38,7 @@ Download `Kil-arm64.dmg` from `releases/`, drag Kil to Applications, and verify 
 
 ## How does the iPhone remote (Agent on Edge) work?
 
-Settings ▸ Agent on Edge shows a QR code that pairs an iPhone to the same session server through a TLS tunnel, so the phone's panes are the desk's panes. Ticking Public internet forwards a port via the user's own router (UPnP) with no cloud service involved, and the tab row shows a phone badge that turns solid while the phone types.
+Settings ▸ Agent on Edge shows a QR code that pairs an iPhone to the same session server through a TLS tunnel, so the phone's panes are the desk's panes. Ticking Public internet opens an outbound Cloudflare Tunnel (no router setup; the pinned TLS rides inside, so Cloudflare relays ciphertext only), and the tab row shows a phone badge that turns solid while the phone types.
 
 ## Where are Kil's config files?
 

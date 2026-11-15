@@ -44,8 +44,8 @@ impl Remote {
         }
     }
 
-    /// Stops the bridge: every phone hangs up, and the router's port mapping
-    /// (`--public`) is removed rather than left behind.
+    /// Stops the bridge: every phone hangs up, and the tunnel (`--public`)
+    /// is closed rather than left behind.
     pub fn stop(&mut self) {
         if let Some(bridge) = self.bridge.take() {
             bridge.stop();
@@ -54,7 +54,7 @@ impl Remote {
 }
 
 /// Owns the bridge for the app's lifetime and stops it on quit, so a public
-/// mapping never outlives Kil.
+/// tunnel never outlives Kil.
 pub fn init(cx: &mut App) {
     cx.set_global(Remote::default());
     cx.on_app_quit(|cx| {

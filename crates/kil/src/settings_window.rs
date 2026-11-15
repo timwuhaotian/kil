@@ -1000,7 +1000,7 @@ impl SettingsWindow {
             ),
             row(
                 "Public internet",
-                Some("Set up a UPnP port mapping so the QR works away from this network"),
+                Some("Via a Cloudflare Tunnel — works away from this network, no router setup"),
                 c,
                 None,
                 toggle("remote-public", self.remote_public, c).on_click(cx.listener(

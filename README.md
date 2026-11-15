@@ -57,9 +57,10 @@ owns every process, PID and file descriptor it creates.
   The pairing code never expires — the first phone spends it and its token reconnects for as
   long as the bridge runs — and the bridge belongs to Kil rather than to the panel, so closing
   Settings leaves it up; **New QR** makes a fresh certificate, code and port for a second phone
-  or a re-pair. Ticking Public internet asks your own router (UPnP) to forward a port and prints
-  a QR for the public IP, so the phone works from anywhere — no cloud service or third party is
-  involved, and the mapping is removed when the bridge stops.
+  or a re-pair. Ticking Public internet opens a Cloudflare Quick Tunnel (`cloudflared` dials
+  out, so no router setup) and prints a QR that works from anywhere; the pinned TLS rides inside
+  the tunnel, so Cloudflare relays ciphertext only, the QR also carries the LAN address for at
+  home, and the tunnel closes when the bridge stops.
 
   While a phone is attached, its tab's row in the sidebar is outlined in the theme's accent and
   carries a small phone badge; when the phone types, both turn solid — driving, not just

@@ -6,6 +6,17 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.39 — 2026-11-15
+
+- **Public internet no longer asks the router for anything.** The Agent on Edge
+  bridge's public mode used to set up a UPnP port mapping, which simply does not
+  exist on routers with UPnP off, behind CGNAT, or behind a second NAT — the QR
+  never worked there. It now opens a Cloudflare Quick Tunnel instead:
+  `cloudflared` dials out (no account, no router setup), the pinned TLS stream
+  rides inside it as ciphertext, and the QR also carries the LAN address, which
+  the phone prefers at home. Needs `cloudflared` (`brew install cloudflared`);
+  the tunnel closes when the bridge stops.
+
 ## 0.0.38 — 2026-11-13
 
 - **The command line is strict.** `kil --help` (`-h`) and `kil --version` (`-V`)
