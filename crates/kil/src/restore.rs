@@ -42,7 +42,19 @@ pub struct SavedTab {
     pub focused: usize,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Index into [`SavedWorkspace::groups`] of the group the tab is in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<usize>,
     pub root: Shape<SavedPane>,
+}
+
+/// A tab group (A30): its tabs name it by index.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedGroup {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,8 +121,13 @@ impl SavedWindow {
 pub struct SavedWorkspace {
     #[serde(default)]
     pub active: usize,
+    /// The sidebar's width, once its edge was dragged (A31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<SavedWindow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<SavedGroup>,
     #[serde(default)]
     pub tabs: Vec<SavedTab>,
 }
@@ -431,6 +448,7 @@ mod tests {
     fn saved_workspace_should_survive_the_file_format() {
         let saved = SavedWorkspace {
             active: 1,
+            sidebar_width: Some(260.),
             window: Some(SavedWindow {
                 x: 10.,
                 y: 20.,
@@ -438,17 +456,23 @@ mod tests {
                 height: 600.,
                 state: WindowState::Maximized,
             }),
+            groups: vec![SavedGroup {
+                name: "服务".to_owned(),
+                collapsed: true,
+            }],
             tabs: vec![
                 SavedTab {
                     name: None,
                     focused: 0,
                     pinned: false,
+                    group: Some(0),
                     root: Shape::Leaf(SavedPane::default()),
                 },
                 SavedTab {
                     name: Some("构建".to_owned()),
                     focused: 1,
                     pinned: true,
+                    group: None,
                     root: Shape::Split {
                         axis: Axis::Horizontal,
                         ratio: 0.3,
@@ -466,6 +490,7 @@ mod tests {
         let text = toml::to_string(&saved).unwrap();
         assert_eq!(text.matches("pinned = ").count(), 1);
         assert!(text.contains("pinned = true"));
+        assert_eq!(text.matches("group = ").count(), 1);
         let store = scratch("format");
         store.save(store.ticket(), &saved, &[]).unwrap();
         let restored = store.load().unwrap().unwrap();
@@ -476,6 +501,9 @@ mod tests {
     fn saved_tab_should_default_to_unpinned_in_an_old_session() {
         let tab: SavedTab = toml::from_str("[root]\n").unwrap();
         assert!(!tab.pinned);
+        assert_eq!(tab.group, None);
+        let saved: SavedWorkspace = toml::from_str("active = 0\n").unwrap();
+        assert_eq!((saved.groups, saved.sidebar_width), (Vec::new(), None));
     }
 
     #[test]
@@ -515,6 +543,7 @@ mod tests {
                 name: None,
                 focused: 0,
                 pinned: false,
+                group: None,
                 root: pane("kept-1", "/", None),
             }],
             ..SavedWorkspace::default()

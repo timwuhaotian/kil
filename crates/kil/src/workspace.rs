@@ -5,6 +5,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     io,
+    ops::Range,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -26,9 +27,11 @@ use crate::{
     motion::{self, Ease, Motion, Tween},
     notify,
     pane_tree::{Axis, Close, Direction, Node, PaneTree, Split, SplitId},
-    restore::{self, PaneIds, Restored, SavedPane, SavedTab, SavedWindow, SavedWorkspace, Store},
+    restore::{
+        self, PaneIds, Restored, SavedGroup, SavedPane, SavedTab, SavedWindow, SavedWorkspace,
+        Store,
+    },
     settings::Settings,
-    terminal_element::cells,
     terminal_pane::{BLINK_INTERVAL, Launch, PaneEvent, TerminalPane},
     text_field::{FieldEvent, TextField},
     theme::{Theme, on_accent},
@@ -68,9 +71,19 @@ actions!(
     ]
 );
 
+/// The sidebar's width until its edge is dragged (A31), and what a double-click on it restores.
 const SIDEBAR_WIDTH: f32 = 220.;
+/// How far the sidebar's edge drags.
+const SIDEBAR_MIN: f32 = 160.;
+const SIDEBAR_MAX: f32 = 400.;
 const SIDEBAR_TOP: f32 = 52.;
 const ROW_HEIGHT: f32 = 44.;
+/// A group's header: one line, lighter than the tab rows under it (A30).
+const GROUP_HEIGHT: f32 = 28.;
+/// How far a group's rows sit in from the others; its rail runs down the middle of the gap.
+const GROUP_INDENT: f32 = 12.;
+/// What a new group, or one whose name was emptied, is called.
+const GROUP_NAME: &str = "Group";
 /// The New Tab button: one line, so it is lighter than the two-line rows above it.
 const NEW_TAB_HEIGHT: f32 = 36.;
 /// The rows' inset from the sidebar's edges.
@@ -103,6 +116,41 @@ const HEAVY_MEMORY: u64 = 512 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TabId(u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GroupId(u64);
+
+/// A named run of unpinned tabs under a header that folds them away (A30). Its tabs are
+/// the ones whose `group` names it; they always sit next to each other in `tabs`, and the
+/// group is dropped when the last of them leaves.
+struct Group {
+    id: GroupId,
+    name: SharedString,
+    collapsed: bool,
+    /// Offset of the header from its place, in pixels, as [`Tab::shift`].
+    shift: Tween,
+}
+
+/// One thing in the tab list: a tab's row, or a group's header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Item {
+    Tab(TabId),
+    Group(GroupId),
+}
+
+/// Where an item rests in the tab list, from the list's top, ignoring its shift.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    item: Item,
+    top: f32,
+    height: f32,
+}
+
+impl Placed {
+    fn bottom(&self) -> f32 {
+        self.top + self.height
+    }
+}
+
 struct Tab {
     id: TabId,
     tree: PaneTree<Entity<TerminalPane>>,
@@ -111,14 +159,18 @@ struct Tab {
     name: Option<SharedString>,
     /// Pinned tabs form a stable group above the others.
     pinned: bool,
+    /// The group the tab is in; never set on a pinned tab.
+    group: Option<GroupId>,
     /// A job ended here while the tab was not in view; cleared when it is.
     finished: bool,
     animating: bool,
     /// What this tab's panes cost the machine; read every [`MEMORY_INTERVAL`].
     memory: u64,
-    /// Offset of the row from its slot, in rows; eases to 0 as it makes room for a dragged
-    /// row, or settles into place after a drop.
+    /// Offset of the row from its slot, in pixels; eases to 0 as it makes room for a
+    /// dragged row, or settles into place after a drop.
     shift: Tween,
+    /// How much of the row shows: 0 while its group is folded away, 1 otherwise.
+    reveal: Tween,
 }
 
 /// What the panes cost, and how the system is doing (DESIGN.md §5.2).
@@ -145,8 +197,8 @@ impl MemoryState {
     }
 }
 
-/// What a sidebar row's status mark shows, most urgent first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a sidebar row's status mark shows, most urgent first (and least in `Ord`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TabStatus {
     /// A pane's program ended badly and its banner is up.
     Failed,
@@ -158,6 +210,22 @@ enum TabStatus {
 }
 
 impl Tab {
+    fn new(id: TabId, tree: PaneTree<Entity<TerminalPane>>, focused: Entity<TerminalPane>) -> Self {
+        Self {
+            id,
+            tree,
+            focused,
+            name: None,
+            pinned: false,
+            group: None,
+            finished: false,
+            animating: false,
+            memory: 0,
+            shift: Tween::settled(0.),
+            reveal: Tween::settled(1.),
+        }
+    }
+
     fn title(&self, cx: &App) -> SharedString {
         self.name
             .clone()
@@ -210,16 +278,16 @@ struct Ghost {
     title: SharedString,
 }
 
-/// The right-click menu of a sidebar row, at the click.
+/// The right-click menu of a sidebar row or group header, at the click.
 #[derive(Clone, Copy)]
 struct TabMenu {
-    tab: TabId,
+    item: Item,
     position: Point<Pixels>,
 }
 
-/// A row whose title is being edited in place.
+/// A row's title, or a group's name, being edited in place.
 struct Rename {
-    tab: TabId,
+    item: Item,
     field: Entity<TextField>,
     _subscription: Subscription,
 }
@@ -231,15 +299,27 @@ struct DividerDrag {
 }
 
 /// A sidebar row being dragged to another place; the row itself moves under the pointer.
+/// Which one is [`Workspace::dragging`]'s.
 #[derive(Clone, Copy)]
-struct TabDrag(TabId);
+struct TabDrag;
 
-/// The row being dragged: where in it the pointer took it, and where its slot is now.
+/// A group's header being dragged, taking the whole group with it.
+#[derive(Clone, Copy)]
+struct GroupDrag;
+
+/// The sidebar's edge being dragged to resize it.
+#[derive(Clone, Copy)]
+struct SidebarDrag;
+
+/// The row or header being dragged: where in it the pointer took it, and where its slot is
+/// now, in the window.
 #[derive(Clone, Copy)]
 struct RowDrag {
-    tab: TabId,
+    item: Item,
     grab: Point<Pixels>,
     slot_top: Pixels,
+    /// The folded group whose header a dragged tab is over: let go, it joins that group.
+    into: Option<GroupId>,
 }
 
 /// The dragged row, lifted off the list: it follows the pointer up and down while the slot
@@ -253,6 +333,8 @@ struct RowPreview {
     chrome: Chrome,
     /// Where across the row it was taken, to keep it in the sidebar's column.
     grab_x: Pixels,
+    /// The row's width, the sidebar's less its insets.
+    width: f32,
 }
 
 impl Render for RowPreview {
@@ -266,7 +348,7 @@ impl Render for RowPreview {
                 .absolute()
                 .left(left)
                 .top_0()
-                .w(px(SIDEBAR_WIDTH - 2. * ROWS_INSET))
+                .w(px(self.width))
                 .h(px(ROW_HEIGHT))
                 .rounded_lg()
                 // The sidebar is translucent; a lifted row is not.
@@ -296,6 +378,48 @@ impl Render for RowPreview {
                                 .when(self.pinned, |row| row.child(pin_mark(chrome))),
                         )
                         .child(row_cwd(self.cwd.clone(), chrome)),
+                ),
+        )
+    }
+}
+
+/// A dragged group's header, lifted off the list folded: the group moves as one line.
+#[derive(Clone)]
+struct GroupPreview {
+    name: SharedString,
+    count: usize,
+    status: TabStatus,
+    chrome: Chrome,
+    grab_x: Pixels,
+    width: f32,
+}
+
+impl Render for GroupPreview {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let chrome = self.chrome;
+        let left = px(ROWS_INSET) - (window.mouse_position().x - self.grab_x);
+        div().child(
+            div()
+                .absolute()
+                .left(left)
+                .top_0()
+                .w(px(self.width))
+                .h(px(GROUP_HEIGHT))
+                .rounded_lg()
+                .bg(Hsla {
+                    a: 1.,
+                    ..chrome.sidebar_bg
+                })
+                .shadow_lg()
+                .child(
+                    group_line(true, chrome)
+                        .size_full()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(chrome.divider)
+                        .bg(chrome.selected)
+                        .child(group_name(self.name.clone(), None, chrome))
+                        .child(group_summary(self.count, self.status, chrome)),
                 ),
         )
     }
@@ -372,7 +496,12 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
     next_tab: u64,
-    /// Offset of the selection pill from the active row, in rows; eases to 0 so the pill
+    /// The tab groups, in no particular order: their tabs' places order them.
+    groups: Vec<Group>,
+    next_group: u64,
+    /// The sidebar's width, as its edge was last dragged (A31).
+    sidebar_width: f32,
+    /// Offset of the selection pill from the active row, in pixels; eases to 0 so the pill
     /// slides from the previous row.
     pill: Tween,
     ghosts: Vec<Ghost>,
@@ -470,6 +599,9 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             next_tab: 0,
+            groups: Vec::new(),
+            next_group: 0,
+            sidebar_width: SIDEBAR_WIDTH,
             pill: Tween::settled(0.),
             ghosts: Vec::new(),
             menu: None,
@@ -561,6 +693,11 @@ impl Workspace {
     ) -> bool {
         let Restored { saved, rerun } = restored;
         let store = self.store.clone();
+        self.sidebar_width = saved
+            .sidebar_width
+            .filter(|width| width.is_finite())
+            .map_or(SIDEBAR_WIDTH, |width| width.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
+        let groups = self.restore_groups(&saved.groups);
         let mut seen = std::collections::HashSet::new();
         let mut held_back = false;
         for tab in saved.tabs {
@@ -596,18 +733,16 @@ impl Workspace {
             let id = TabId(self.next_tab);
             self.next_tab += 1;
             self.tabs.push(Tab {
-                id,
-                tree,
-                focused,
                 name: tab
                     .name
                     .filter(|name| !name.trim().is_empty())
                     .map(Into::into),
                 pinned: tab.pinned,
-                finished: false,
-                animating: false,
-                memory: 0,
-                shift: Tween::settled(0.),
+                group: tab
+                    .group
+                    .and_then(|group| groups.get(group).copied())
+                    .filter(|_| !tab.pinned),
+                ..Tab::new(id, tree, focused)
             });
         }
         if held_back {
@@ -619,18 +754,63 @@ impl Workspace {
         let Some(last) = self.tabs.len().checked_sub(1) else {
             return false;
         };
-        // A hand-edited old save may mix the groups; pinned rows still reopen at the top.
         self.active = saved.active.min(last);
-        let active = self.tabs[self.active].id;
-        self.tabs.sort_by_key(|tab| !tab.pinned);
-        self.active = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == active)
-            .unwrap_or(0);
+        self.gather();
+        // Folded groups reopen folded, without folding as the window opens.
+        for index in 0..self.tabs.len() {
+            let shown = if self.is_shown(index) { 1. } else { 0. };
+            self.tabs[index].reveal.set(shown);
+        }
         // Set first, so the selection pill starts on the row instead of sliding to it.
         self.activate(self.active, window, cx);
         true
+    }
+
+    /// The saved groups, made again; a tab names its group by its index here.
+    fn restore_groups(&mut self, saved: &[SavedGroup]) -> Vec<GroupId> {
+        saved
+            .iter()
+            .map(|group| {
+                let id = GroupId(self.next_group);
+                self.next_group += 1;
+                let name = group.name.trim();
+                self.groups.push(Group {
+                    id,
+                    name: if name.is_empty() { GROUP_NAME } else { name }
+                        .to_owned()
+                        .into(),
+                    collapsed: group.collapsed,
+                    shift: Tween::settled(0.),
+                });
+                id
+            })
+            .collect()
+    }
+
+    /// Puts reopened tabs in a shape the sidebar can show: a hand-edited old save may mix
+    /// the sections or split a group. Pinned rows go to the top, and a group's tabs gather
+    /// where its first one is. The active tab stays active.
+    fn gather(&mut self) {
+        let active = self.tabs.get(self.active).map(|tab| tab.id);
+        let mut first = HashMap::new();
+        let keys: HashMap<TabId, (bool, usize)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let at = tab
+                    .group
+                    .map_or(index, |group| *first.entry(group).or_insert(index));
+                (tab.id, (!tab.pinned, at))
+            })
+            .collect();
+        self.tabs.sort_by_key(|tab| keys[&tab.id]);
+        self.prune_groups();
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| Some(tab.id) == active)
+            .unwrap_or(0);
     }
 
     /// Saves soon, at most once per [`SAVE_INTERVAL`] however much changes, so a crash or a
@@ -697,6 +877,8 @@ impl Workspace {
         let mut screens = Vec::new();
         let mut waiting = false;
         let mut tabs = Vec::with_capacity(self.tabs.len());
+        // In the order the tabs place them.
+        let mut saved_groups: Vec<GroupId> = Vec::new();
         for tab in &self.tabs {
             let root = tab.tree.shape().map(&mut |pane: &Entity<TerminalPane>| {
                 pane.update(cx, |pane, _| {
@@ -708,9 +890,17 @@ impl Workspace {
                     pane.saved()
                 })
             });
+            let group = tab.group.and_then(|group| {
+                let index = saved_groups.iter().position(|&id| id == group);
+                index.or_else(|| {
+                    saved_groups.push(group);
+                    Some(saved_groups.len() - 1)
+                })
+            });
             tabs.push(SavedTab {
                 name: tab.name.as_ref().map(ToString::to_string),
                 pinned: tab.pinned,
+                group,
                 focused: tab
                     .tree
                     .leaves()
@@ -725,7 +915,16 @@ impl Workspace {
         }
         let saved = SavedWorkspace {
             active: self.active,
+            sidebar_width: (self.sidebar_width != SIDEBAR_WIDTH).then_some(self.sidebar_width),
             window: Some(self.frame),
+            groups: saved_groups
+                .iter()
+                .filter_map(|&id| self.group(id))
+                .map(|group| SavedGroup {
+                    name: group.name.to_string(),
+                    collapsed: group.collapsed,
+                })
+                .collect(),
             tabs,
         };
         Some(Snapshot {
@@ -781,46 +980,30 @@ impl Workspace {
         let pane = self.new_pane(launch, window, cx);
         let id = TabId(self.next_tab);
         self.next_tab += 1;
-        self.tabs.push(Tab {
-            id,
-            tree: PaneTree::new(pane.clone()),
-            focused: pane,
-            name: None,
-            pinned: false,
-            finished: false,
-            animating: false,
-            memory: 0,
-            shift: Tween::settled(0.),
-        });
+        self.tabs
+            .push(Tab::new(id, PaneTree::new(pane.clone()), pane));
     }
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(index) else {
+        if index >= self.tabs.len() {
             return;
-        };
-        tab.finished = false;
+        }
         if index != self.active {
             let now = Instant::now();
-            let offset = self.pill.value(now) + cells(self.active) - cells(index);
-            self.pill.set(offset);
-            self.pill.retarget(0., motion::PILL, Ease::OutQuint, now);
+            let tops = self.tops(now);
+            let top = |tab: Option<&Tab>| tab.and_then(|tab| tops.get(&Item::Tab(tab.id)).copied());
+            if let (Some(from), Some(to)) =
+                (top(self.tabs.get(self.active)), top(self.tabs.get(index)))
+            {
+                self.pill.set(self.pill.value(now) + from - to);
+                self.pill.retarget(0., motion::PILL, Ease::OutQuint, now);
+            }
         }
         self.active = index;
+        let tab = &mut self.tabs[index];
+        tab.finished = false;
         window.focus(&tab.focused.focus_handle(cx));
         cx.notify();
-    }
-
-    /// `cmd-1`…`cmd-8` pick that tab if it exists; `cmd-9` (`usize::MAX`) picks the last.
-    /// Puts tab `id` where tab `to` is, within their shared pinned or unpinned group.
-    fn move_tab(&mut self, id: TabId, to: TabId, cx: &mut Context<Self>) {
-        let index = |tabs: &[Tab], id| tabs.iter().position(|tab| tab.id == id);
-        let (Some(from), Some(to)) = (index(&self.tabs, id), index(&self.tabs, to)) else {
-            return;
-        };
-        if self.tabs[from].pinned != self.tabs[to].pinned {
-            return;
-        }
-        self.move_tab_to(from, to, cx);
     }
 
     fn toggle_pin(&mut self, id: TabId, cx: &mut Context<Self>) {
@@ -835,6 +1018,7 @@ impl Workspace {
         self.set_pinned(id, pinned, cx);
     }
 
+    /// Pinning leaves the tab's group: pinned tabs are in none.
     fn set_pinned(&mut self, id: TabId, pinned: bool, cx: &mut Context<Self>) {
         let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
@@ -842,62 +1026,494 @@ impl Workspace {
         if self.tabs[from].pinned == pinned {
             return;
         }
-        self.tabs[from].pinned = pinned;
-        let pinned_count = self.tabs.iter().filter(|tab| tab.pinned).count();
-        // Pin after the existing pinned rows; unpin before the ordinary rows.
-        let to = if pinned {
-            pinned_count - 1
-        } else {
-            pinned_count
-        };
-        self.move_tab_to(from, to, cx);
+        self.rearrange(cx, |this| {
+            this.tabs[from].pinned = pinned;
+            let pinned_count = this.tabs.iter().filter(|tab| tab.pinned).count();
+            // Pin after the existing pinned rows; unpin before the ordinary rows.
+            let to = if pinned {
+                pinned_count - 1
+            } else {
+                pinned_count
+            };
+            this.place_tab(from, to, None);
+        });
     }
 
-    /// Moves a row and keeps the active tab active, sliding the rows between over by one.
-    fn move_tab_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let active = self.tabs[self.active].id;
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        self.active = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == active)
-            .unwrap_or(0);
+    /// Moves tab `from` to `to` (an index once it is out of the list) and into `group`.
+    fn place_tab(&mut self, from: usize, to: usize, group: Option<GroupId>) {
+        let mut tab = self.tabs.remove(from);
+        tab.group = group;
+        self.tabs.insert(to.min(self.tabs.len()), tab);
+    }
+
+    /// Changes the tabs' order or groups, keeping the active tab active. Every row and
+    /// header that moved slides over from where it was (`ROW_SHIFT`) instead of jumping;
+    /// one being dragged stays under the pointer.
+    fn rearrange(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Self)) {
         let now = Instant::now();
-        let (between, by) = if from < to {
-            (from..to, 1.)
-        } else {
-            (to + 1..from + 1, -1.)
-        };
-        for tab in &mut self.tabs[between] {
-            tab.shift.set(tab.shift.value(now) + by);
-            tab.shift
-                .retarget(0., motion::ROW_SHIFT, Ease::OutQuint, now);
+        let before = self.tops(now);
+        let active = self.tabs.get(self.active).map(|tab| tab.id);
+        change(self);
+        self.prune_groups();
+        if let Some(active) = active {
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| tab.id == active)
+                .unwrap_or(0);
+        }
+        let lifted = self.dragging.map(|drag| drag.item);
+        for placed in self.layout(now) {
+            let Some(&was) = before.get(&placed.item) else {
+                continue;
+            };
+            if Some(placed.item) == lifted || (was - placed.top).abs() < 0.5 {
+                continue;
+            }
+            if let Some(shift) = self.shift_mut(placed.item) {
+                shift.set(shift.value(now) + was - placed.top);
+                shift.retarget(0., motion::ROW_SHIFT, Ease::OutQuint, now);
+            }
         }
         cx.notify();
     }
 
-    /// The dragged row was let go: it settles from under the pointer into its slot.
+    fn shift_mut(&mut self, item: Item) -> Option<&mut Tween> {
+        match item {
+            Item::Tab(id) => self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .map(|tab| &mut tab.shift),
+            Item::Group(id) => self.group_mut(id).map(|group| &mut group.shift),
+        }
+    }
+
+    // ── groups ────────────────────────────────────────────────────────────────────────
+
+    fn group(&self, id: GroupId) -> Option<&Group> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    fn group_mut(&mut self, id: GroupId) -> Option<&mut Group> {
+        self.groups.iter_mut().find(|group| group.id == id)
+    }
+
+    /// Where a group's tabs are in `tabs`: they always sit together.
+    fn group_range(&self, id: GroupId) -> Option<Range<usize>> {
+        let start = self.tabs.iter().position(|tab| tab.group == Some(id))?;
+        let len = self.tabs[start..]
+            .iter()
+            .take_while(|tab| tab.group == Some(id))
+            .count();
+        Some(start..start + len)
+    }
+
+    /// The group whose header is being dragged.
+    fn dragged_group(&self) -> Option<GroupId> {
+        match self.dragging?.item {
+            Item::Group(id) => Some(id),
+            Item::Tab(_) => None,
+        }
+    }
+
+    /// Whether tab `index`'s row would show if it were not the active one: a folded group
+    /// keeps its tabs out of sight, and so does a group being dragged.
+    fn shown_unless_active(&self, index: usize) -> bool {
+        match self.tabs[index].group {
+            None => true,
+            Some(id) => {
+                self.dragged_group() != Some(id)
+                    && self.group(id).is_none_or(|group| !group.collapsed)
+            }
+        }
+    }
+
+    /// Whether tab `index`'s row shows. The active tab stays under its folded group's
+    /// header, and a dragged tab keeps its slot.
+    fn is_shown(&self, index: usize) -> bool {
+        let tab = &self.tabs[index];
+        self.shown_unless_active(index)
+            || self
+                .dragging
+                .is_some_and(|drag| drag.item == Item::Tab(tab.id))
+            || (index == self.active && tab.group.is_none_or(|id| self.dragged_group() != Some(id)))
+    }
+
+    /// The tabs whose rows show, in order: what `cmd-1`…`cmd-9` and Next and Previous Tab
+    /// go through, so a folded group stays out of the way.
+    fn shown_tabs(&self) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|&index| self.is_shown(index))
+            .collect()
+    }
+
+    /// Eases each row toward showing or folded away, as its group and the selection say.
+    fn sync_reveal(&mut self, now: Instant) {
+        for index in 0..self.tabs.len() {
+            let to = if self.is_shown(index) { 1. } else { 0. };
+            let reveal = &mut self.tabs[index].reveal;
+            if (reveal.target() - to).abs() > f32::EPSILON {
+                let (duration, ease) = if to > 0. {
+                    (motion::ROW_IN, Ease::OutQuint)
+                } else {
+                    (motion::ROW_OUT, Ease::InOut)
+                };
+                reveal.retarget(to, duration, ease, now);
+            }
+        }
+    }
+
+    /// Drops the groups left without tabs, and the menu or rename that was on one.
+    fn prune_groups(&mut self) {
+        let tabs = &self.tabs;
+        self.groups
+            .retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
+        let gone = |item: Item, groups: &[Group]| match item {
+            Item::Tab(_) => false,
+            Item::Group(id) => groups.iter().all(|group| group.id != id),
+        };
+        if self.menu.is_some_and(|menu| gone(menu.item, &self.groups)) {
+            self.menu = None;
+        }
+        if self
+            .rename
+            .as_ref()
+            .is_some_and(|rename| gone(rename.item, &self.groups))
+        {
+            self.rename = None;
+        }
+    }
+
+    /// New Group from Tab: the tab goes into a group of its own, whose name is then edited.
+    /// A tab taken from another group goes after it, so that group stays in one piece.
+    fn new_group(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        if self.tabs[from].pinned {
+            return;
+        }
+        let group = GroupId(self.next_group);
+        self.next_group += 1;
+        self.groups.push(Group {
+            id: group,
+            name: GROUP_NAME.into(),
+            collapsed: false,
+            shift: Tween::settled(0.),
+        });
+        let to = self.tabs[from]
+            .group
+            .and_then(|old| self.group_range(old))
+            .map_or(from, |range| range.end - 1);
+        self.rearrange(cx, |this| this.place_tab(from, to, Some(group)));
+        self.start_rename(Item::Group(group), window, cx);
+    }
+
+    /// Remove from Group: the tab goes just after its group.
+    fn leave_group(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let Some(range) = self.tabs[from]
+            .group
+            .and_then(|group| self.group_range(group))
+        else {
+            return;
+        };
+        self.rearrange(cx, |this| this.place_tab(from, range.end - 1, None));
+    }
+
+    /// Ungroup: the group goes, and its tabs stay where they are.
+    fn ungroup(&mut self, id: GroupId, cx: &mut Context<Self>) {
+        self.rearrange(cx, |this| {
+            for tab in &mut this.tabs {
+                if tab.group == Some(id) {
+                    tab.group = None;
+                }
+            }
+        });
+    }
+
+    fn toggle_group(&mut self, id: GroupId, cx: &mut Context<Self>) {
+        if let Some(group) = self.group_mut(id) {
+            group.collapsed = !group.collapsed;
+            cx.notify();
+        }
+    }
+
+    // ── the list's layout, and dragging in it ─────────────────────────────────────────
+
+    /// Where each row and header is in the tab list, from its top, without shifts: a row
+    /// folding in or out counts for what shows of it now. Mirrors
+    /// [`Self::render_sidebar`], less the rows of closed tabs animating out.
+    fn layout(&self, now: Instant) -> Vec<Placed> {
+        self.layout_by(|_, tab| ROW_HEIGHT * tab.reveal.value(now).clamp(0., 1.))
+    }
+
+    /// The layout once the rows have folded in or out as they are about to: where a drag
+    /// lands is worked out on this, so it doesn't depend on how far an animation got.
+    fn resting_layout(&self) -> Vec<Placed> {
+        self.layout_by(
+            |index, _| {
+                if self.is_shown(index) { ROW_HEIGHT } else { 0. }
+            },
+        )
+    }
+
+    fn layout_by(&self, row_height: impl Fn(usize, &Tab) -> f32) -> Vec<Placed> {
+        let mut placed = Vec::with_capacity(self.tabs.len() + self.groups.len());
+        let mut top = 0.;
+        let mut run = None;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.group != run {
+                run = tab.group;
+                if let Some(group) = run {
+                    placed.push(Placed {
+                        item: Item::Group(group),
+                        top,
+                        height: GROUP_HEIGHT,
+                    });
+                    top += GROUP_HEIGHT;
+                }
+            }
+            let height = row_height(index, tab);
+            placed.push(Placed {
+                item: Item::Tab(tab.id),
+                top,
+                height,
+            });
+            top += height;
+        }
+        placed
+    }
+
+    fn tops(&self, now: Instant) -> HashMap<Item, f32> {
+        self.layout(now)
+            .into_iter()
+            .map(|placed| (placed.item, placed.top))
+            .collect()
+    }
+
+    /// The group an item belongs to: a header's own, or a tab's.
+    fn group_of(&self, item: Item) -> Option<GroupId> {
+        match item {
+            Item::Group(id) => Some(id),
+            Item::Tab(id) => self.tabs.iter().find(|tab| tab.id == id)?.group,
+        }
+    }
+
+    /// The pointer dragging a row or header is at `y` in the tab list, whose top is at
+    /// `list_top` in the window.
+    fn drag_over(&mut self, y: f32, list_top: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.dragging else {
+            return;
+        };
+        let layout = self.resting_layout();
+        let Some(at) = layout.iter().position(|placed| placed.item == drag.item) else {
+            return;
+        };
+        let over = layout
+            .iter()
+            .position(|placed| placed.height > 0. && placed.top <= y && y < placed.bottom());
+        let into = match drag.item {
+            Item::Tab(id) => self.drag_tab_over(id, &layout, at, over, y, cx),
+            Item::Group(id) => {
+                self.drag_group_over(id, &layout, at, over, y, cx);
+                None
+            }
+        };
+        let slot = self
+            .resting_layout()
+            .into_iter()
+            .find(|placed| placed.item == drag.item)
+            .map_or(0., |placed| placed.top);
+        if let Some(drag) = &mut self.dragging {
+            drag.slot_top = list_top + px(slot);
+            if drag.into != into {
+                drag.into = into;
+                cx.notify();
+            }
+        }
+    }
+
+    /// A dragged tab takes the place of the row it passes, and that row's group with it
+    /// (A30). Past an open group's header it goes in at the top, or back out above it;
+    /// below the last row it goes to the end, in no group. Over a folded group's header it
+    /// stays put, and that group is returned: let go there, it goes in at the end.
+    fn drag_tab_over(
+        &mut self,
+        id: TabId,
+        layout: &[Placed],
+        at: usize,
+        over: Option<usize>,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<GroupId> {
+        let from = self.tabs.iter().position(|tab| tab.id == id)?;
+        let pinned = self.tabs[from].pinned;
+        let Some(over) = over else {
+            let end = layout.last().map_or(0., Placed::bottom);
+            let last = self.tabs.len() - 1;
+            if !pinned && y >= end && (from != last || self.tabs[from].group.is_some()) {
+                self.rearrange(cx, |this| this.place_tab(from, last, None));
+            }
+            return None;
+        };
+        if over == at {
+            return None;
+        }
+        let target = layout[over];
+        // Only once the row would land under the pointer, so it doesn't trade places back
+        // with one taller or shorter than itself.
+        let down = over > at;
+        let height = layout[at].height;
+        let lands = if down {
+            y >= target.bottom() - height
+        } else {
+            y < target.top + height
+        };
+        match target.item {
+            Item::Tab(other) => {
+                let to = self.tabs.iter().position(|tab| tab.id == other)?;
+                if self.tabs[to].pinned == pinned && lands {
+                    let group = self.tabs[to].group;
+                    self.rearrange(cx, |this| this.place_tab(from, to, group));
+                }
+                None
+            }
+            Item::Group(group) => {
+                if pinned {
+                    return None;
+                }
+                if self.group(group).is_some_and(|group| group.collapsed) {
+                    return Some(group);
+                }
+                if lands {
+                    self.rearrange(cx, |this| {
+                        let tab = this.tabs.remove(from);
+                        let first = this
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.group == Some(group))
+                            .unwrap_or(from);
+                        this.tabs.insert(first, tab);
+                        this.tabs[first].group = down.then_some(group);
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    /// A dragged group moves as one: past a tab out of any group, or past a whole other
+    /// group, never into one, and never among the pinned tabs.
+    fn drag_group_over(
+        &mut self,
+        id: GroupId,
+        layout: &[Placed],
+        at: usize,
+        over: Option<usize>,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range) = self.group_range(id) else {
+            return;
+        };
+        let Some(over) = over else {
+            let end = layout.last().map_or(0., Placed::bottom);
+            if y >= end && range.end != self.tabs.len() {
+                self.rearrange(cx, |this| {
+                    let moved: Vec<Tab> = this.tabs.drain(range).collect();
+                    this.tabs.extend(moved);
+                });
+            }
+            return;
+        };
+        let target = self.group_of(layout[over].item);
+        if target == Some(id) {
+            return;
+        }
+        // The block the pointer is over, in the layout and in `tabs`.
+        let block = if let Some(other) = target {
+            let first = layout
+                .iter()
+                .position(|placed| placed.item == Item::Group(other));
+            let last = layout
+                .iter()
+                .rposition(|placed| self.group_of(placed.item) == Some(other));
+            first.zip(last).zip(self.group_range(other))
+        } else {
+            let index = match layout[over].item {
+                Item::Tab(other) => self.tabs.iter().position(|tab| tab.id == other),
+                Item::Group(_) => None,
+            };
+            index
+                .filter(|&index| !self.tabs[index].pinned)
+                .map(|index| ((over, over), index..index + 1))
+        };
+        let Some(((first, last), tabs)) = block else {
+            return;
+        };
+        let down = first > at;
+        let height = layout[at].height;
+        let lands = if down {
+            y >= layout[last].bottom() - height
+        } else {
+            y < layout[first].top + height
+        };
+        if !lands {
+            return;
+        }
+        self.rearrange(cx, |this| {
+            let moved: Vec<Tab> = this.tabs.drain(range.clone()).collect();
+            let to = if down {
+                tabs.end - moved.len()
+            } else {
+                tabs.start
+            };
+            this.tabs.splice(to..to, moved);
+        });
+    }
+
+    /// The dragged row or header was let go: it settles from under the pointer into its
+    /// slot. A tab let go on a folded group's header goes in at the group's end instead.
     fn drop_row(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(drag) = self.dragging.take() else {
             return;
         };
+        if let (Item::Tab(id), Some(group)) = (drag.item, drag.into) {
+            let from = self.tabs.iter().position(|tab| tab.id == id);
+            if let (Some(from), Some(range)) = (from, self.group_range(group)) {
+                let to = if from < range.end {
+                    range.end - 1
+                } else {
+                    range.end
+                };
+                self.rearrange(cx, |this| this.place_tab(from, to, Some(group)));
+            }
+            cx.notify();
+            return;
+        }
         let top = window.mouse_position().y - drag.grab.y;
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == drag.tab) {
-            let now = Instant::now();
-            tab.shift.set((top - drag.slot_top) / px(ROW_HEIGHT));
-            tab.shift
-                .retarget(0., motion::ROW_DROP, Ease::OutQuint, now);
+        if let Some(shift) = self.shift_mut(drag.item) {
+            shift.set((top - drag.slot_top) / px(1.));
+            shift.retarget(0., motion::ROW_DROP, Ease::OutQuint, Instant::now());
         }
         cx.notify();
     }
 
+    /// `cmd-1`…`cmd-8` pick that shown tab if it exists; `cmd-9` (`usize::MAX`) picks the
+    /// last. Tabs folded away in a group are skipped.
     fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let last = self.tabs.len().saturating_sub(1);
-        if index == usize::MAX {
-            self.activate(last, window, cx);
-        } else if index <= last {
-            self.activate(index, window, cx);
+        let shown = self.shown_tabs();
+        let pick = if index == usize::MAX {
+            shown.last()
+        } else {
+            shown.get(index)
+        };
+        if let Some(&pick) = pick {
+            self.activate(pick, window, cx);
         }
     }
 
@@ -964,19 +1580,25 @@ impl Workspace {
     }
 
     fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let was_at = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| self.tops(now).get(&Item::Tab(tab.id)).copied());
         let tab = self.tabs.remove(index);
         for pane in tab.tree.leaves() {
             pane.update(cx, |pane, _| pane.shutdown());
             self.pane_subscriptions.remove(&pane.entity_id());
         }
-        self.menu = self.menu.filter(|menu| menu.tab != tab.id);
+        self.menu = self.menu.filter(|menu| menu.item != Item::Tab(tab.id));
         if self
             .rename
             .as_ref()
-            .is_some_and(|rename| rename.tab == tab.id)
+            .is_some_and(|rename| rename.item == Item::Tab(tab.id))
         {
             self.rename = None;
         }
+        self.prune_groups();
         let after = index
             .checked_sub(1)
             .and_then(|i| self.tabs.get(i))
@@ -1006,20 +1628,27 @@ impl Workspace {
             cx.quit();
             return;
         }
-        if index < self.active || (index == self.active && index == self.tabs.len()) {
-            // The active row moved up one, or the last tab closed and its predecessor takes over.
-            let removed_active = index == self.active;
+        if index < self.active {
+            // The active row moved up one.
             self.active -= 1;
-            if removed_active {
-                self.pill.set(1.);
-                self.pill
-                    .retarget(0., motion::ROW_OUT, Ease::InOut, Instant::now());
-            }
         } else if index == self.active {
-            // The next row slides up into place while the ghost shrinks above it.
-            self.pill.set(-1.);
-            self.pill
-                .retarget(0., motion::ROW_OUT, Ease::InOut, Instant::now());
+            // The next row takes over, or the previous one after the last tab. A row folded
+            // away in a group is passed over for the nearest one that shows.
+            let mut next = index.min(self.tabs.len() - 1);
+            if !self.shown_unless_active(next) {
+                let shown = (next..self.tabs.len())
+                    .chain((0..next).rev())
+                    .find(|&other| self.shown_unless_active(other));
+                next = shown.unwrap_or(next);
+            }
+            self.active = next;
+            // The pill slides from the closed row, which shrinks above a row below it.
+            let below = if next >= index { ROW_HEIGHT } else { 0. };
+            let now_at = self.tops(now).get(&Item::Tab(self.tabs[next].id)).copied();
+            if let (Some(was), Some(now_at)) = (was_at, now_at) {
+                self.pill.set(was - now_at - below);
+                self.pill.retarget(0., motion::ROW_OUT, Ease::InOut, now);
+            }
         }
         let next = &mut self.tabs[self.active];
         next.finished = false;
@@ -1032,12 +1661,12 @@ impl Workspace {
 
     fn open_menu(
         &mut self,
-        tab: TabId,
+        item: Item,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.menu = Some(TabMenu { tab, position });
+        self.menu = Some(TabMenu { item, position });
         window.focus(&self.menu_focus);
         cx.notify();
     }
@@ -1055,27 +1684,30 @@ impl Workspace {
         }
     }
 
-    fn start_rename(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == id)
-            .map(|t| t.title(cx))
-        else {
+    fn start_rename(&mut self, item: Item, window: &mut Window, cx: &mut Context<Self>) {
+        let title = match item {
+            Item::Tab(id) => self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|t| t.title(cx)),
+            Item::Group(id) => self.group(id).map(|group| group.name.clone()),
+        };
+        let Some(title) = title else {
             return;
         };
         let field = cx.new(|cx| TextField::new(&title, window, cx));
         let subscription = cx.subscribe_in(&field, window, Self::end_rename);
         window.focus(&field.focus_handle(cx));
         self.rename = Some(Rename {
-            tab: id,
+            item,
             field,
             _subscription: subscription,
         });
         cx.notify();
     }
 
-    /// An empty name gives the row back to the pane's title.
+    /// An empty name gives the row back to the pane's title, and a group its default name.
     fn end_rename(
         &mut self,
         field: &Entity<TextField>,
@@ -1088,10 +1720,15 @@ impl Workspace {
         };
         if let FieldEvent::Confirmed(text) = event {
             let name = text.trim();
-            self.set_name(
-                rename.tab,
-                (!name.is_empty()).then(|| name.to_owned().into()),
-            );
+            let name = (!name.is_empty()).then(|| SharedString::from(name.to_owned()));
+            match rename.item {
+                Item::Tab(id) => self.set_name(id, name),
+                Item::Group(id) => {
+                    if let Some(group) = self.group_mut(id) {
+                        group.name = name.unwrap_or_else(|| GROUP_NAME.into());
+                    }
+                }
+            }
         }
         // Enter or Escape: back to the terminal. A click elsewhere already moved focus.
         if field.focus_handle(cx).is_focused(window) {
@@ -1647,15 +2284,20 @@ impl Workspace {
         }
     }
 
-    /// The active row's child index in the tab list: past the leading ghosts and the
-    /// rows (with their ghosts) above it. Mirrors [`Self::render_sidebar`].
+    /// The active row's child index in the tab list: past the leading ghosts, and the
+    /// headers and rows (with their ghosts) above it. Mirrors [`Self::render_sidebar`].
     fn active_child_index(&self) -> usize {
         let mut index = self
             .ghosts
             .iter()
             .filter(|ghost| ghost.after.is_none())
             .count();
+        let mut run = None;
         for (position, tab) in self.tabs.iter().enumerate() {
+            if tab.group != run {
+                run = tab.group;
+                index += usize::from(run.is_some_and(|id| self.group(id).is_some()));
+            }
             if position == self.active {
                 break;
             }
@@ -1669,10 +2311,39 @@ impl Workspace {
         index
     }
 
+    /// The pointer dragging a row or header moved; `bounds` are the tab list's.
+    fn drag_moved(
+        &mut self,
+        bounds: gpui::Bounds<Pixels>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let top = bounds.top() + self.tabs_scroll.offset().y;
+        self.drag_over((position.y - top) / px(1.), top, cx);
+    }
+
+    fn set_sidebar_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+        if (width - self.sidebar_width).abs() >= 0.5 {
+            self.sidebar_width = width;
+            cx.notify();
+        }
+    }
+
     /// What [`Sidebar`] draws.
-    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
-        if self.pill.is_animating(now) || self.tabs.iter().any(|tab| tab.shift.is_animating(now)) {
+        self.sync_reveal(now);
+        if self.pill.is_animating(now)
+            || self
+                .tabs
+                .iter()
+                .any(|tab| tab.shift.is_animating(now) || tab.reveal.is_animating(now))
+            || self
+                .groups
+                .iter()
+                .any(|group| group.shift.is_animating(now))
+        {
             // Asked from the sidebar's render, so it is the sidebar that draws the next frame.
             window.request_animation_frame();
         }
@@ -1689,7 +2360,14 @@ impl Workspace {
             .filter(|ghost| ghost.after.is_none())
             .map(|ghost| render_ghost(ghost, chrome, cx))
             .collect();
+        let mut run = None;
         for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.group != run {
+                run = tab.group;
+                if let Some(group) = run.and_then(|id| self.group(id)) {
+                    rows.push(self.render_group(group, now, chrome, cx));
+                }
+            }
             rows.push(self.render_row(index, tab, now, chrome, cx));
             rows.extend(
                 self.ghosts
@@ -1699,7 +2377,7 @@ impl Workspace {
             );
         }
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .h_full()
             .flex_none()
             .flex()
@@ -1735,6 +2413,16 @@ impl Workspace {
                             this.new_tab(&NewTab, window, cx);
                         }
                     }))
+                    // Where a dragged row or header goes is worked out from the list's
+                    // layout as a whole: a header and a row differ in height.
+                    .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                        this.drag_moved(event.bounds, event.event.position, cx);
+                    }))
+                    .on_drag_move(
+                        cx.listener(|this, event: &DragMoveEvent<GroupDrag>, _, cx| {
+                            this.drag_moved(event.bounds, event.event.position, cx);
+                        }),
+                    )
                     .children(rows),
             )
             .child(memory_footer(self.memory, chrome))
@@ -1755,12 +2443,13 @@ impl Workspace {
         let editing = self
             .rename
             .as_ref()
-            .filter(|rename| rename.tab == id)
+            .filter(|rename| rename.item == Item::Tab(id))
             .map(|rename| rename.field.clone());
         let status = tab.status(cx);
         let presence = Presence::of(tab, cx);
         let active = index == self.active;
-        let lifted = cx.has_active_drag() && self.dragging.is_some_and(|drag| drag.tab == id);
+        let lifted =
+            cx.has_active_drag() && self.dragging.is_some_and(|drag| drag.item == Item::Tab(id));
         let preview = RowPreview {
             title: title.clone(),
             cwd: info.cwd.clone(),
@@ -1768,39 +2457,27 @@ impl Workspace {
             pinned: tab.pinned,
             chrome,
             grab_x: px(0.),
+            width: self.sidebar_width - 2. * ROWS_INSET,
         };
-        let pill = (active && !lifted).then(|| {
-            div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .top(px(ROW_HEIGHT * self.pill.value(now)))
-                .h(px(ROW_HEIGHT))
-                .rounded_lg()
-                .bg(chrome.selected)
-        });
+        let pill = (active && !lifted).then(|| selection_pill(self.pill.value(now), chrome));
+        // What shows of the row while its group folds or unfolds.
+        let reveal = tab.reveal.value(now).clamp(0., 1.);
         let row = div()
             .id(ElementId::NamedInteger("tab".into(), id.0))
             .group("tab-row");
         // Not while renaming: a drag in the field selects its text.
-        let row = reorderable(row, id, editing.is_none().then_some(preview), cx)
+        let row = draggable(row, id, editing.is_none().then_some(preview), cx)
             .relative()
-            .top(px(ROW_HEIGHT * tab.shift.value(now)))
+            .top(px(tab.shift.value(now)))
             .flex_none()
-            .h(px(ROW_HEIGHT))
+            .h(px(ROW_HEIGHT * reveal))
+            .when(reveal < 1., |row| row.overflow_hidden().opacity(reveal))
+            .when(tab.group.is_some(), |row| {
+                row.ml(px(GROUP_INDENT)).child(group_rail(chrome))
+            })
             .rounded_lg();
         if lifted {
-            // The open slot the lifted row will drop into.
-            return row
-                .child(
-                    div()
-                        .size_full()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(chrome.accent.opacity(0.5))
-                        .bg(chrome.hover),
-                )
-                .into_any_element();
+            return row.child(open_slot(chrome)).into_any_element();
         }
         let row = row
             .px_3()
@@ -1813,11 +2490,15 @@ impl Workspace {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
                 // Clicks inside the title being edited belong to the field.
-                if this.rename.as_ref().is_some_and(|rename| rename.tab == id) {
+                if this
+                    .rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.item == Item::Tab(id))
+                {
                     return;
                 }
                 if event.click_count() == 2 {
-                    this.start_rename(id, window, cx);
+                    this.start_rename(Item::Tab(id), window, cx);
                 } else {
                     this.activate_id(id, window, cx);
                 }
@@ -1826,7 +2507,7 @@ impl Workspace {
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.open_menu(id, event.position, window, cx);
+                    this.open_menu(Item::Tab(id), event.position, window, cx);
                 }),
             )
             .children(pill)
@@ -1851,7 +2532,118 @@ impl Workspace {
                     .child(tab_close(id, chrome, cx)),
             )
             .child(row_cwd(info.cwd, chrome).relative());
-        animate_row_in(row, id)
+        animate_row_in(row, id, reveal)
+    }
+
+    /// A group's header: click folds or unfolds it, a double-click names it, and a drag
+    /// moves the whole group. Folded, it shows how many tabs it holds and their most
+    /// urgent mark.
+    fn render_group(
+        &self,
+        group: &Group,
+        now: Instant,
+        chrome: Chrome,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = group.id;
+        let editing = self
+            .rename
+            .as_ref()
+            .filter(|rename| rename.item == Item::Group(id))
+            .map(|rename| rename.field.clone());
+        let dragging = self.dragging.filter(|_| cx.has_active_drag());
+        let lifted = dragging.is_some_and(|drag| drag.item == Item::Group(id));
+        let into = dragging.is_some_and(|drag| drag.into == Some(id));
+        let (count, status) = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.group == Some(id))
+            .fold((0, TabStatus::Idle), |(count, status), tab| {
+                (count + 1, status.min(tab.status(cx)))
+            });
+        let header = div()
+            .id(ElementId::NamedInteger("group".into(), id.0))
+            .debug_selector(move || format!("group-{}", id.0))
+            .relative()
+            .top(px(group.shift.value(now)))
+            .flex_none()
+            .h(px(GROUP_HEIGHT))
+            .rounded_lg();
+        if lifted {
+            return header.child(open_slot(chrome)).into_any_element();
+        }
+        let preview = GroupPreview {
+            name: group.name.clone(),
+            count,
+            status,
+            chrome,
+            grab_x: px(0.),
+            width: self.sidebar_width - 2. * ROWS_INSET,
+        };
+        let workspace = cx.entity().downgrade();
+        header
+            .when(editing.is_none(), |header| {
+                header.on_drag(GroupDrag, move |_, grab, _, cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.dragging = Some(RowDrag {
+                            item: Item::Group(id),
+                            grab,
+                            slot_top: px(0.),
+                            into: None,
+                        });
+                        cx.notify();
+                    });
+                    let preview = GroupPreview {
+                        grab_x: grab.x,
+                        ..preview.clone()
+                    };
+                    cx.new(|_| preview)
+                })
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(chrome.hover))
+            // A dragged tab over it goes in when let go.
+            .when(into, |header| {
+                header
+                    .bg(chrome.hover)
+                    .border_1()
+                    .border_color(chrome.accent)
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                if this
+                    .rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.item == Item::Group(id))
+                {
+                    return;
+                }
+                match event.click_count() {
+                    1 => this.toggle_group(id, cx),
+                    // The first click folded it; put that back, and name it.
+                    2 => {
+                        this.toggle_group(id, cx);
+                        this.start_rename(Item::Group(id), window, cx);
+                    }
+                    _ => {}
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_menu(Item::Group(id), event.position, window, cx);
+                }),
+            )
+            .child(
+                group_line(group.collapsed, chrome)
+                    .size_full()
+                    .child(group_name(group.name.clone(), editing, chrome))
+                    .when(group.collapsed, |line| {
+                        line.child(group_summary(count, status, chrome))
+                    }),
+            )
+            .into_any_element()
     }
 }
 
@@ -1862,32 +2654,6 @@ impl Workspace {
         chrome: Chrome,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let id = menu.tab;
-        let named = self
-            .tabs
-            .iter()
-            .any(|tab| tab.id == id && tab.name.is_some());
-        let pinned = self.tabs.iter().any(|tab| tab.id == id && tab.pinned);
-        let item = |key: &'static str,
-                    label: &'static str,
-                    run: fn(&mut Self, TabId, &mut Window, &mut Context<Self>),
-                    cx: &mut Context<Self>| {
-            div()
-                .id(key)
-                .debug_selector(move || key.to_owned())
-                .h(px(26.))
-                .px_2()
-                .flex()
-                .items_center()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|style| style.bg(chrome.accent).text_color(on_accent()))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.close_menu(window, cx);
-                    run(this, id, window, cx);
-                }))
-                .child(label)
-        };
         let panel = div()
             .id("tab-menu")
             .track_focus(&self.menu_focus)
@@ -1913,14 +2679,66 @@ impl Workspace {
                     cx.stop_propagation();
                     this.close_menu(window, cx);
                 }
-            }))
+            }));
+        let panel = match menu.item {
+            Item::Tab(id) => self.tab_menu(panel, id, chrome, cx),
+            Item::Group(id) => {
+                let item = |key, label, run: MenuAction<GroupId>, cx: &mut Context<Self>| {
+                    menu_item(key, label, id, run, chrome, cx)
+                };
+                panel
+                    .child(item(
+                        "menu-rename-group",
+                        "Rename Group…",
+                        |this, id, window, cx| this.start_rename(Item::Group(id), window, cx),
+                        cx,
+                    ))
+                    .child(item(
+                        "menu-ungroup",
+                        "Ungroup",
+                        |this, id, _, cx| this.ungroup(id, cx),
+                        cx,
+                    ))
+            }
+        };
+        deferred(
+            anchored()
+                .position(menu.position)
+                .snap_to_window_with_margin(px(8.))
+                .child(panel),
+        )
+        .with_priority(1)
+    }
+
+    /// A row's menu: Pin or Unpin, Rename, Reset Name, the group entries, Close.
+    fn tab_menu(
+        &self,
+        panel: Stateful<Div>,
+        id: TabId,
+        chrome: Chrome,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let tab = self.tabs.iter().find(|tab| tab.id == id);
+        let named = tab.is_some_and(|tab| tab.name.is_some());
+        let pinned = tab.is_some_and(|tab| tab.pinned);
+        let grouped = tab.is_some_and(|tab| tab.group.is_some());
+        let item = |key, label, run: MenuAction<TabId>, cx: &mut Context<Self>| {
+            menu_item(key, label, id, run, chrome, cx)
+        };
+        let separator = || div().my_1().mx_2().h(px(1.)).bg(chrome.divider);
+        panel
             .child(item(
                 "menu-pin",
                 if pinned { "Unpin Tab" } else { "Pin Tab" },
                 |this, id, _, cx| this.toggle_pin(id, cx),
                 cx,
             ))
-            .child(item("menu-rename", "Rename Tab…", Self::start_rename, cx))
+            .child(item(
+                "menu-rename",
+                "Rename Tab…",
+                |this, id, window, cx| this.start_rename(Item::Tab(id), window, cx),
+                cx,
+            ))
             .when(named, |panel| {
                 panel.child(item(
                     "menu-reset-name",
@@ -1932,16 +2750,56 @@ impl Workspace {
                     cx,
                 ))
             })
-            .child(div().my_1().mx_2().h(px(1.)).bg(chrome.divider))
-            .child(item("menu-close", "Close Tab", Self::close_tab_id, cx));
-        deferred(
-            anchored()
-                .position(menu.position)
-                .snap_to_window_with_margin(px(8.))
-                .child(panel),
-        )
-        .with_priority(1)
+            // Pinned tabs are in no group.
+            .when(!pinned, |panel| {
+                panel
+                    .child(separator())
+                    .child(item(
+                        "menu-new-group",
+                        "New Group from Tab",
+                        Self::new_group,
+                        cx,
+                    ))
+                    .when(grouped, |panel| {
+                        panel.child(item(
+                            "menu-leave-group",
+                            "Remove from Group",
+                            |this, id, _, cx| this.leave_group(id, cx),
+                            cx,
+                        ))
+                    })
+            })
+            .child(separator())
+            .child(item("menu-close", "Close Tab", Self::close_tab_id, cx))
     }
+}
+
+/// What a menu entry does to the row or group it was opened on.
+type MenuAction<T> = fn(&mut Workspace, T, &mut Window, &mut Context<Workspace>);
+
+fn menu_item<T: Copy + 'static>(
+    key: &'static str,
+    label: &'static str,
+    target: T,
+    run: MenuAction<T>,
+    chrome: Chrome,
+    cx: &mut Context<Workspace>,
+) -> Stateful<Div> {
+    div()
+        .id(key)
+        .debug_selector(move || key.to_owned())
+        .h(px(26.))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|style| style.bg(chrome.accent).text_color(on_accent()))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.close_menu(window, cx);
+            run(this, target, window, cx);
+        }))
+        .child(label)
 }
 
 /// Runs `Quit` in the terminal window, for when another window (Settings) has focus. With the
@@ -2338,15 +3196,21 @@ impl Workspace {
         );
     }
 
+    /// Through the tabs that show: a folded group's tabs are skipped.
     fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.tabs.len();
+        let shown = self.shown_tabs();
+        let count = shown.len();
         if count > 1 {
+            let at = shown
+                .iter()
+                .position(|&index| index == self.active)
+                .unwrap_or(0);
             let next = if forward {
-                (self.active + 1) % count
+                (at + 1) % count
             } else {
-                (self.active + count - 1) % count
+                (at + count - 1) % count
             };
-            self.activate(next, window, cx);
+            self.activate(shown[next], window, cx);
         }
     }
 }
@@ -2355,9 +3219,9 @@ fn split_id_bits(tab: TabId, split: SplitId) -> u64 {
     (tab.0 << 32) ^ split.bits()
 }
 
-/// Lets `row` be dragged (when it has a `preview`, the row lifted) and takes the dragged
-/// tab's place when the pointer passes over it.
-fn reorderable(
+/// Lets `row` be dragged when it has a `preview`, the row lifted. Where it goes is the
+/// tab list's to work out ([`Workspace::drag_over`]).
+fn draggable(
     row: Stateful<Div>,
     id: TabId,
     preview: Option<RowPreview>,
@@ -2365,12 +3229,13 @@ fn reorderable(
 ) -> Stateful<Div> {
     let workspace = cx.entity().downgrade();
     row.when_some(preview, |row, preview| {
-        row.on_drag(TabDrag(id), move |_, grab, _, cx| {
+        row.on_drag(TabDrag, move |_, grab, _, cx| {
             let _ = workspace.update(cx, |this, cx| {
                 this.dragging = Some(RowDrag {
-                    tab: id,
+                    item: Item::Tab(id),
                     grab,
                     slot_top: px(0.),
+                    into: None,
                 });
                 cx.notify();
             });
@@ -2381,33 +3246,110 @@ fn reorderable(
             cx.new(|_| preview)
         })
     })
-    .on_drag_move(
-        cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
-            let TabDrag(dragged) = *event.drag(cx);
-            let (y, row) = (event.event.position.y, event.bounds);
-            if dragged == id {
-                if let Some(drag) = &mut this.dragging {
-                    drag.slot_top = row.top();
-                }
-                return;
+}
+
+/// The active row's highlight, `offset` pixels from the row while it slides over.
+fn selection_pill(offset: f32, chrome: Chrome) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(offset))
+        .h(px(ROW_HEIGHT))
+        .rounded_lg()
+        .bg(chrome.selected)
+}
+
+/// The open slot a lifted row or header will drop into.
+fn open_slot(chrome: Chrome) -> Div {
+    div()
+        .size_full()
+        .rounded_lg()
+        .border_1()
+        .border_color(chrome.accent.opacity(0.5))
+        .bg(chrome.hover)
+}
+
+/// The line down the left of a group's rows, under its header's fold mark.
+fn group_rail(chrome: Chrome) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(-GROUP_INDENT / 2. - 0.5))
+        .w(px(1.))
+        .bg(chrome.divider)
+}
+
+/// A group header's line: the fold mark, centered over the rail, then what the caller adds.
+fn group_line(collapsed: bool, chrome: Chrome) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(TITLE_INSET - STATUS_SLOT))
+        .pl(px((GROUP_INDENT - STATUS_SLOT) / 2.))
+        .pr_3()
+        .child(
+            div()
+                .flex_none()
+                .size(px(STATUS_SLOT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.))
+                .text_color(chrome.muted)
+                .child(if collapsed { "▸" } else { "▾" }),
+        )
+}
+
+/// A group's name, or the field editing it.
+fn group_name(name: SharedString, editing: Option<Entity<TextField>>, chrome: Chrome) -> Div {
+    let name_box = div()
+        .flex_1()
+        .min_w_0()
+        .text_size(px(12.))
+        .font_weight(FontWeight::SEMIBOLD);
+    match editing {
+        Some(field) => name_box.text_color(chrome.text).child(field),
+        None => name_box.truncate().text_color(chrome.muted).child(name),
+    }
+}
+
+/// What a folded group holds: how many tabs, and the most urgent of their marks.
+fn group_summary(count: usize, status: TabStatus, chrome: Chrome) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(11.))
+        .text_color(chrome.muted)
+        .child(count.to_string())
+        .when(status != TabStatus::Idle, |summary| {
+            summary.child(status_mark(status, chrome))
+        })
+}
+
+/// The sidebar's right edge: dragging it resizes the sidebar, and a double-click puts it
+/// back to its usual width (A31).
+fn sidebar_edge(width: f32, cx: &mut Context<Workspace>) -> impl IntoElement {
+    div()
+        .id("sidebar-edge")
+        .debug_selector(|| "sidebar-edge".to_owned())
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(width - 3.))
+        .w(px(6.))
+        .cursor(CursorStyle::ResizeLeftRight)
+        // The pane under its right half doesn't take the press.
+        .occlude()
+        .on_drag(SidebarDrag, |_, _, _, cx| cx.new(|_| EmptyDrag))
+        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+            if event.click_count() == 2 {
+                this.set_sidebar_width(SIDEBAR_WIDTH, cx);
             }
-            // Where the row rests, not where it is sliding through: a row sliding away under
-            // the pointer would be passed again, and the two would trade places back and forth.
-            let Some(shift) = this
-                .tabs
-                .iter()
-                .find(|tab| tab.id == id)
-                .map(|tab| px(ROW_HEIGHT * tab.shift.value(Instant::now())))
-            else {
-                return;
-            };
-            let top = row.top() - shift;
-            // Rows are one height, so the dragged row lands under the pointer and stays.
-            if top <= y && y < top + px(ROW_HEIGHT) {
-                this.move_tab(dragged, id, cx);
-            }
-        }),
-    )
+        }))
 }
 
 /// A pushpin in a pinned row's title line, drawn so Kil needs no icon font.
@@ -2750,13 +3692,14 @@ fn row_cwd(cwd: SharedString, chrome: Chrome) -> Div {
         .child(cwd)
 }
 
-/// A new row, grown in unless motion is off (then at full height at once).
-fn animate_row_in(row: Stateful<Div>, id: TabId) -> AnyElement {
+/// A new row, grown in unless motion is off (then at full height at once), to the part of
+/// it that shows (`reveal`) while its group folds or unfolds.
+fn animate_row_in(row: Stateful<Div>, id: TabId, reveal: f32) -> AnyElement {
     if Motion::enabled() {
         row.with_animation(
             ElementId::NamedInteger("tab-in".into(), id.0),
             Animation::new(motion::ROW_IN).with_easing(|t| Ease::OutQuint.apply(t)),
-            |row, t| row.h(px(ROW_HEIGHT * t)).opacity(t),
+            move |row, t| row.h(px(ROW_HEIGHT * t * reveal)).opacity(t * reveal),
         )
         .into_any_element()
     } else {
@@ -2875,6 +3818,54 @@ select_tab_handlers!(
     SelectTab6 => 5, SelectTab7 => 6, SelectTab8 => 7, SelectTab9 => usize::MAX,
 );
 
+impl Workspace {
+    /// Notices at the top right of the tab; a click clears them.
+    fn render_notices(
+        &self,
+        window: &Window,
+        chrome: Chrome,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        (!self.notices.is_empty()).then(|| {
+            // Wide enough for a sentence, but never over the sidebar in a narrow window.
+            let room = window.viewport_size().width - px(self.sidebar_width + 24.);
+            let max_notice = if room < px(0.) {
+                px(0.)
+            } else if room < px(460.) {
+                room
+            } else {
+                px(460.)
+            };
+            div()
+                .id("notices")
+                .absolute()
+                .top(px(SPLIT_BUTTONS_HEIGHT + 16.))
+                .right_3()
+                .max_w(max_notice)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .cursor_pointer()
+                .occlude()
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.notices.clear();
+                    cx.notify();
+                }))
+                .children(self.notices.iter().map(|notice| {
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(chrome.banner)
+                        .text_size(px(12.))
+                        .text_color(chrome.text)
+                        .child(notice.clone())
+                }))
+        })
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
@@ -2910,56 +3901,28 @@ impl Render for Workspace {
             ));
             animate_tab_show(base, tab.id)
         });
-        let notices = (!self.notices.is_empty()).then(|| {
-            // Wide enough for a sentence, but never over the sidebar in a narrow window.
-            let room = window.viewport_size().width - px(SIDEBAR_WIDTH + 24.);
-            let max_notice = if room < px(0.) {
-                px(0.)
-            } else if room < px(460.) {
-                room
-            } else {
-                px(460.)
-            };
-            div()
-                .id("notices")
-                .absolute()
-                .top(px(SPLIT_BUTTONS_HEIGHT + 16.))
-                .right_3()
-                .max_w(max_notice)
-                .flex()
-                .flex_col()
-                .gap_2()
-                .cursor_pointer()
-                .occlude()
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.notices.clear();
-                    cx.notify();
-                }))
-                .children(self.notices.iter().map(|notice| {
-                    div()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(chrome.banner)
-                        .text_size(px(12.))
-                        .text_color(chrome.text)
-                        .child(notice.clone())
-                }))
-        });
+        let notices = self.render_notices(window, chrome, cx);
 
         let root = div()
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus_handle);
         let root = select_tab_listeners(bind_actions(root, cx), cx);
-        root.flex()
+        root.relative()
+            .flex()
             .size_full()
             .on_drop(cx.listener(|this, _: &TabDrag, window, cx| this.drop_row(window, cx)))
+            .on_drop(cx.listener(|this, _: &GroupDrag, window, cx| this.drop_row(window, cx)))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<SidebarDrag>, _, cx| {
+                    let x = event.event.position.x - event.bounds.left();
+                    this.set_sidebar_width(x / px(1.), cx);
+                }),
+            )
             .child(
                 AnyView::from(self.sidebar.clone()).cached(
                     StyleRefinement::default()
-                        .w(px(SIDEBAR_WIDTH))
+                        .w(px(self.sidebar_width))
                         .h_full()
                         .flex_none(),
                 ),
@@ -2976,6 +3939,7 @@ impl Render for Workspace {
                     })
                     .children(notices),
             )
+            .child(sidebar_edge(self.sidebar_width, cx))
             .children(self.menu.map(|menu| self.render_menu(menu, chrome, cx)))
     }
 }
@@ -3314,10 +4278,10 @@ mod tests {
             });
         }
         // The row is lifted off the list, its slot left open where it will drop.
-        let lifted = workspace.read_with(cx, |this, _| this.dragging.map(|drag| drag.tab));
+        let lifted = workspace.read_with(cx, |this, _| this.dragging.map(|drag| drag.item));
         assert_eq!(
             lifted,
-            workspace.read_with(cx, |this, _| Some(this.tabs[2].id))
+            workspace.read_with(cx, |this, _| Some(Item::Tab(this.tabs[2].id)))
         );
         cx.simulate_event(MouseUpEvent {
             position: ROW + point(px(0.), px(ROW_HEIGHT * 2.)),
@@ -3502,6 +4466,317 @@ mod tests {
                 Some("d".into()),
             )
         );
+    }
+
+    /// A workspace of tabs named `names`, the last one active, at rest.
+    fn named_tabs<'a>(
+        names: &[&'static str],
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+        let (workspace, cx) = workspace(cx);
+        for _ in 1..names.len() {
+            cx.dispatch_action(NewTab);
+        }
+        workspace.update(cx, |this, _| {
+            for (tab, name) in this.tabs.iter_mut().zip(names) {
+                tab.name = Some((*name).into());
+            }
+        });
+        settle(cx, motion::ROW_IN);
+        (workspace, cx)
+    }
+
+    /// Lets animations of `duration` finish, then draws.
+    fn settle(cx: &mut VisualTestContext, duration: Duration) {
+        std::thread::sleep(duration + Duration::from_millis(20));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    /// Presses at `from` and drags to `to` in small moves, as a hand would, then lets go.
+    fn drag_between(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
+        cx.simulate_event(MouseDownEvent {
+            position: from,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for step in (1..=8u8).map(f32::from) {
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: from + (to - from) * (step / 8.),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::none(),
+            });
+        }
+        cx.simulate_event(MouseUpEvent {
+            position: to,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        settle(cx, motion::ROW_DROP);
+    }
+
+    /// A point in the sidebar `y` pixels down the tab list.
+    fn in_list(y: f32) -> Point<Pixels> {
+        point(px(100.), px(SIDEBAR_TOP + y))
+    }
+
+    /// Each tab's name, and the name of the group it is in.
+    fn grouping(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, Option<String>)> {
+        workspace.read_with(cx, |this, _| {
+            this.tabs
+                .iter()
+                .map(|tab| {
+                    (
+                        tab.name
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                        tab.group
+                            .and_then(|id| this.group(id))
+                            .map(|group| group.name.to_string()),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn grouped(rows: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        rows.iter()
+            .map(|(name, group)| ((*name).to_owned(), group.map(str::to_owned)))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn a_group_should_be_made_from_the_menu_and_take_rows_dragged_in_and_out(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = named_tabs(&["a", "b", "c", "d"], cx);
+        // New Group from Tab on "b", named as it is made.
+        click(cx, in_list(ROW_HEIGHT * 1.5), MouseButton::Right, 1);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let item = cx
+            .debug_bounds("menu-new-group")
+            .expect("new group item drawn");
+        click(cx, item.center(), MouseButton::Left, 1);
+        assert!(workspace.read_with(cx, |this, _| {
+            this.rename
+                .as_ref()
+                .is_some_and(|rename| matches!(rename.item, Item::Group(_)))
+        }));
+        cx.simulate_input("srv");
+        cx.simulate_keystrokes("enter");
+        settle(cx, motion::ROW_SHIFT);
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[("a", None), ("b", Some("srv")), ("c", None), ("d", None)])
+        );
+        // a 0–44, the header 44–72, b 72–116, c 116–160, d 160–204. "c" dragged up onto
+        // "b" takes its place in the group.
+        drag_between(cx, in_list(138.), in_list(94.));
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[
+                ("a", None),
+                ("c", Some("srv")),
+                ("b", Some("srv")),
+                ("d", None)
+            ])
+        );
+        // "d" dragged up through the group and past its header leaves it, above the header.
+        drag_between(cx, in_list(182.), in_list(60.));
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[
+                ("a", None),
+                ("d", None),
+                ("c", Some("srv")),
+                ("b", Some("srv"))
+            ])
+        );
+        // "a" dragged down past the header goes in at the top of the group.
+        drag_between(cx, in_list(22.), in_list(102.));
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[
+                ("d", None),
+                ("a", Some("srv")),
+                ("c", Some("srv")),
+                ("b", Some("srv"))
+            ])
+        );
+        // Below the last row: the end of the list, in no group.
+        drag_between(cx, in_list(94.), in_list(400.));
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[
+                ("d", None),
+                ("c", Some("srv")),
+                ("b", Some("srv")),
+                ("a", None)
+            ])
+        );
+        // The active tab stayed active throughout.
+        assert_eq!(tab_layout(&workspace, cx).2, Some("d".into()));
+        // Remove from Group puts "c" after the group; pinning "b" takes it out too, and the
+        // emptied group goes.
+        workspace.update(cx, |this, cx| {
+            this.leave_group(this.tabs[1].id, cx);
+            let b = this.tabs[1].id;
+            assert_eq!(this.tabs[1].name, Some("b".into()));
+            this.toggle_pin(b, cx);
+        });
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[("b", None), ("d", None), ("c", None), ("a", None)])
+        );
+        assert!(workspace.read_with(cx, |this, _| this.groups.is_empty()));
+    }
+
+    #[gpui::test]
+    fn a_folded_group_should_hide_its_tabs_from_the_tab_shortcuts(cx: &mut TestAppContext) {
+        let (workspace, cx) = named_tabs(&["a", "b", "c", "d"], cx);
+        let group = workspace.update_in(cx, |this, window, cx| {
+            this.new_group(this.tabs[1].id, window, cx);
+            this.rename = None;
+            let group = this.tabs[1].group.expect("grouped");
+            this.tabs[2].group = Some(group);
+            this.activate(0, window, cx);
+            group
+        });
+        settle(cx, motion::ROW_SHIFT);
+        // A click on the header folds the group.
+        let selector: &'static str = format!("group-{}", group.0).leak();
+        let header = cx.debug_bounds(selector).expect("header drawn");
+        click(cx, header.center(), MouseButton::Left, 1);
+        settle(cx, motion::ROW_OUT);
+        assert!(workspace.read_with(cx, |this, _| this.groups[0].collapsed));
+        let active = |cx: &mut VisualTestContext| tab_layout(&workspace, cx).2;
+        cx.dispatch_action(SelectTab2);
+        assert_eq!(active(cx), Some("d".into()));
+        cx.dispatch_action(NextTab);
+        assert_eq!(active(cx), Some("a".into()));
+        cx.dispatch_action(PrevTab);
+        assert_eq!(active(cx), Some("d".into()));
+        cx.dispatch_action(SelectTab9);
+        assert_eq!(active(cx), Some("d".into()));
+        // A folded tab made active (a notification's click) shows under the header, and
+        // goes back out of sight once another tab is.
+        workspace.update_in(cx, |this, window, cx| this.activate(1, window, cx));
+        settle(cx, motion::ROW_IN);
+        let shown = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |this, _| {
+                this.tabs
+                    .iter()
+                    .map(|tab| tab.reveal.target() > 0.)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(shown(cx), vec![true, true, false, true]);
+        cx.dispatch_action(NextTab);
+        assert_eq!(active(cx), Some("d".into()));
+        settle(cx, motion::ROW_OUT);
+        assert_eq!(shown(cx), vec![true, false, false, true]);
+        // Clicked again, it unfolds.
+        click(cx, header.center(), MouseButton::Left, 1);
+        settle(cx, motion::ROW_IN);
+        assert_eq!(shown(cx), vec![true, true, true, true]);
+    }
+
+    #[gpui::test]
+    fn a_tab_let_go_on_a_folded_header_should_go_into_its_group(cx: &mut TestAppContext) {
+        let (workspace, cx) = named_tabs(&["a", "b", "c", "d"], cx);
+        workspace.update_in(cx, |this, window, cx| {
+            this.new_group(this.tabs[1].id, window, cx);
+            this.rename = None;
+            let group = this.tabs[1].group.expect("grouped");
+            this.toggle_group(group, cx);
+        });
+        settle(cx, motion::ROW_OUT);
+        // a 0–44, the folded header 44–72, c 72–116, d 116–160.
+        drag_between(cx, in_list(94.), in_list(58.));
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[
+                ("a", None),
+                ("b", Some("Group")),
+                ("c", Some("Group")),
+                ("d", None)
+            ])
+        );
+        settle(cx, motion::ROW_OUT);
+        let hidden = workspace.read_with(cx, |this, _| this.tabs[2].reveal.target());
+        assert!(hidden < 0.5, "folded away with its group");
+    }
+
+    #[gpui::test]
+    fn dragging_a_group_header_should_move_the_whole_group(cx: &mut TestAppContext) {
+        let (workspace, cx) = named_tabs(&["a", "b", "c", "d", "e"], cx);
+        workspace.update_in(cx, |this, window, cx| {
+            this.toggle_pin(this.tabs[0].id, cx);
+            this.new_group(this.tabs[1].id, window, cx);
+            this.rename = None;
+            let group = this.tabs[1].group.expect("grouped");
+            this.tabs[2].group = Some(group);
+        });
+        settle(cx, motion::ROW_SHIFT);
+        // a 0–44 (pinned), the header 44–72, then (b and c out of sight while their group
+        // is dragged) d 72–116 and e 116–160. Down past "d": the group goes after it, whole.
+        drag_between(cx, in_list(58.), in_list(120.));
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[
+                ("a", None),
+                ("d", None),
+                ("b", Some("Group")),
+                ("c", Some("Group")),
+                ("e", None),
+            ])
+        );
+        // Never above a pinned tab.
+        settle(cx, motion::ROW_IN);
+        drag_between(cx, in_list(102.), in_list(4.));
+        assert_eq!(
+            grouping(&workspace, cx),
+            grouped(&[
+                ("a", None),
+                ("b", Some("Group")),
+                ("c", Some("Group")),
+                ("d", None),
+                ("e", None),
+            ])
+        );
+        assert_eq!(tab_layout(&workspace, cx).2, Some("e".into()));
+        assert!(workspace.read_with(cx, |this, _| this.dragging.is_none()));
+    }
+
+    #[gpui::test]
+    fn dragging_the_sidebar_edge_should_resize_it_within_bounds(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        let width =
+            |cx: &mut VisualTestContext| workspace.read_with(cx, |this, _| this.sidebar_width);
+        let edge = point(px(SIDEBAR_WIDTH), px(300.));
+        drag_between(cx, edge, point(px(300.), px(300.)));
+        assert!((width(cx) - 300.).abs() < 1., "{}", width(cx));
+        let sidebar = cx.debug_bounds("new-tab").expect("new tab button drawn");
+        assert!(sidebar.right() > px(280.), "{sidebar:?}");
+        drag_between(cx, point(px(300.), px(300.)), point(px(900.), px(300.)));
+        assert!((width(cx) - SIDEBAR_MAX).abs() < f32::EPSILON);
+        drag_between(
+            cx,
+            point(px(SIDEBAR_MAX), px(300.)),
+            point(px(10.), px(300.)),
+        );
+        assert!((width(cx) - SIDEBAR_MIN).abs() < f32::EPSILON);
+        // A double-click puts it back.
+        click(cx, point(px(SIDEBAR_MIN), px(300.)), MouseButton::Left, 2);
+        assert!((width(cx) - SIDEBAR_WIDTH).abs() < f32::EPSILON);
     }
 
     #[gpui::test]
@@ -4351,12 +5626,14 @@ mod tests {
                     name: None,
                     focused: 0,
                     pinned: false,
+                    group: None,
                     root: shell_in("/", None),
                 },
                 SavedTab {
                     name: Some("构建".to_owned()),
                     focused: 2,
                     pinned: true,
+                    group: None,
                     root: Shape::Split {
                         axis: Axis::Horizontal,
                         ratio: 0.3,
@@ -4370,6 +5647,7 @@ mod tests {
                     },
                 },
             ],
+            ..SavedWorkspace::default()
         };
         let store = Store::at(scratch_dir("reopen"));
         store.save(store.ticket(), &saved, &[]).unwrap();
@@ -4409,6 +5687,98 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[gpui::test]
+    fn groups_and_the_sidebar_width_should_be_saved_for_the_next_launch(cx: &mut TestAppContext) {
+        let dir = scratch_dir("groups");
+        let (workspace, cx) = workspace_saving_to(Some(Store::at(dir.clone())), cx);
+        cx.dispatch_action(NewTab);
+        cx.dispatch_action(NewTab);
+        workspace.update_in(cx, |this, window, cx| {
+            this.new_group(this.tabs[1].id, window, cx);
+            this.rename = None;
+            let group = this.tabs[1].group.expect("grouped");
+            this.tabs[2].group = Some(group);
+            if let Some(group) = this.group_mut(group) {
+                group.name = "服务".into();
+                group.collapsed = true;
+            }
+            this.set_sidebar_width(280., cx);
+            // Out of the name field, back to the terminal.
+            this.focus_active(window, cx);
+        });
+        cx.dispatch_action(Quit);
+        cx.run_until_parked();
+        let saved = saved_layout(&dir);
+        assert_eq!(
+            saved.groups,
+            vec![SavedGroup {
+                name: "服务".to_owned(),
+                collapsed: true,
+            }]
+        );
+        let groups: Vec<_> = saved.tabs.iter().map(|tab| tab.group).collect();
+        assert_eq!(groups, vec![None, Some(0), Some(0)]);
+        assert_eq!(saved.sidebar_width, Some(280.));
+    }
+
+    #[gpui::test]
+    fn launch_should_reopen_groups_folded_and_in_one_piece(cx: &mut TestAppContext) {
+        let tab = |group: Option<usize>, pinned: bool| SavedTab {
+            name: None,
+            focused: 0,
+            pinned,
+            group,
+            root: shell_in("/", None),
+        };
+        // A hand-edited save: the group split by an ungrouped tab, a pinned tab claiming a
+        // group, a group named by no one, and a width past the limit.
+        let saved = SavedWorkspace {
+            active: 0,
+            sidebar_width: Some(9000.),
+            groups: vec![
+                SavedGroup {
+                    name: "  ".to_owned(),
+                    collapsed: true,
+                },
+                SavedGroup::default(),
+            ],
+            tabs: vec![
+                tab(Some(0), false),
+                tab(None, false),
+                tab(Some(0), false),
+                tab(Some(1), true),
+            ],
+            ..SavedWorkspace::default()
+        };
+        let store = Store::at(scratch_dir("reopen-groups"));
+        store.save(store.ticket(), &saved, &[]).unwrap();
+        let (workspace, cx) = workspace_saving_to(Some(store), cx);
+        workspace.read_with(cx, |this, _| {
+            let rows: Vec<_> = this
+                .tabs
+                .iter()
+                .map(|tab| (tab.pinned, tab.group.is_some()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(true, false), (false, true), (false, true), (false, false)]
+            );
+            assert_eq!(this.groups.len(), 1);
+            assert_eq!(this.groups[0].name, SharedString::from(GROUP_NAME));
+            assert!(this.groups[0].collapsed);
+            assert!((this.sidebar_width - SIDEBAR_MAX).abs() < f32::EPSILON);
+            // The active tab shows under its folded header; the other one is folded away.
+            let active = this.tabs[this.active].group;
+            assert!(active.is_some());
+            let shown: Vec<_> = this
+                .tabs
+                .iter()
+                .map(|tab| tab.reveal.target() > 0.)
+                .collect();
+            assert_eq!(shown, vec![true, true, false, true]);
+        });
     }
 
     #[gpui::test]
@@ -4622,15 +5992,12 @@ mod tests {
             let pane = this.tabs[0].focused.clone();
             for n in 1..30u64 {
                 this.tabs.push(Tab {
-                    id: TabId(n),
-                    tree: crate::pane_tree::PaneTree::new(pane.clone()),
-                    focused: pane.clone(),
                     name: Some(format!("t{n}").into()),
-                    pinned: false,
-                    finished: false,
-                    animating: false,
-                    memory: 0,
-                    shift: crate::motion::Tween::settled(0.),
+                    ..Tab::new(
+                        TabId(n),
+                        crate::pane_tree::PaneTree::new(pane.clone()),
+                        pane.clone(),
+                    )
                 });
             }
             this.next_tab = 30;

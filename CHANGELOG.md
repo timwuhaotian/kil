@@ -6,6 +6,21 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.42 — 2026-11-20
+
+- **Tab groups in the sidebar.** Right-click a tab for **New Group from Tab**, name the group in
+  place, and drag other tabs into it: a dragged row joins the group of the row it passes, and
+  leaves it out past the header or below the last row. Click a header to fold the group away
+  (it then shows how many tabs it holds and their most urgent status mark), double-click to
+  rename it, right-click for **Rename Group…** and **Ungroup**, or drag the header to move the
+  whole group. The active tab stays visible under a folded header, `⌘1`…`⌘9` and
+  previous/next tab skip folded tabs, and a tab let go on a folded header joins that group.
+  Groups live below the pinned tabs; pinning a tab takes it out of its group. Groups, names and
+  folds reopen with everything else.
+- **A resizable sidebar.** Drag the border between the sidebar and the terminal to make the
+  sidebar 160–400 px wide; double-click the border to go back to 220 px. The width reopens at
+  the next launch.
+
 ## 0.0.41 — 2026-11-15
 
 - **Pair once, reconnect from anywhere.** The first phone still spends the one-time QR code,

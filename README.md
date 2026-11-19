@@ -31,10 +31,17 @@ owns every process, PID and file descriptor it creates.
 - **Vertical tabs** in a sidebar. A ring marks a tab with a running job, and a dot marks one
   whose job finished while you weren't looking. Right-click for **Pin Tab** / **Unpin Tab**:
   pinning moves a tab to the end of the pinned group at the top, and unpinning to the start of
-  the unpinned group. Drag a tab up or down to reorder it within its group: it lifts off the
-  list and follows the pointer while the others slide out of its way. Pinning and tab order
-  survive relaunches. Double-click a tab to rename it (IME works, Chinese included). A new tab
-  is named for its folder. How much of the blurred desktop shows through the sidebar is a setting.
+  the unpinned group. Drag a tab up or down to reorder it: it lifts off the list and follows
+  the pointer while the others slide out of its way. Double-click a tab to rename it (IME
+  works, Chinese included). A new tab is named for its folder. How much of the blurred desktop
+  shows through the sidebar is a setting, and its width is yours: drag its border with the
+  terminal (160–400 px), double-click the border for the usual 220.
+- **Tab groups.** Right-click a tab for **New Group from Tab** and name it. Drag tabs into a
+  group, out past its header, or below the last row; drag the header to move the whole group.
+  Click the header to fold the group away: it shows how many tabs it holds and the most urgent
+  of their marks, the active tab stays under it, and `⌘1`…`⌘9` and previous/next tab skip
+  what is folded. Right-click a header to rename or ungroup it. Groups sit below the pinned
+  tabs. Groups, folds, pinning, tab order and the sidebar's width survive relaunches.
 - **Notifications from programs.** When a program posts one (OSC 9 or 777: killi, Claude
   Code and others do when a long job ends) and its tab isn't in view, macOS shows it —
   naming the job, tab and folder it came from — and the tab gets the dot; clicking the
@@ -191,7 +198,7 @@ copies read to find the update.
 | `⌘⇧C` / `⌘⇧W` | Close pane / close tab |
 | `⌘⇧P` / `⌥⌘⇧P` | Pin / unpin the active tab |
 | `⌘⌥←→↑↓` | Focus the pane in that direction |
-| `⌘1`…`⌘9`, `⌘⇧[` / `⌘⇧]` | Select a tab, previous / next tab |
+| `⌘1`…`⌘9`, `⌘⇧[` / `⌘⇧]` | Select a shown tab, previous / next tab (folded groups are skipped) |
 | `⇧↩` | New line without sending, in Claude Code, kimi and other TUIs (sends ESC CR, like `⌥↩`) |
 | `⌘C` / `⌘V` | Copy / paste (bracketed paste when the program asks for it; with an image on the clipboard such a program gets an empty paste, so killi attaches the image) |
 | drag a file in | Its path is typed where it lands, shell-escaped; killi attaches an image or names any other file with `@` |
@@ -204,7 +211,8 @@ The **Kil** menu has **Restart** (stop every job, then open Kil again), **Quit a
 Jobs**, and the usual Hide, Hide Others and Show All.
 
 Double-click a tab to rename it (Enter or clicking away saves, Esc cancels), right-click it
-for Pin / Unpin / Rename / Close, drag it within its group to reorder, and double-click empty
+for Pin / Unpin / Rename / New Group from Tab / Remove from Group / Close, drag it to reorder
+or to move it into or out of a group, click a group's header to fold it, and double-click empty
 sidebar space for a new tab (the **New Tab** button at the bottom shows its shortcut when you hover it).
 Double-click the top of the sidebar, beside the window buttons, to fill the screen and again
 to go back (it does what **System Settings ▸ Desktop & Dock** says a title-bar double-click
