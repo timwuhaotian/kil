@@ -73,15 +73,16 @@ impl DisplayLink {
         if self.running {
             return Ok(());
         }
+        // Modified for Kil: `running` is set only once the link started, so a failed start
+        // (display asleep or reconfiguring) is tried again by the next wake instead of
+        // leaving a resumed source behind a dead link.
         unsafe {
+            self.display_link.as_mut().unwrap().start()?;
             dispatch_resume(crate::dispatch_sys::dispatch_object_t {
                 _ds: self.frame_requests,
             });
         }
         self.running = true;
-        unsafe {
-            self.display_link.as_mut().unwrap().start()?;
-        }
         Ok(())
     }
 

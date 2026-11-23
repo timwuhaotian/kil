@@ -22,8 +22,10 @@ Every changed place is marked `Modified for Kil`:
 
 - `src/platform.rs`: `PlatformWindow::frame_waker` and `pause_frames`, which do nothing by
   default, so only macOS changes.
-- `src/platform/mac/window.rs`: the macOS window pauses and resumes its display link.
-- `src/platform/mac/display_link.rs`: `start` and `stop` can be called again, keeping the
+- `src/platform/mac/window.rs`: the macOS window pauses and resumes its display link, and a
+  wake makes the link again if an earlier attempt left none.
+- `src/platform/mac/display_link.rs`: `start` and `stop` can be called again (`running` is set
+  only once the link started), keeping the
   dispatch source's resumes and suspends paired.
 - `src/window.rs`: `WindowInvalidator` wakes the platform when the window becomes dirty; the
   request-frame callback counts idle frames and pauses; `on_next_frame` and `dispatch_event`

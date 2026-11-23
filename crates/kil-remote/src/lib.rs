@@ -448,6 +448,7 @@ impl Bridge {
         let tags_remote = Arc::new(AtomicBool::new(false));
         let socket_path = kil_term::server::socket_path(&config.dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut cancel = shutdown_rx.clone();
 
         let config = config.clone();
         let thread_auth = Arc::clone(&auth);
@@ -468,17 +469,21 @@ impl Bridge {
                 let result = runtime.block_on(async {
                     let listener =
                         TcpListener::from_std(listener).context("register the TCP listener")?;
-                    ensure_server(&socket_path, config.launcher.as_deref(), &config.dir).await?;
-                    keep_alive(&socket_path).await?;
-                    // Probed once, not once per phone connection: the answer is
-                    // the server's, and the app's presence poll needs it too.
-                    let tags = server_tags_remote(&socket_path).await;
-                    thread_tags.store(tags, Ordering::Release);
-
                     let tls_port = listener.local_addr()?.port();
-                    let mut tunnel = match tunnel_config.as_ref() {
-                        Some((_, token)) => Some(PublicTunnel::start(tls_port, token).await?),
-                        None => None,
+                    // Setup can take a while (a server to start, a tunnel that takes up to
+                    // 30 s to register), and `stop` waits for this thread: it gives way to
+                    // the shutdown signal, dropping what it started (`cloudflared` is
+                    // killed on drop).
+                    let setup = prepare(
+                        &socket_path,
+                        &config,
+                        tunnel_config.as_ref().map(|(_, token)| token.as_str()),
+                        tls_port,
+                        &thread_tags,
+                    );
+                    let Some((tags, mut tunnel)) = until_stopped(&mut cancel, setup).await? else {
+                        log::info!("stopping (shutdown during setup)");
+                        return Ok(());
                     };
                     let lan_host = match config.host.as_deref() {
                         Some(host) => host.to_owned(),
@@ -1077,6 +1082,42 @@ async fn keep_alive(socket_path: &Path) -> Result<()> {
         }
     });
     Ok(())
+}
+
+/// What the bridge needs before it accepts a phone: the session server up, whether it tags
+/// remote clients (probed once, not once per phone connection: the app's presence poll needs
+/// the answer too), and the tunnel, if one is configured.
+async fn prepare(
+    socket_path: &Path,
+    config: &Config,
+    tunnel_token: Option<&str>,
+    tls_port: u16,
+    tags_remote: &AtomicBool,
+) -> Result<(bool, Option<PublicTunnel>)> {
+    ensure_server(socket_path, config.launcher.as_deref(), &config.dir).await?;
+    keep_alive(socket_path).await?;
+    let tags = server_tags_remote(socket_path).await;
+    tags_remote.store(tags, Ordering::Release);
+    let tunnel = match tunnel_token {
+        Some(token) => Some(PublicTunnel::start(tls_port, token).await?),
+        None => None,
+    };
+    Ok((tags, tunnel))
+}
+
+/// Runs `work` unless shutdown is signalled first: `None` then, with `work` dropped.
+async fn until_stopped<T>(
+    stop: &mut watch::Receiver<bool>,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<Option<T>> {
+    let stopped = async {
+        // A closed channel means the bridge handle is gone: nobody is left to serve.
+        while !*stop.borrow_and_update() && stop.changed().await.is_ok() {}
+    };
+    tokio::select! {
+        done = work => done.map(Some),
+        () = stopped => Ok(None),
+    }
 }
 
 async fn serve(
@@ -1829,6 +1870,40 @@ mod tests {
             "a server that hangs up on the declaration reports no phone"
         );
         bridge.stop();
+    }
+
+    #[tokio::test]
+    async fn setup_should_give_way_to_shutdown() {
+        let (tx, mut rx) = watch::channel(false);
+        let hung = std::future::pending::<Result<()>>();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send(true).unwrap();
+            tx
+        });
+        let started = std::time::Instant::now();
+        assert!(until_stopped(&mut rx, hung).await.unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        stopper.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_should_give_way_to_a_shutdown_sent_before_it_began() {
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(true).unwrap();
+        let hung = std::future::pending::<Result<()>>();
+        assert!(until_stopped(&mut rx, hung).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn setup_should_finish_and_keep_its_error_when_nothing_stops_it() {
+        let (_tx, mut rx) = watch::channel(false);
+        assert_eq!(
+            until_stopped(&mut rx, async { Ok(7) }).await.unwrap(),
+            Some(7)
+        );
+        let failed = until_stopped(&mut rx, async { bail!("no tunnel") as Result<()> }).await;
+        assert!(failed.is_err_and(|err| err.to_string() == "no tunnel"));
     }
 
     #[tokio::test]

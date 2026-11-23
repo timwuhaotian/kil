@@ -507,7 +507,11 @@ impl MacWindowState {
     }
 
     fn resume_display_link(&mut self) {
-        if let Some(display_link) = &mut self.display_link {
+        // No link when the last attempt to make one failed (no screen yet, display
+        // reconfiguring): a wake is the next chance to make it.
+        if self.display_link.is_none() {
+            self.start_display_link();
+        } else if let Some(display_link) = &mut self.display_link {
             display_link.start().log_err();
         }
     }

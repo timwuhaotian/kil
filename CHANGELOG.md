@@ -6,6 +6,12 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+- **Fewer freezes.** Quitting, or switching Agent on Edge off or on, while the bridge was still
+  starting (a tunnel that takes up to 30 s to register) held the window until the setup ended;
+  it now gives way at once. A window whose display link failed to start (display asleep or
+  reconfiguring) kept waiting for frames that never came; the next change to the window starts
+  it again.
+
 ## 0.0.42 — 2026-11-20
 
 - **Tab groups in the sidebar.** Right-click a tab for **New Group from Tab**, name the group in
