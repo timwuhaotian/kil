@@ -251,6 +251,25 @@ pub struct MemoryUsage {
     pub process_bytes: u64,
 }
 
+/// The cheap half of [`Session::memory`] taken, and the slow half waiting: walking the process
+/// tree asks the kernel about every process below the shell, so [`Self::read`] can run on any
+/// thread while the caller goes on.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryProbe {
+    grid_bytes: usize,
+    shell: Option<ProcIdentity>,
+}
+
+impl MemoryProbe {
+    /// The session's total cost in bytes: its grid, and the program with all it started.
+    #[must_use]
+    pub fn read(self) -> u64 {
+        u64::try_from(self.grid_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.shell.map_or(0, proc_info::subtree_rss))
+    }
+}
+
 /// A running terminal: a child on a PTY, parsed by alacritty's VT state machine.
 ///
 /// The PTY is either in this process ([`Session::spawn`]) or in the session server
@@ -561,6 +580,18 @@ impl Session {
             columns,
             grid_bytes,
             process_bytes,
+        }
+    }
+
+    /// What [`Self::memory`] reads, with the process tree left to [`MemoryProbe::read`].
+    #[must_use]
+    pub fn memory_probe(&self) -> MemoryProbe {
+        let term = self.term.lock();
+        MemoryProbe {
+            grid_bytes: (term.history_size() + term.screen_lines())
+                * term.columns()
+                * size_of::<Cell>(),
+            shell: self.shell,
         }
     }
 

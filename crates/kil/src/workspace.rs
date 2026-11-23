@@ -20,7 +20,7 @@ use gpui::{
     Subscription, Task, WeakEntity, Window, actions, anchored, deferred, div, prelude::*, px,
     relative,
 };
-use kil_term::{Client, TabDesc};
+use kil_term::{Client, MemoryProbe, TabDesc};
 
 use crate::{
     config, keymap,
@@ -2128,25 +2128,48 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reads what every pane costs, and how the system is doing (DESIGN.md §5.2).
+    /// What every pane costs, as far as the UI thread can tell: the grids are measured here,
+    /// and the processes are left to [`MemoryProbe::read`], which asks the kernel about every
+    /// process below each shell and belongs on a background thread.
+    fn memory_probes(&self, cx: &App) -> Vec<(TabId, Vec<MemoryProbe>)> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let probes = tab
+                    .tree
+                    .leaves()
+                    .iter()
+                    .filter_map(|pane| pane.read(cx).memory_probe())
+                    .collect();
+                (tab.id, probes)
+            })
+            .collect()
+    }
+
+    /// Takes in what the panes cost (`readings`, per tab) and how the system is doing
+    /// (DESIGN.md §5.2).
     ///
     /// A program in a pane can take gigabytes, and the system charges them to the app that
     /// started it: the sidebar's figures are how the user finds the hog before macOS does.
-    fn refresh_memory(&mut self, cx: &mut Context<Self>) {
+    fn apply_memory(
+        &mut self,
+        readings: &[(TabId, u64)],
+        system: kil_term::system::Memory,
+        cx: &mut Context<Self>,
+    ) {
         let mut changed = false;
         let mut total = 0;
         for tab in &mut self.tabs {
-            let mut sum = 0;
-            for pane in tab.tree.leaves() {
-                sum += pane.read(cx).memory();
+            // A tab opened since the probes were taken keeps what it had.
+            if let Some(&(_, sum)) = readings.iter().find(|(id, _)| *id == tab.id) {
+                // The bytes change at every reading of any running program; what the row
+                // shows seldom does, and a redraw for nothing is what keeps an idle window
+                // awake.
+                changed |= shown_memory(sum) != shown_memory(tab.memory);
+                tab.memory = sum;
             }
-            // The bytes change at every reading of any running program; what the row shows
-            // seldom does, and a redraw for nothing is what keeps an idle window awake.
-            changed |= shown_memory(sum) != shown_memory(tab.memory);
-            tab.memory = sum;
-            total += sum;
+            total += tab.memory;
         }
-        let system = kil_term::system::memory();
         let state = MemoryState {
             total,
             pressure: system.pressure,
@@ -2162,12 +2185,42 @@ impl Workspace {
         }
     }
 
-    /// Reads what the panes cost, every [`MEMORY_INTERVAL`].
+    /// [`Self::memory_probes`] read on this thread, for tests.
+    #[cfg(test)]
+    fn refresh_memory(&mut self, cx: &mut Context<Self>) {
+        let readings: Vec<_> = self
+            .memory_probes(cx)
+            .into_iter()
+            .map(|(id, probes)| (id, probes.into_iter().map(MemoryProbe::read).sum()))
+            .collect();
+        self.apply_memory(&readings, kil_term::system::memory(), cx);
+    }
+
+    /// Reads what the panes cost, every [`MEMORY_INTERVAL`]. The reading walks every pane's
+    /// process tree through the kernel, so it runs on a background thread.
     fn start_memory_watch(&mut self, cx: &mut Context<Self>) {
         self.memory_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(MEMORY_INTERVAL).await;
-                if this.update(cx, Workspace::refresh_memory).is_err() {
+                let Ok(probes) = this.update(cx, |this, cx| this.memory_probes(cx)) else {
+                    break;
+                };
+                let (readings, system) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let readings: Vec<_> = probes
+                            .into_iter()
+                            .map(|(id, probes)| {
+                                (id, probes.into_iter().map(MemoryProbe::read).sum())
+                            })
+                            .collect();
+                        (readings, kil_term::system::memory())
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.apply_memory(&readings, system, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -4100,6 +4153,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(memory > 0, "the pane's program is not counted");
+    }
+
+    #[gpui::test]
+    fn the_memory_watch_should_read_the_panes_on_its_own(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace(cx);
+        wait_for(cx, |cx| {
+            workspace.read_with(cx, |this, cx| this.tabs[0].focused.read(cx).pid().is_some())
+        });
+        let mut memory = 0;
+        for _ in 0..50 {
+            cx.executor().advance_clock(MEMORY_INTERVAL);
+            cx.run_until_parked();
+            memory = workspace.read_with(cx, |this, _| this.tabs[0].memory);
+            if memory > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(memory > 0, "the timer's reading never reached the tab");
+        assert!(workspace.read_with(cx, |this, _| this.memory.total) >= memory);
     }
 
     #[gpui::test]

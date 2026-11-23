@@ -29,6 +29,25 @@ fn process_memory_should_count_what_the_program_holds() {
 }
 
 #[test]
+fn a_probe_should_read_the_program_on_another_thread() {
+    let probe = start(&sh(
+        "x=$(head -c 33554432 /dev/zero | tr '\\0' 'a'); sleep 600",
+    ));
+    assert!(
+        wait_until(Duration::from_secs(20), || probe.session.process_memory()
+            > 20 * 1024 * 1024),
+        "the program's memory is not counted"
+    );
+    // Taken here, read elsewhere: the part that walks the process tree leaves the caller.
+    let taken = probe.session.memory_probe();
+    let bytes = std::thread::spawn(move || taken.read()).join().unwrap();
+    assert!(
+        bytes > 20 * 1024 * 1024,
+        "the probe leaves the program out: {bytes} bytes"
+    );
+}
+
+#[test]
 fn an_attached_session_should_report_its_program() {
     // The app's path: the program runs in the server, the app holds a mirror of it.
     let dir = std::env::temp_dir().join(format!("kil-mem-{}", std::process::id()));

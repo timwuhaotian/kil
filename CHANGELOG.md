@@ -10,7 +10,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
   starting (a tunnel that takes up to 30 s to register) held the window until the setup ended;
   it now gives way at once. A window whose display link failed to start (display asleep or
   reconfiguring) kept waiting for frames that never came; the next change to the window starts
-  it again.
+  it again. The sidebar's memory figures are read off the UI thread, so a slow process query
+  no longer stalls the window every 2 s.
 
 ## 0.0.42 — 2026-11-20
 

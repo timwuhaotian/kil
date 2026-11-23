@@ -17,8 +17,8 @@ use gpui::{
     Task, UTF16Selection, WeakEntity, Window, actions, div, point, prelude::*,
 };
 use kil_term::{
-    Client, Frame, GridSize, Palette, SelectionKind, Session, SessionConfig, SessionEvent,
-    Transcript, ViewportCell,
+    Client, Frame, GridSize, MemoryProbe, Palette, SelectionKind, Session, SessionConfig,
+    SessionEvent, Transcript, ViewportCell,
 };
 
 use crate::{
@@ -286,15 +286,14 @@ impl TerminalPane {
         true
     }
 
-    /// What this pane costs the machine: its grid, and the program running in it.
+    /// What this pane costs the machine: its grid, and the program running in it. Taken
+    /// here, read with [`MemoryProbe::read`] wherever the kernel may be asked about the
+    /// program's processes.
     ///
     /// The program is the larger part: an agent with its own subprocesses dwarfs the
     /// terminal's own scrollback (DESIGN.md §5.2).
-    pub fn memory(&self) -> u64 {
-        self.session.as_ref().map_or(0, |session| {
-            let usage = session.memory();
-            u64::try_from(usage.grid_bytes).unwrap_or(u64::MAX) + usage.process_bytes
-        })
+    pub fn memory_probe(&self) -> Option<MemoryProbe> {
+        self.session.as_ref().map(Session::memory_probe)
     }
 
     /// The program ended on its own with a failure (or never started): the banner is up.

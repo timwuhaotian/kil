@@ -37,7 +37,8 @@ pub use proc_info::{ForegroundProcess, Job, Pid, ProcIdentity, TtyId};
 pub use reaper::expedite_reaping;
 pub use remote::Client;
 pub use session::{
-    GridSize, InputMode, MemoryUsage, Program, SelectionKind, Session, SessionConfig, ViewportCell,
+    GridSize, InputMode, MemoryProbe, MemoryUsage, Program, SelectionKind, Session, SessionConfig,
+    ViewportCell,
 };
 pub use snapshot::{CellFlags, CursorShape, CursorSnapshot, Frame, Palette, RenderCell, Rgba};
 pub use transcript::Transcript;
