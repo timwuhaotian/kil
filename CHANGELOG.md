@@ -6,6 +6,8 @@ versions below are how we track releases, and match `Cargo.toml` and the app's I
 
 ## Unreleased
 
+## 0.0.43 — 2026-11-23
+
 - **Fewer freezes.** Quitting, or switching Agent on Edge off or on, while the bridge was still
   starting (a tunnel that takes up to 30 s to register) held the window until the setup ended;
   it now gives way at once. A window whose display link failed to start (display asleep or
